@@ -6,11 +6,17 @@ Co-authors: ChatGPT (GPT-5.6 Sol)
 
 Owner: @pvl
 
-Status: **design sealed** after a second full correctness/security/edge-case review for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
+Status: **model-facing design sealed; shared implementation cutover complete, with platform release gates still open**. The shared AW implementation and secured backends are live, dotlink production native filesystem/Graph dispatch uses them, and all three shared crates are pinned to reviewed remote AW revision `4a23e92a8f516971bb232b98e4fc000554bcc4ba`. Remaining release gates are the explicitly documented native Bubblewrap and Windows/macOS platform checks, not shared-engine or dependency-pin convergence.
 
 Implementation should follow this specification as written. A model-facing surface or
 semantic change discovered during implementation must explicitly reopen/update DL-150
 rather than silently drifting from the sealed design.
+
+Cross-repository implementation architecture: [SHARED-IMPLEMENTATION.md](SHARED-IMPLEMENTATION.md). It makes `aw-tools` the single reusable implementation, including the canonical JobManager, while AW/dotlink keep thin authority/transport/process adapters.
+
+Implementation status (2026-11-09): AW `4a23e92a8f516971bb232b98e4fc000554bcc4ba` is the reviewed and pushed shared baseline. The prior status/cancellation/config review remains intact, and this pass additionally closes a deterministic Graph scheduling race: native nodes now re-resolve their canonical filesystem footprint while still `Claimed` and must match the captured `NodePlan` before `Start`, so a final symlink retarget between preparation and effect settles provably unlaunched `skip` instead of executing under a stale conflict footprint. The shared/config/runtime refactor remains aligned with AW's larger architecture: one Agent/ToolPolicy/journal, narrowing-only `LocalToolLimits`, one canonical `aw-tools::JobManager`, explicit full/minimal/stateless/no-std boundaries, and atomic host tool-parallelism updates. Fresh AW gates include `aw-tools` 279/279, Unix secured backend 41/41, AW adapter 203/203, Agent core 78 active plus 1 intentional ignore, AW CLI library 229/229 active, AW CLI binary 384/384 active plus 1 intentional ignore, workspace all-target compilation, affected strict Clippy, stateless/no-default, `minimal` and no-std+alloc kernel. A fresh Windows cross-run is environment-blocked before source compilation because the cached `x86_64-pc-windows-gnu` std sysroot is a dangling Nix-store symlink; earlier matching-toolchain cross evidence remains historical only.
+
+Dotlink production native filesystem dispatch uses `aw-tools::filesystem::{request,direct}` plus the shared secured `CapabilitySet`; the retired duplicate native filesystem implementations are removed. The production Job surface also uses the canonical shared Graph runtime: model-visible `batch(ops)`, Graph-shaped `job_start(ops)`, current-authority `job_restart(id)`, native filesystem nodes and ShellNodes all share `aw-tools::JobManager` lifecycle, captured semantic budgets/footprints, deterministic admission, output ownership/ACK and cancellation/revocation. Dotlink keeps only product-specific process custody, sandbox/policy, transport request delivery/replay, wall-clock retention and MCP projection. Against remote-pinned AW `4a23e92`, linked conformance and a separately regenerated external fixture (13 schemas / 13 requests) pass, including the explicit ignored cross-repository fixture gate. The complete remote-pinned dotlink main unit suite is 628/628 active tests plus 1 intentional external-fixture ignore; child-env 1/1, exit-status 8/8, OAuth live-rotation 1/1, private-generation 12/12 and stdio shared-tools 4/4 integrations are green. Strict all-target Clippy, all-target check, rustfmt and diff checks pass. The fresh cross-repo review also mirrors AW's pre-effect topology revalidation in dotlink's thin Graph host without duplicating path semantics: a prepared native node recomputes the shared request footprint immediately before the shared `Start` checkpoint and settles unlaunched on drift. All three AW dependencies now pin the exact remote Git revision `4a23e92a8f516971bb232b98e4fc000554bcc4ba`; sibling review paths are retired. Bubblewrap native smoke remains host-kernel-blocked at `/proc` mounting, and native Windows/macOS execution remains an explicit release gate.
 
 Base: `84cd9b7` (`release: dotlink v0.14.3`)
 
@@ -903,7 +909,12 @@ only describe the deliberately excluded root.
 For `ls`, `find` and `grep`, the caller-named `path` must resolve to an
 authorized directory. The explicit root may itself be reached through a symlink
 only after the normal lexical + resolved authority/protected-path checks; child
-symlinks discovered beneath that root are entries and are never traversed.
+symlinks discovered beneath that root are entries and are never traversed. A
+resolved/symlinked root keeps the caller's lexical model-facing prefix in emitted
+paths: native traversal is bound to the resolved authorized directory, while a
+`find(path="alias", ...)` result remains `alias/child`, not the resolved host
+spelling. This preserves path composability without exposing or switching to a
+different model namespace after authorization.
 
 ### Glob semantics
 
@@ -2353,7 +2364,7 @@ Use one durable execution control surface for every exposed Job:
 
 ~~~text
 job_start(ops)
-job_list(limit=64)
+job_list(offset=0, limit=64)
 job_get(id)
 job_output(id, node=null, stream=null, offset=0, ...)
 job_ack(id, node=null, stream=null, offset)
@@ -2470,16 +2481,21 @@ expressions see only canonical node outcomes; Job lifecycle is observed through
 
 ### Listing and polling
 
-`job_list(limit=64)` lists the newest exposed Jobs in one compact namespace so a
+`job_list(offset=0, limit=64)` lists exposed Jobs in one compact namespace so a
 lost creation/handoff response can be recovered. The display label is derived from
-the Graph shape, not from a separate durability kind:
+the Graph shape, not from a separate durability kind. `offset` is a non-negative
+logical Job offset and `limit` is a positive bounded page size.
 
 Order is newest exposed Job first with the Job ID as a deterministic tie-breaker.
-`limit` may be raised through the runtime's retained-Job cap. If the default
-page omits older retained Jobs, return a compact `more limit=<cap>` remedy
-rather than silently implying the namespace is exhaustive. This keeps the common
-schema small while preserving lost-receipt recovery within the bounded live
-session.
+When another retained Job exists after the rendered page, return `more offset=N`,
+where `N` is the next logical Job offset. Like other direct live-query cursors,
+this is a cursor into the namespace observed by that call, not a cross-call
+snapshot token: newly exposed or expired Jobs may shift later offsets. Lost-
+receipt recovery remains reliable because newly created/exposed Jobs sort at the
+front and the caller normally begins at offset zero. The result fitter must obey
+the same atomic-row/non-advancing rule as filesystem discovery: if even the first
+selected Job row cannot fit the semantic result budget, return an actionable
+error rather than an empty `more offset=<same>` page.
 
 - one ShellNode -> its interpreter name (`bash`, `pwsh`, `powershell`);
 - one NativeToolNode -> its tool name;
@@ -2935,12 +2951,34 @@ CompactRenderer
 - metadata acquisition;
 - incomplete-reason collection.
 
-The walker also excludes exact active mutation-private staging/tombstone names
-registered by the shared mutation layer, regardless of `hidden`. Pending durable
-cleanup records are reconciled and registered before the filesystem surface is
-served after restart. Exclusion is valid only while the internal record still
-proves ownership of that exact object/name; this is never a magic filename
-prefix that could hide arbitrary user files.
+The walker also excludes exact active mutation-private staging/tombstone/backup
+names registered by the shared mutation layer, regardless of `hidden`. This is
+not limited to recursive-delete tombstones: any named private mutation artifact
+that can survive an in-flight operation must have exact ownership semantics.
+
+For named staging artifacts, first create the empty object with restrictive/no-
+broader protection and no-replace semantics, capture its stable no-follow object
+identity, then durably register the exact parent identity + basename + artifact
+identity **before writing user bytes**. If the process crashes before that durable
+record exists, the implementation may have left only the empty/restrictive
+ordinary object; restart must not hide or delete it merely because its filename
+looks internal. Once the record is durable, discovery may hide the exact matching
+identity/name while the record owns it. Publication/cleanup retires the record
+only after the private name is gone or no longer owned.
+
+Recursive `rm` tombstones keep their stronger existing rule: the identity-bound
+cleanup record is durable before namespace detach. Windows replacement backups
+use the same exact-record principle, with the record reserved before replacement
+and bound to the original target/future backup name so recovery cannot delete a
+user-created replacement. Use unnamed native staging where it cleanly preserves
+the same atomic/security properties; never require a weaker portable fallback.
+
+Pending durable private-artifact records are reconciled and registered before the
+filesystem surface is served after restart. Recovery may hide/delete an object
+only while its current no-follow identity still matches the record. A stale,
+absent or mismatched record is retired/diagnosed rather than hiding or deleting
+that namespace entry. This is never a magic filename prefix that could hide
+arbitrary user files.
 
 `ls` becomes essentially depth-one traversal + ordering + rendering.
 
@@ -3364,7 +3402,7 @@ powershell(command, dir=".", stdin=null, timeout_secs=null,
 
 # shared durable execution control
 job_start(ops)
-job_list(limit=64)
+job_list(offset=0, limit=64)
 job_get(id)
 job_output(id, node=null, stream=null, offset=0, ...)
 job_ack(id, node=null, stream=null, offset)
@@ -3841,6 +3879,19 @@ The v2 extension is complete only when:
     tools resolve/re-authorize the regular-file target and preserve the link;
     create-only paths do not follow dangling links; lifecycle tools act on the
     link object itself.
+66. `job_list` is a genuine live pageable query: `offset` + `limit`, newest-first
+    deterministic ordering, and `more offset=N`. Raising one limit to the full
+    retained cap is not a substitute for paging because a legal response budget
+    may be smaller than the retained namespace.
+67. Named mutation-private artifacts use exact durable ownership records, not
+    filename shape. Stages register stable identity before user bytes are written;
+    recursive-delete tombstones register before detach; replacement backups
+    reserve/bind recovery identity before replacement. Restart never hides or
+    deletes an identity mismatch.
+68. An explicitly authorized symlinked discovery root uses the resolved/pinned
+    directory for native traversal but keeps the caller's lexical root spelling in
+    model-visible results, preserving reusable path arguments and avoiding host-
+    namespace leakage.
 
 ## References
 

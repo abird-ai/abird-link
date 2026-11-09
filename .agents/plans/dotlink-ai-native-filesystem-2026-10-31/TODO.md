@@ -2,7 +2,7 @@
 
 Base: `84cd9b7`
 
-Status: **design sealed** after a second full correctness/security/edge-case review for v1 plus the specified v2 canonical Job/Graph runtime and shell nodes; implementation intentionally not started.
+Status: **model-facing design sealed; shared-engine cutover complete, with platform release gates still open**. Native filesystem and Graph/Job execution use the shared implementation in production, all three shared crates pin reviewed remote AW `4a23e92a8f516971bb232b98e4fc000554bcc4ba`, and the remote-pinned offline/locked gate is green. Remaining blockers are the explicitly documented native Bubblewrap and Windows/macOS platform checks.
 
 ## Committed
 
@@ -87,130 +87,163 @@ Status: **design sealed** after a second full correctness/security/edge-case rev
 
 ## Implementation roadmap
 
+### Phase 0 — shared implementation convergence
+
+**AW/shared implementation checkpoint (2026-11-09):** AW A1-A7 plus post-pin Job/output/config/topology hardening are freshly reviewed and pushed at commit `4a23e92a8f516971bb232b98e4fc000554bcc4ba`. The latest fix revalidates each canonical native filesystem footprint while its Graph node is still `Claimed`; any final-symlink/topology drift from the captured `NodePlan` settles unlaunched `skip` before the shared `Start` checkpoint. `aw-tools` remains the canonical semantic/Job crate, `aw-tools-adapter` remains the AW host adapter, and secured Unix/Windows backends depend only on the shared layer. The refactor remains consistent with AW's larger goals: one Agent/ToolPolicy/journal, narrowing-only host runtime limits, one JobManager, full/minimal/stateless/no-std boundaries, child-limit monotonicity and atomic scheduler-policy updates. Fresh gates: `aw-tools` 279/279, Unix secured backend 41/41, AW adapter 203/203, Agent core 78 active + 1 intentional ignore, AW CLI library 229/229 active, AW CLI binary 384/384 active + 1 intentional ignore, workspace all-target compile, strict affected Clippy, stateless/no-default, `minimal`, no-std+alloc, rustfmt/diff. Fresh Windows cross verification is environment-blocked before AW source compilation by a dangling cached Nix Windows-std symlink. `origin/main` now contains `4a23e92a8f516971bb232b98e4fc000554bcc4ba`, and dotlink pins all three shared crates to that exact remote Cargo Git revision. Sibling review paths are retired; never substitute a committed sibling path, local `file://` URL or vendored copy.
+
+**Dotlink convergence checkpoint:** production native filesystem dispatch uses the shared canonical parser/executor/backend for all 13 tools and the duplicate native filesystem modules are removed. The model-visible Graph surface is live: `batch(ops)`, Graph-shaped `job_start(ops)`, `job_restart(id)`, native filesystem nodes and ShellNodes use the shared `JobManager` for canonical lifecycle, captured budgets/footprints, deterministic admission, output ownership/ACK, exposure and cancellation/revocation; dotlink retains transport-delivery replay, process custody/sandbox, TTL and MCP projection. Against remote-pinned AW `4a23e92`, linked conformance and a separately regenerated external fixture (13 schemas / 13 requests) pass; the explicit ignored fixture gate executes and passes. The main suite is 628/628 active unit tests plus 1 intentional external-fixture ignore; all five integration binaries pass; strict all-target Clippy/check, rustfmt and diff checks pass. The fresh review adds one pre-effect topology invariant: before a native node crosses from `Claimed` to `Running`, dotlink recomputes the shared canonical request footprint and requires exact equality with the captured `NodePlan`, so a retargeted final symlink cannot invalidate deterministic conflict scheduling. The tracked dependencies use exact remote `4a23e92`; Cargo regenerated `Cargo.lock` with `git+https://github.com/abird-ai/aw?...#4a23e92`, and the full no-override validation is green.
+
+- [x] Treat `SHARED-IMPLEMENTATION.md` as the canonical cross-repo implementation architecture: one shared `aw-tools` semantic/runtime crate, one secured backend per platform, and thin AW/dotlink adapters.
+- [x] Fold the three review clarifications into the canonical model/runtime spec: paged `job_list(offset=0,limit=64)`, exact crash-private mutation artifact ownership/recovery, and lexical-prefix-preserving output for an authorized symlinked discovery root.
+- [x] Fresh reviewed AW implementation `4a23e92a8f516971bb232b98e4fc000554bcc4ba` is pushed and remotely reachable; dotlink uses that exact Cargo Git pin. No committed local-path substitute.
+- [x] In AW, mechanically rename `aw-tools-core -> aw-tools` and current `aw-tools -> aw-tools-adapter`; the rename and subsequent convergence phases are complete and validated in AW.
+- [x] Keep dotlink a single package; the thin shared-filesystem/rmcp adapter is internal (`mcp/shared_fs.rs`, `mcp/tools/shared_native.rs`) rather than a symmetry-only workspace crate.
+- [x] All three AW dependencies point together at reviewed remote `4a23e92...`; Cargo regenerated the lockfile from that Git source and the complete offline/locked no-override gate is green. Never commit a `../aw` path, local `file://` dependency or vendored implementation.
+- [x] Fresh cross-repo correctness review at AW `55d93db...`: AW shared/config/runtime architecture remained clean; dotlink retained its earlier pre-effect admission hardening and additionally fixed the pre-admission exposure race so shared visibility cannot lag an already-committed local durable surface. Full local-AW override main suite is 619/619 active unit tests plus 1 intentional ignore; production-binary strict Clippy, the exact external conformance fixture and all integration binaries pass. Strict all-target Clippy, rustfmt and diff checks pass. Added an explicit shutdown regression proving terminal shared file-backed output may remain unacknowledged while host shutdown safely expires shared retention, closes spool handles and removes the private session directory.
+- [x] Fresh topology/cutover review at AW `4a23e92`: confirmed the prior AW configuration/runtime refactor still satisfies off-mode, child inheritance, selected-tool, dynamic-policy, direct-vs-Graph and private-state boundaries; fixed final-symlink retarget drift by revalidating the canonical footprint before native `Start` in both AW and dotlink. Dotlink regression proves both possible targets stay unchanged and the node settles `skip`. Historical local-AW override at that checkpoint was 620/620 active + 1 intentional external-fixture ignore; the separately regenerated AW fixture's explicit ignored gate passes; all integrations, strict all-target Clippy/check, rustfmt and diff checks are green. A disposable exact-Git consumer resolves `aw-tools` at `4a23e92` successfully, then is blocked only by the environment's known crates.io CA-chain failure when fetching registry metadata.
+- [x] Fresh lifecycle/replay ownership review at AW `4a23e92`: standalone ShellNode execution now commits canonical shared `Start` before `Command::spawn`; a definitive spawn refusal settles known `fail`, while post-spawn custody ambiguity remains `unknown`. Any host entry that owns a shared Job now treats missing canonical state as split-brain rather than silently falling back to legacy lifecycle semantics. Shutdown cleans in place and retains host metadata/spool state if shared/output cleanup cannot be proven safe. Hosted replay revalidates the exact committed inner `Synchronous`/`Durable` representation immediately before delivering a cached terminal shell response; a stale body returns to the same inner execution's recoverable path instead of being delivered first and retired afterward. Full local-AW suite is now 628/628 active + 1 intentional external-fixture ignore; all five integration binaries, strict all-target Clippy/check, rustfmt and diff checks are green.
+- [x] Remote-pin cutover verification: pushed AW `4a23e92a8f516971bb232b98e4fc000554bcc4ba`, replaced all three sibling review dependencies with exact HTTPS Git revisions, regenerated `Cargo.lock` through Cargo, and reran dotlink without dependency overrides. `cargo test --offline --locked --all-features` passes 628/628 active unit tests + 1 intentional external-fixture ignore and all five integrations (1/1, 8/8, 1/1, 12/12, 4/4). The separately regenerated AW fixture passes the ignored cross-repo gate (13 schemas / 13 requests). `cargo check --offline --locked --all-targets --all-features`, strict all-target/all-feature Clippy, rustfmt and `git diff --check` are green. No `../aw`, `file://` or vendored shared dependency remains.
+- [x] Final integration lint pass removes an unused backend alias from production and replaces over-wide Job output page argument lists with one typed request/render path. Native Graph preparation/execution is production-live through `batch`, `job_start` and `job_restart`; current-AW all-target check and production-binary strict `-D warnings` are green.
+- [!] Native Bubblewrap smoke reaches the real launcher but this host rejects `proc` mounting with `Operation not permitted`; successful namespace execution remains an environment gate. Dotlink Windows cross-build is separately blocked by target-cache/Cargo CA constraints. A fresh AW Windows cross-run is also environment-blocked before source compilation because the cached Windows std sysroot symlink points to a removed Nix store path; earlier Windows cross results are historical evidence only.
+- [x] Make the shared `aw-tools` JobManager the sole canonical Graph/Job/Task lifecycle implementation; AW uses it through the original journal/authority/Process adapter and dotlink now uses it for production native/ShellNode Graph execution while retaining product transport/process responsibilities.
+
+- [x] Final cross-repo status review: shared `unknown` dominates cancel/revoke intent; dotlink preserves its live `working` / terminal `completed|failed|cancelled|unknown` compatibility vocabulary while exposing canonical `skip` and shared Graph lifecycle/summary detail. Explicit external conformance fixture from AW `4a23e92...` passes.
+- [x] Shared canonical file semantics no longer impose the old user-file single-hard-link restriction; private control/spool artifacts retain their stricter integrity checks.
+- [x] Replace magic-prefix private staging/tombstone hiding with bounded exact identity-owned records supplied by protected host stores; dotlink prepares durable per-write-root registries and reconciles them before serving shared filesystem operations.
+- [x] Retired duplicate dotlink native filesystem implementations only after shared canonical/security/failure and conformance tests passed; production dispatch now has one native filesystem engine.
+- [x] Add a test-only dotlink differential boundary that can consume the versioned shared conformance fixture without affecting production tool dispatch or standalone builds.
+- [x] Capture the first strict legacy-vs-canonical schema/tool/request drift report; do not normalize it away or weaken the shared expectations.
+- [x] Use the linked `aw_tools::conformance` surface as the primary in-repo parity gate; retain external fixture-path injection only as an ignored cross-repository proof that a separately generated reviewed fixture matches the linked revision.
+- [x] Build the thin dotlink filesystem adapter on the platform `CapabilitySet`: admitted grants/exclusions become `PreparedGrant`/`ExclusionSpec`, protected crash-durable Registry stores are reconciled before serving, final-symlink target namespaces are reauthorized, and recursive discovery/lifecycle semantics remain shared rather than reimplemented.
+- [x] Dotlink direct/native, ShellNode and Graph limits are mapped without semantic drift: read/write ceilings narrow shared safety maxima, encoded binary schema capacity is distinct from decoded writes, direct rendering consumes the authenticated result budget, Graph `NodePlan`s capture semantic work/result ceilings, retention calls shared `expire_terminal`, large shell logs attach through shared file-backed output ownership/quota, and `--serialize` captures Graph width 1 without a second scheduler.
+- [ ] Verify canonical Windows UNC/network-share paths (`//server/share/...`) on native Windows CI during cutover; the shared grammar/router already cross-compiles them, and they must never be silently routed through the launch drive.
+- [x] Complete model-visible Graph surface: `batch`, Graph-shaped `job_start`, `job_restart`, native+ShellNode execution through one shared JobManager, current-authority restart, and `--serialize` width-1 capture. Direct shell calls retain their one-ShellNode compatibility path without a second Graph parser or manager.
+
 ### Phase 1 — shared discovery/metadata architecture
 
-- [ ] Introduce one shared metadata model with portable file/symlink `size`,
+- [x] Introduce one shared metadata model with portable file/symlink `size`,
   POSIX `mode`, `mtime`, `ctime`, `btime` and precise unavailable semantics.
-- [ ] Refactor descriptor-rooted traversal so `hidden`, `gitignore`, `depth`,
+- [x] Refactor descriptor-rooted traversal so `hidden`, `gitignore`, `depth`,
   budgets, active mutation-private-name exclusion and incomplete reasons are
   single-sourced.
-- [ ] Introduce shared selector, ordering and compact-rendering primitives with
+- [x] Introduce shared selector, ordering and compact-rendering primitives with
   canonical `/` path separators, reversible UTF-8 labels, and fail-closed
   `path_encoding` coverage for unaddressable invalid-UTF-8 Unix names.
-- [ ] Preserve current deny/protected-path and symlink non-traversal invariants.
-- [ ] Preserve file/path-level mutation coordination as the correctness baseline;
+- [x] Preserve current deny/protected-path and symlink non-traversal invariants.
+- [x] Preserve file/path-level mutation coordination as the correctness baseline;
   do not add model-facing range/revision coordination knobs in v1.
 
 ### Phase 2 — `ls` + `find`
 
-- [ ] Shrink `ls` to immediate-directory inspection only.
-- [ ] Add `find` for recursive glob/regex/kind/depth/time discovery.
-- [ ] Add compact path output and opt-in ordered metadata columns.
-- [ ] Add `mtime`/`ctime`/`btime` filtering and sorting.
-- [ ] Add `hidden` and `gitignore` consistently to both.
-- [ ] Preserve bounded globally correct selection/paging.
+- [x] Shrink `ls` to immediate-directory inspection only.
+- [x] Add `find` for recursive glob/regex/kind/depth/time discovery.
+- [x] Add compact path output and opt-in ordered metadata columns.
+- [x] Add `mtime`/`ctime`/`btime` filtering and sorting.
+- [x] Add `hidden` and `gitignore` consistently to both.
+- [x] Preserve bounded globally correct selection/paging.
 
 ### Phase 3 — `grep` + read-side schema cleanup
 
-- [ ] Align `grep` with `depth`, `hidden`, `gitignore`.
-- [ ] Keep `glob` as the content-search path prefilter.
-- [ ] Replace advertised `before`/`after` with one bounded symmetric
+- [x] Align `grep` with `depth`, `hidden`, `gitignore`.
+- [x] Keep `glob` as the content-search path prefilter.
+- [x] Replace advertised `before`/`after` with one bounded symmetric
   `context`; use follow-up `read` for asymmetric inspection.
-- [ ] Make content results always line-numbered and remove advertised
+- [x] Make content results always line-numbered and remove advertised
   `numbered`.
-- [ ] Convert files/count results to compact deterministic text; define a grep
+- [x] Convert files/count results to compact deterministic text; define a grep
   hit/count as one matching logical line and order content by path then line.
-- [ ] Remove the legacy fixed per-file match-count cap; bounded file bytes/global
+- [x] Remove the legacy fixed per-file match-count cap; bounded file bytes/global
   scan work plus logical paging keep work finite while making later matches
   reachable.
-- [ ] Make `offset`/`limit` count primary hits in content mode and matching files
+- [x] Make `offset`/`limit` count primary hits in content mode and matching files
   in files/count mode; context never consumes page slots or leaks hits across
   page boundaries.
-- [ ] Stop advertising `read.max_read_bytes`; retain it as runtime/profile
+- [x] Stop advertising `read.max_read_bytes`; retain it as runtime/profile
   policy and surface the effective limit only in actionable errors.
-- [ ] Replace advertised read `offset`/`limit` with
+- [x] Replace advertised read `offset`/`limit` with
   `line`/`lines`/`byte` and support continuation inside oversized UTF-8
   lines.
-- [ ] Use the same continuation cursor when a direct-call profile/transport
+- [x] Use the same continuation cursor when a direct-call profile/transport
   ceiling ends a page; Graph-node modifiers instead come only from the semantic
   node ceilings captured at Job creation.
-- [ ] Define mid-read I/O faults as error-marked/fault-marked results with any
+- [x] Define mid-read I/O faults as error-marked/fault-marked results with any
   safely obtained prefix and cursor, never as a complete successful read.
 
 ### Phase 4 — text mutation schema/output cleanup
 
-- [ ] Make `edit(path,edits)` the single-file hot-path primitive, with compact
+- [x] Make `edit(path,edits)` the single-file hot-path primitive, with compact
   tuples `[old,new,all?]`.
-- [ ] Resolve every tuple against one original snapshot; `all` uses
+- [x] Resolve every tuple against one original snapshot; `all` uses
   left-to-right non-overlapping matches; reject ambiguous non-`all` matches and
   overlaps between selected ranges before staging.
-- [ ] Build/verify/publish the file once so several independent replacements
+- [x] Build/verify/publish the file once so several independent replacements
   remain one atomic visible mutation.
-- [ ] Keep contextual, dependent, overlapping and multi-file editing
+- [x] Keep contextual, dependent, overlapping and multi-file editing
   responsibility in strict `patch`.
-- [ ] Keep one advertised edit shape even for a single replacement; do not add a
+- [x] Keep one advertised edit shape even for a single replacement; do not add a
   top-level singular shorthand.
-- [ ] Keep legacy multi-file edit objects and the temporary singular edit shape
+- [x] Keep legacy multi-file edit objects and the temporary singular edit shape
   only as compatibility deserialization if needed.
-- [ ] Replace verbose successful mutation receipts with compact outcomes where
+- [x] Replace verbose successful mutation receipts with compact outcomes where
   no additional information is needed.
-- [ ] Define one shared mutation outcome model: not committed, committed,
+- [x] Define one shared mutation outcome model: not committed, committed,
   unknown, and explicit mixed multi-object commit state.
-- [ ] Ensure write/edit/binary staging failures never expose partial target
+- [x] Ensure write/edit/binary staging failures never expose partial target
   contents; over-limit writes fail before staging/publication.
-- [ ] Keep `write`/`bwrite` genuinely write-authority-only: successful publish is
+- [x] Keep `write`/`bwrite` genuinely write-authority-only: successful publish is
   `ok` and must not perform a hidden equality read to manufacture `unchanged`.
-- [ ] Preserve existing target access protection during atomic replacement; an
+- [x] Preserve existing target access protection during atomic replacement; an
   in-flight temporary must never be broader than the target it replaces.
-- [ ] Single-source final-component symlink semantics: content tools follow only
+- [x] Single-source final-component symlink semantics: content tools follow only
   after lexical + resolved authorization and preserve the link entry; create-only
   paths reject dangling links; lifecycle tools act on the link itself/no-follow.
-- [ ] Keep Codex patch grammar, advertise strict-only `patch(patch)`, and
+- [x] Keep Codex patch grammar, advertise strict-only `patch(patch)`, and
   leave move/delete to dedicated tools; coalesce shared missing-parent Add File
   sections into deterministic atomic namespace publication units.
-- [ ] Accept legacy `best_effort` only at the compatibility boundary if a
+- [x] Accept legacy `best_effort` only at the compatibility boundary if a
   migration window is required.
 
 ### Phase 5 — lifecycle primitives
 
-- [ ] Design/implement `cp(from,to)` through shared mutation/staging: files copy
+- [x] Design/implement `cp(from,to)` through shared mutation/staging: files copy
   as files, symlinks as exact no-follow links, directories as complete bounded
   trees; missing parent suffixes publish atomically; special descendants and
   destination-inside-source fail closed; hard-link topology is not promised.
-- [ ] Design/implement same-filesystem `mv(from,to)`; never implicit copy+delete,
+- [x] Design/implement same-filesystem `mv(from,to)`; never implicit copy+delete,
   require the destination parent to exist, reject self/descendant moves by
   namespace identity, and handle hard-link aliases/case-only renames explicitly.
-- [ ] Design/implement `rm(paths,recursive=false)` with full-request preflight;
+- [x] Design/implement `rm(paths,recursive=false)` with full-request preflight;
   recursive roots commit by atomic detach to exact private tombstones before
-  cleanup, never caller-visible child-by-child deletion. Durably reserve bounded
-  identity-bound cleanup records before detach, reconcile them before serving
+  cleanup, never caller-visible child-by-child deletion. Durably reserve **all**
+  bounded identity-bound cleanup records before the first detach, revalidate each
+  source identity immediately before rename, reconcile them before serving
   filesystem discovery after restart, and reject duplicate/alias/ancestor-
   descendant overlaps before any mutation.
-- [ ] Auto-create missing destination parents only for `cp`, inside the same
+- [x] Auto-create missing destination parents only for `cp`, inside the same
   staged publication unit; `mv` is strictly one rename or no namespace change.
-- [ ] Do not add glob expansion, destination inference or implicit overwrite.
-- [ ] Add replay protection/capability visibility for all lifecycle mutations.
+- [x] Do not add glob expansion, destination inference or implicit overwrite.
+- [x] Add replay protection/capability visibility for all lifecycle mutations.
 
 ### Phase 6 — canonical status, paging and progress
 
-- [ ] Implement primary outcomes `ok`, `unchanged`, `fail`, `mixed`,
+- [x] Implement primary outcomes `ok`, `unchanged`, `fail`, `mixed`,
   `unknown`, `skip` plus orthogonal query modifiers `more` and
   `incomplete`; keep `unknown` as the sole fail-closed ambiguity name (no
   `maybe` alias).
-- [ ] Make `mixed` represent multiple material terminal outcome families,
+- [x] Make `mixed` represent multiple material terminal outcome families,
   including mixtures that contain unknown components; use `unknown` only when
   all material components are unknown, and treat `skip` as structurally
   neutral when another material outcome exists.
-- [ ] Use one paging grammar based on actual follow-up argument names
+- [x] Use one paging grammar based on actual follow-up argument names
   (`more offset=200`, `more line=42 byte=...`), with optional known page
   fractions only when already cheap.
-- [ ] Keep `more` (recoverable continuation) distinct from `incomplete`
+- [x] Keep `more` (recoverable continuation) distinct from `incomplete`
   (coverage not guaranteed), including combined states.
-- [ ] Separate exact data and status into distinct MCP content blocks when status
+- [x] Separate exact data and status into distinct MCP content blocks when status
   text would corrupt returned bytes/text.
-- [ ] Standardize progress as cumulative snapshots: fixed total when known,
+- [x] Standardize progress as cumulative snapshots: fixed total when known,
   omitted total when open-ended, stable units and terse phase messages.
-- [ ] Ensure progress never carries the only copy of result data.
+- [x] Ensure progress never carries the only copy of result data.
 
 ### Phase 7 — shared Job/Graph/Node runtime + native `batch`
 

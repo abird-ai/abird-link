@@ -10,8 +10,6 @@ use std::{
 use tokio::sync::RwLock;
 
 use crate::logging::LogConfig;
-use crate::mcp::tools::dot;
-use crate::mcp::tools::grep::{GrepArgs, GrepOutputMode};
 use crate::mcp::{
     AccessPolicy, AccessSpec, LocalMachine, PreparedLaunchers, RuntimeConfig, TransportContextToken,
 };
@@ -33,6 +31,26 @@ pub(crate) fn test_machine(root: PathBuf) -> LocalMachine {
 pub(crate) fn test_machine_with(
     root: PathBuf,
     configure: impl FnOnce(&mut RuntimeConfig),
+) -> LocalMachine {
+    test_machine_with_launchers(root, configure, PreparedLaunchers::default())
+}
+
+#[cfg(unix)]
+pub(crate) fn test_machine_with_shell(root: PathBuf, shell: PathBuf) -> LocalMachine {
+    test_machine_with_launchers(
+        root,
+        |config| {
+            config.allow_shell = true;
+            config.sandbox_shell = false;
+        },
+        PreparedLaunchers::for_test(Some(shell), None),
+    )
+}
+
+fn test_machine_with_launchers(
+    root: PathBuf,
+    configure: impl FnOnce(&mut RuntimeConfig),
+    launchers: PreparedLaunchers,
 ) -> LocalMachine {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let root_for_secure_fs = root.clone();
@@ -58,14 +76,20 @@ pub(crate) fn test_machine_with(
         max_output_bytes: 65536,
         max_read_bytes: 65536,
         max_write_bytes: 65536,
-
+        shared_caps: crate::mcp::tools::shared_native::caps(65536, 65536).unwrap(),
         task_result_budget: None,
         protected_paths: Vec::new(),
     };
     configure(&mut config);
+    config.shared_caps =
+        crate::mcp::tools::shared_native::caps(config.max_read_bytes, config.max_write_bytes)
+            .unwrap();
+    let shared_fs =
+        crate::mcp::shared_fs::prepare_for_test(&config.access, &config.protected_paths).unwrap();
     LocalMachine {
+        shared_fs,
         config,
-        launchers: PreparedLaunchers::default(),
+        launchers,
         jobs: crate::jobs::JobManager::new(std::time::Duration::from_secs(
             crate::limits::DEFAULT_JOB_RETENTION_SECS,
         ))
@@ -83,6 +107,8 @@ pub(crate) fn test_machine_with(
             .unwrap(),
         ),
     }
+    .bind_test_execution_policy()
+    .unwrap()
 }
 
 pub(crate) fn access(root: &Path) -> AccessPolicy {
@@ -95,36 +121,4 @@ pub(crate) fn access(root: &Path) -> AccessPolicy {
         unrestricted_fs: false,
     })
     .unwrap()
-}
-
-pub(crate) fn grep_args(pattern: &str) -> GrepArgs {
-    GrepArgs {
-        pattern: pattern.to_owned(),
-        path: dot(),
-        glob: None,
-        literal: false,
-        ignore_case: false,
-        output_mode: GrepOutputMode::Content,
-        before: None,
-        after: None,
-        numbered: None,
-        offset: None,
-        limit: None,
-        gitignore: false,
-        skip_hidden: false,
-    }
-}
-
-pub(crate) fn grep_tree() -> (tempfile::TempDir, LocalMachine) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
-    std::fs::create_dir_all(root.join("src/nested")).unwrap();
-    std::fs::write(root.join("top.txt"), "alpha\nneedle one\nomega\n").unwrap();
-    std::fs::write(root.join("src/lib.rs"), "needle two\nplain\nneedle three\n").unwrap();
-    std::fs::write(root.join("src/nested/deep.rs"), "deep needle\n").unwrap();
-    std::fs::write(root.join("notes.md"), "needle notes\n").unwrap();
-    std::fs::write(root.join("binary.bin"), [0xff_u8, 0xfe, 0x00]).unwrap();
-    std::fs::write(root.join(".hidden.txt"), "needle hidden\n").unwrap();
-    let machine = test_machine(root);
-    (temp, machine)
 }

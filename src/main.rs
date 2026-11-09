@@ -11,7 +11,6 @@ mod jobs;
 mod limits;
 mod logging;
 mod mcp;
-mod mutation;
 mod oauth;
 mod private_state;
 mod recovery;
@@ -21,7 +20,6 @@ mod secure_fs;
 mod setup;
 mod shell_process;
 mod shutdown;
-mod staging;
 mod supervisor;
 mod transports;
 #[cfg(windows)]
@@ -1254,6 +1252,11 @@ fn runtime_authority_intent(
         // change must retire the old JobManager even when machine authority is
         // otherwise identical.
         "openai_job_namespace": openai_job_namespace_value(transports)?,
+        // Retained output and replay ownership are admitted under one immutable
+        // Job-session resource policy. Reloading either ceiling therefore
+        // retires the old session instead of rebudgeting already-admitted Jobs.
+        "job_retention_secs": setup.config.job_retention_secs,
+        "job_spool_bytes": setup.config.job_spool_bytes,
     }))?);
     Ok(RuntimeAuthorityIntent {
         execution,
@@ -1502,7 +1505,7 @@ async fn prepare_runtime(
     if let Some(openai) = transports.openai.as_mut() {
         openai.execution_authority = Some(authority);
     }
-    let machine = LocalMachine::from_prepared(prepared, job_manager)?;
+    let machine = LocalMachine::from_prepared(prepared, job_manager, authority)?;
     Ok((transports, machine))
 }
 
@@ -2118,6 +2121,53 @@ mod tests {
             before_revision, after_revision,
             "OAuth owner-password rotation must not revoke execution-lifetime job authority"
         );
+    }
+
+    #[test]
+    fn job_resource_policy_revokes_job_session_not_execution_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let args = Args::try_parse_from(["dotlink"]).unwrap();
+        let mut config: crate::setup::AppConfig =
+            serde_json::from_value(serde_json::json!({"version": 10})).unwrap();
+        config.transports.openai = false;
+        config.transports.stdio = true;
+        config.permissions.default_allow = true;
+        let setup = SetupResult {
+            config,
+            new_tunnel: false,
+            protected_paths: Vec::new(),
+        };
+        let policy = Policy::from_args(&args, root, &setup.config.permissions).unwrap();
+        let transports = ActiveTransports {
+            openai: None,
+            stdio: true,
+            http: None,
+        };
+        let baseline = runtime_authority_intent(&args, &setup, &policy, &transports).unwrap();
+
+        let mut retention_config = setup.config.clone();
+        retention_config.job_retention_secs += 60;
+        let retention_setup = SetupResult {
+            config: retention_config,
+            new_tunnel: setup.new_tunnel,
+            protected_paths: setup.protected_paths.clone(),
+        };
+        let retention =
+            runtime_authority_intent(&args, &retention_setup, &policy, &transports).unwrap();
+        assert_eq!(baseline.execution, retention.execution);
+        assert_ne!(baseline.job_session, retention.job_session);
+
+        let mut spool_config = setup.config;
+        spool_config.job_spool_bytes += crate::limits::MIN_JOB_SPOOL_BYTES;
+        let spool_setup = SetupResult {
+            config: spool_config,
+            new_tunnel: setup.new_tunnel,
+            protected_paths: setup.protected_paths,
+        };
+        let spool = runtime_authority_intent(&args, &spool_setup, &policy, &transports).unwrap();
+        assert_eq!(baseline.execution, spool.execution);
+        assert_ne!(baseline.job_session, spool.job_session);
     }
 
     #[test]

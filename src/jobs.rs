@@ -21,6 +21,27 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use aw_tools::filesystem::{
+    batch::{Graph as SharedGraph, NodeTool as SharedNodeTool, Status as SharedStatus},
+    footprint::Footprint as SharedFootprint,
+    job::{
+        JournalError as SharedJournalError, Lifecycle as SharedLifecycle,
+        NodeState as SharedNodeState, StopReason as SharedStopReason,
+    },
+    job_manager::{
+        JobManager as SharedJobManager, Limits as SharedJobLimits, NodePlan as SharedNodePlan,
+        NodePolicy as SharedNodePolicy, OutputOwner as SharedOutputOwner,
+        OutputStream as SharedOutputStream, OutputWriter as SharedOutputWriter,
+        RuntimeAdmission as SharedRuntimeAdmission, SemanticBudget as SharedSemanticBudget,
+        ShellOutputFiles as SharedShellOutputFiles, Snapshot as SharedSnapshot,
+        StartRequest as SharedStartRequest, plan_graph,
+    },
+    runner::{
+        ProcessExit as SharedProcessExit, ProcessOutputMeta as SharedProcessOutputMeta,
+        ProcessTerminal as SharedProcessTerminal,
+    },
+    status::Primary as SharedPrimary,
+};
 use futures_util::FutureExt as _;
 use rmcp::{
     ErrorData as McpError,
@@ -43,6 +64,7 @@ use crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM;
 
 const MAX_ACTIVE_JOBS: usize = 32;
 pub(crate) const MAX_RETAINED_JOBS: usize = 256;
+const SHARED_MAX_RETAINED_JOBS: usize = MAX_RETAINED_JOBS + MAX_REQUEST_REPLAYS;
 /// Transport-owned hidden state is separate from ordinary user-visible job
 /// retention. Request-key replay mappings plus positive-delivery cleanup-only
 /// retries share this bound; the spool quota independently bounds their bytes.
@@ -54,6 +76,14 @@ const SESSION_LOCK_FILE: &str = ".session.lock";
 const SESSION_COORDINATION_LOCK: &str = ".sessions.lock";
 const SESSION_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_JOB_ERROR_BYTES: usize = 16 * 1024;
+
+pub(crate) fn next_shared_sequence(manager: &SharedJobManager, id: &str) -> Result<u64> {
+    manager
+        .current_sequence(id)
+        .map_err(|error| anyhow!("cannot read shared Job transition sequence: {error:?}"))?
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("shared Job transition sequence exhausted"))
+}
 #[cfg(windows)]
 const SESSION_REMOVE_RETRIES: usize = 40;
 #[cfg(windows)]
@@ -81,11 +111,23 @@ pub(crate) enum JobStatus {
     TimedOut,
     Failed,
     Cancelled,
+    Unknown,
 }
 
 impl JobStatus {
     fn terminal(self) -> bool {
         self != Self::Working
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Completed => "completed",
+            Self::TimedOut => "timed_out",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
@@ -122,6 +164,18 @@ pub(crate) struct JobCompletion {
     pub(crate) stderr: StreamSummary,
     pub(crate) context: Option<JobResultContext>,
     pub(crate) internal_error: Option<String>,
+    /// Host-observed terminal event retained when canonical shared settlement
+    /// must conservatively publish `unknown` (for example an unprovable Unix
+    /// timeout/cancel stop). This is diagnostic evidence, never proof.
+    pub(crate) observed_status: Option<JobStatus>,
+    /// Whether the host proved stdout/stderr readers quiesced after process settlement.
+    pub(crate) output_complete: bool,
+    /// For timeout/cancel only: whether OS custody proved the launched process
+    /// tree stopped. Other terminal classes do not consult this bit.
+    pub(crate) stop_proven: bool,
+    /// The canonical Start checkpoint committed, but `Command::spawn` itself
+    /// definitively failed, so no process/effect was created.
+    pub(crate) spawn_failed: bool,
 }
 
 impl JobCompletion {
@@ -140,6 +194,10 @@ impl JobCompletion {
             stderr,
             context: None,
             internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            stop_proven: true,
+            spawn_failed: false,
         }
     }
 
@@ -153,6 +211,10 @@ impl JobCompletion {
             stderr,
             context: None,
             internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            stop_proven: true,
+            spawn_failed: false,
         }
     }
 
@@ -166,11 +228,36 @@ impl JobCompletion {
             stderr,
             context: None,
             internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            stop_proven: true,
+            spawn_failed: false,
         }
     }
 
     pub(crate) fn failed(message: impl Into<String>) -> Self {
         Self::failed_with_output(message, StreamSummary::default(), StreamSummary::default())
+    }
+
+    pub(crate) fn unknown_with_output(
+        message: impl Into<String>,
+        stdout: StreamSummary,
+        stderr: StreamSummary,
+    ) -> Self {
+        Self {
+            status: JobStatus::Unknown,
+            exit_code: None,
+            success: false,
+            error: Some(bounded_job_error(message)),
+            stdout,
+            stderr,
+            context: None,
+            internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            stop_proven: false,
+            spawn_failed: false,
+        }
     }
 
     pub(crate) fn failed_with_output(
@@ -187,7 +274,17 @@ impl JobCompletion {
             stderr,
             context: None,
             internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            stop_proven: true,
+            spawn_failed: false,
         }
+    }
+
+    pub(crate) fn spawn_failed(message: impl Into<String>) -> Self {
+        let mut completion = Self::failed(message);
+        completion.spawn_failed = true;
+        completion
     }
 
     pub(crate) fn internal_failed(
@@ -205,12 +302,86 @@ impl JobCompletion {
             stderr,
             context: None,
             internal_error: Some(message),
+            observed_status: None,
+            output_complete: false,
+            stop_proven: false,
+            spawn_failed: false,
         }
     }
 
     pub(crate) fn with_context(mut self, context: JobResultContext) -> Self {
         self.context = Some(context);
         self
+    }
+
+    pub(crate) fn with_incomplete_output(mut self) -> Self {
+        self.output_complete = false;
+        self
+    }
+
+    pub(crate) fn with_unproven_stop(mut self) -> Self {
+        self.stop_proven = false;
+        self
+    }
+
+    pub(crate) fn from_shared_graph(snapshot: &SharedSnapshot) -> Self {
+        let uncertain = matches!(
+            snapshot.summary,
+            Some((SharedPrimary::Unknown, _, _)) | None
+        );
+        let (status, success, error) = if uncertain {
+            (
+                JobStatus::Unknown,
+                false,
+                Some(
+                    "Graph terminal outcome is uncertain; inspect node results before retrying"
+                        .to_owned(),
+                ),
+            )
+        } else {
+            match snapshot.stop_reason {
+                Some(SharedStopReason::Cancelled) => (
+                    JobStatus::Cancelled,
+                    false,
+                    Some("Graph execution was cancelled".to_owned()),
+                ),
+                Some(SharedStopReason::Revoked) => (
+                    JobStatus::Failed,
+                    false,
+                    Some("Graph execution authority was revoked".to_owned()),
+                ),
+                None => match snapshot.summary.expect("uncertain handled above") {
+                    (SharedPrimary::Ok | SharedPrimary::Unchanged, _, _) => {
+                        (JobStatus::Completed, true, None)
+                    }
+                    (SharedPrimary::Fail | SharedPrimary::Mixed, _, _) => (
+                        JobStatus::Failed,
+                        false,
+                        Some("Graph completed with failed nodes".to_owned()),
+                    ),
+                    (SharedPrimary::Skip, _, _) => (
+                        JobStatus::Failed,
+                        false,
+                        Some("Graph completed without launching a successful node".to_owned()),
+                    ),
+                    (SharedPrimary::Unknown, _, _) => unreachable!("uncertain handled above"),
+                },
+            }
+        };
+        Self {
+            status,
+            exit_code: None,
+            success,
+            error,
+            stdout: StreamSummary::default(),
+            stderr: StreamSummary::default(),
+            context: None,
+            internal_error: None,
+            observed_status: None,
+            output_complete: true,
+            stop_proven: status != JobStatus::Unknown,
+            spawn_failed: false,
+        }
     }
 }
 
@@ -280,6 +451,32 @@ pub(crate) enum JobHandoff {
     NativeTask(Task),
 }
 
+struct SharedJobLease {
+    manager: Arc<SharedJobManager>,
+    id: String,
+}
+
+impl fmt::Debug for SharedJobLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedJobLease")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl Drop for SharedJobLease {
+    fn drop(&mut self) {
+        match self.manager.expire_terminal(&self.id) {
+            Ok(()) | Err(aw_tools::filesystem::job_manager::Error::NotFound) => {}
+            Err(error) => tracing::warn!(
+                id = %self.id,
+                ?error,
+                "shared Job projection outlived dotlink host retention entry"
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct JobEntry {
     id: String,
@@ -295,14 +492,17 @@ struct JobEntry {
     terminal_at: Option<Instant>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    spool_account: Arc<SpoolAccount>,
+    drain_writers: Arc<DrainWriters>,
+    legacy_spool: Option<Arc<LegacySpoolAccount>>,
+    // Legacy/test-only stream mirrors. Shared production entries derive all
+    // retained/ACK/released state directly from SharedJobManager.
     stdout_retained: u64,
     stderr_retained: u64,
     stdout_consumed: u64,
     stderr_consumed: u64,
-    /// The full durable stream is no longer pageable. Compatibility cleanup
-    /// deletes it; native Task compaction may still retain the exact Task-result
-    /// prefix for `tasks/get` while marking the original stream released.
+    /// The user-facing job stream is no longer pageable after its Job owner is
+    /// fully acknowledged. A native Task may still retain the same immutable
+    /// shared spool under its separate owner until Task/job retention expires.
     stdout_released: bool,
     stderr_released: bool,
     readers: usize,
@@ -319,6 +519,11 @@ struct JobEntry {
     /// Exact live Linux sandbox guard generation used to prepare this command.
     /// None for unsandboxed/non-Linux commands and pre-execution failures.
     shell_guard_generation: Option<[u8; 32]>,
+    /// RAII owner of the canonical shared lifecycle projection.
+    shared_job: Option<SharedJobLease>,
+    /// Multi-node/native Graph runner already owns every shared node transition.
+    /// The legacy local finisher must not settle node 1 again.
+    shared_graph_authoritative: bool,
     /// When user-visible retention began. For request-key responses this is
     /// rebased on positive delivery acknowledgement; execution completion stays
     /// independently represented by `terminal_at`.
@@ -333,19 +538,13 @@ impl JobEntry {
             .map_or(JobStatus::Working, |completion| completion.status)
     }
 
-    fn stream_released(&self, stream: JobStream) -> bool {
-        match stream {
-            JobStream::Stdout => self.stdout_released,
-            JobStream::Stderr => self.stderr_released,
-        }
-    }
-
-    fn any_output_released(&self) -> bool {
-        self.stdout_released || self.stderr_released
-    }
-
     fn all_output_released(&self) -> bool {
-        self.stdout_released && self.stderr_released
+        if self.shared_graph_authoritative {
+            return authoritative_graph_outputs_released(self);
+        }
+        [JobStream::Stdout, JobStream::Stderr]
+            .into_iter()
+            .all(|stream| job_owner_projection(self, stream).is_ok_and(|state| state.released))
     }
 }
 
@@ -380,34 +579,110 @@ struct JobManagerInner {
     sweeper: Mutex<Option<JoinHandle<()>>>,
     intent_fingerprint: Mutex<Option<[u8; 32]>>,
     policy_fingerprint: Mutex<Option<[u8; 32]>>,
+    session_fingerprint: [u8; 32],
+    shared_jobs: Arc<SharedJobManager>,
 }
 
 const SPOOL_WRITERS_SEALED: usize = 1usize << (usize::BITS - 1);
 const SPOOL_WRITER_COUNT_MASK: usize = !SPOOL_WRITERS_SEALED;
 
-#[derive(Debug)]
-struct SpoolAccount {
-    inner: Weak<JobManagerInner>,
-    charged: AtomicU64,
+/// Host-only lifetime fence for async stdout/stderr drain tasks. Byte quota,
+/// retained prefixes, paging and acknowledgements belong to shared JobManager.
+#[derive(Debug, Default)]
+struct DrainWriters {
     writers: AtomicUsize,
     writers_idle: Notify,
 }
 
+/// Legacy/test-only local byte account for entries that never attach shared
+/// output. Production shared jobs use SharedJobManager as the sole byte owner.
 #[derive(Debug)]
-pub(crate) struct SpoolWriterGuard {
-    account: Arc<SpoolAccount>,
+struct LegacySpoolAccount {
+    inner: Weak<JobManagerInner>,
+    charged: AtomicU64,
 }
 
-impl SpoolAccount {
+#[derive(Debug)]
+pub(crate) struct SpoolWriterGuard {
+    drain: Arc<DrainWriters>,
+}
+
+impl DrainWriters {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn begin<const N: usize>(self: &Arc<Self>) -> Option<[SpoolWriterGuard; N]> {
+        if N == 0 {
+            return Some(std::array::from_fn(|_| unreachable!()));
+        }
+        let mut state = self.writers.load(Ordering::Acquire);
+        loop {
+            if state & SPOOL_WRITERS_SEALED != 0 {
+                return None;
+            }
+            let count = state & SPOOL_WRITER_COUNT_MASK;
+            let next_count = count.checked_add(N)?;
+            if next_count > SPOOL_WRITER_COUNT_MASK {
+                return None;
+            }
+            match self.writers.compare_exchange_weak(
+                state,
+                next_count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(std::array::from_fn(|_| SpoolWriterGuard {
+                        drain: self.clone(),
+                    }));
+                }
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn begin_one(self: &Arc<Self>) -> Option<SpoolWriterGuard> {
+        self.begin::<1>().map(|[writer]| writer)
+    }
+
+    fn seal(&self) {
+        self.writers
+            .fetch_or(SPOOL_WRITERS_SEALED, Ordering::AcqRel);
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.writers_idle.notified();
+            tokio::pin!(notified);
+            // Register before observing the count: `notify_waiters` does not store
+            // a permit for a future waiter, so checking first could miss the final
+            // writer transition and sleep forever.
+            notified.as_mut().enable();
+            if self.writers.load(Ordering::Acquire) & SPOOL_WRITER_COUNT_MASK == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn seal_and_wait_idle(&self) {
+        self.seal();
+        self.wait_idle().await;
+    }
+}
+
+impl LegacySpoolAccount {
+    #[cfg(test)]
     fn new(inner: &Arc<JobManagerInner>) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::downgrade(inner),
             charged: AtomicU64::new(0),
-            writers: AtomicUsize::new(0),
-            writers_idle: Notify::new(),
         })
     }
 
+    #[cfg(test)]
     fn reserve(&self, requested: u64) -> u64 {
         let Some(inner) = self.inner.upgrade() else {
             return 0;
@@ -452,94 +727,24 @@ impl SpoolAccount {
         }
     }
 
-    fn begin_writers<const N: usize>(self: &Arc<Self>) -> Option<[SpoolWriterGuard; N]> {
-        if N == 0 {
-            return Some(std::array::from_fn(|_| unreachable!()));
-        }
-        let mut state = self.writers.load(Ordering::Acquire);
-        loop {
-            if state & SPOOL_WRITERS_SEALED != 0 {
-                return None;
-            }
-            let count = state & SPOOL_WRITER_COUNT_MASK;
-            let next_count = count.checked_add(N)?;
-            if next_count > SPOOL_WRITER_COUNT_MASK {
-                return None;
-            }
-            match self.writers.compare_exchange_weak(
-                state,
-                next_count,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(std::array::from_fn(|_| SpoolWriterGuard {
-                        account: self.clone(),
-                    }));
-                }
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn begin_writer(self: &Arc<Self>) -> Option<SpoolWriterGuard> {
-        self.begin_writers::<1>().map(|[writer]| writer)
-    }
-
-    fn seal_writers(&self) {
-        self.writers
-            .fetch_or(SPOOL_WRITERS_SEALED, Ordering::AcqRel);
-    }
-
-    async fn wait_writers_idle(&self) {
-        loop {
-            let notified = self.writers_idle.notified();
-            tokio::pin!(notified);
-            // Register before observing the count: `notify_waiters` does not store
-            // a permit for a future waiter, so checking first could miss the final
-            // writer transition and sleep forever.
-            notified.as_mut().enable();
-            if self.writers.load(Ordering::Acquire) & SPOOL_WRITER_COUNT_MASK == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    async fn seal_and_wait_writers_idle(&self) {
-        self.seal_writers();
-        self.wait_writers_idle().await;
-    }
-
     #[cfg(test)]
     fn charged(&self) -> u64 {
         self.charged.load(Ordering::Relaxed)
     }
 }
 
-impl SpoolWriterGuard {
-    pub(crate) fn reserve(&self, requested: u64) -> u64 {
-        self.account.reserve(requested)
-    }
-
-    pub(crate) fn release(&self, bytes: u64) {
-        self.account.release(bytes);
-    }
-}
-
 impl Drop for SpoolWriterGuard {
     fn drop(&mut self) {
-        let previous = self.account.writers.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.drain.writers.fetch_sub(1, Ordering::AcqRel);
         let previous_count = previous & SPOOL_WRITER_COUNT_MASK;
         debug_assert!(previous_count != 0, "spool writer count underflow");
         if previous_count == 1 {
-            self.account.writers_idle.notify_waiters();
+            self.drain.writers_idle.notify_waiters();
         }
     }
 }
 
-impl Drop for SpoolAccount {
+impl Drop for LegacySpoolAccount {
     fn drop(&mut self) {
         let residual = self.charged.swap(0, Ordering::AcqRel);
         if residual == 0 {
@@ -614,7 +819,7 @@ impl Drop for JobManagerInner {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
             for entry in state.jobs.values_mut() {
-                entry.spool_account.seal_writers();
+                entry.drain_writers.seal();
                 entry.cancel.cancel();
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
@@ -661,11 +866,467 @@ pub(crate) struct JobHandle {
     pub(crate) cancel: CancellationToken,
     pub(crate) stdout_path: PathBuf,
     pub(crate) stderr_path: PathBuf,
-    spool_account: Arc<SpoolAccount>,
+    stdout_file: Arc<File>,
+    stderr_file: Arc<File>,
+    drain_writers: Arc<DrainWriters>,
+    #[cfg(test)]
+    legacy_spool: Option<Arc<LegacySpoolAccount>>,
     inner: Weak<JobManagerInner>,
 }
 
+#[derive(Clone)]
+pub(crate) struct SharedShellWriters {
+    pub(crate) stdout: SharedOutputWriter,
+    pub(crate) stderr: SharedOutputWriter,
+}
+
+fn shared_task_output_owner(id: &str) -> Result<SharedOutputOwner> {
+    let mut bytes = b"dotlink-native-task-output-owner-v1\0".to_vec();
+    bytes.extend_from_slice(id.as_bytes());
+    SharedOutputOwner::new(crate::mcp::sha256(&bytes))
+        .map_err(|error| anyhow!("invalid shared native-task output owner: {error:?}"))
+}
+
+fn rollback_shared_claim(inner: &JobManagerInner, id: &str) {
+    let claimed = match inner.shared_jobs.node_state(id, 1) {
+        Ok(SharedNodeState::Claimed { sequence }) => sequence,
+        Ok(SharedNodeState::Terminal { .. })
+        | Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+            return;
+        }
+        Ok(state) => {
+            tracing::warn!(%id, ?state, "shared shell rollback found unexpected pre-launch state");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%id, ?error, "could not inspect shared shell claim for rollback");
+            return;
+        }
+    };
+    let sequence = match next_shared_sequence(&inner.shared_jobs, id) {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            tracing::warn!(%id, %error, "could not advance shared shell sequence for rollback");
+            return;
+        }
+    };
+    match inner.shared_jobs.settle_unlaunched(
+        id,
+        1,
+        claimed,
+        sequence,
+        |_, _| Ok(()),
+        |_, _| Ok::<_, SharedJournalError>(()),
+    ) {
+        Ok(()) => {
+            if let Err(error) = inner.shared_jobs.expire_terminal(id)
+                && !matches!(error, aw_tools::filesystem::job_manager::Error::NotFound)
+            {
+                tracing::warn!(%id, ?error, "could not expire rolled-back shared shell Job");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%id, ?error, "could not roll back claimed shared shell Job");
+        }
+    }
+}
+
+fn rollback_shared_process_attachment(
+    inner: &JobManagerInner,
+    id: &str,
+    owners: &[SharedOutputOwner],
+    stdout: &SharedOutputWriter,
+    stderr: &SharedOutputWriter,
+) {
+    let _ = stdout.finish();
+    let _ = stderr.finish();
+    for stream in [SharedOutputStream::Stdout, SharedOutputStream::Stderr] {
+        for owner in owners {
+            let _ = inner
+                .shared_jobs
+                .acknowledge_output(id, 1, stream, *owner, 0);
+        }
+    }
+    rollback_shared_claim(inner, id);
+}
+
+fn reconcile_prelaunch_shared_exposure(
+    manager: &SharedJobManager,
+    id: &str,
+    context: &str,
+) -> Result<()> {
+    let exposure = manager
+        .reserve_exposed(id)
+        .and_then(|()| manager.expose(id));
+    if let Err(error) = exposure {
+        let cleanup = manager.discard_unstarted(id);
+        bail!("{context}: {error:?}; cleanup={cleanup:?}");
+    }
+    Ok(())
+}
+
 impl JobHandle {
+    pub(crate) fn admit_prepared_graph(
+        &self,
+        graph: SharedGraph,
+        plans: Vec<SharedNodePlan>,
+        width: usize,
+        shell_guard_generation: Option<[u8; 32]>,
+        authoritative: bool,
+    ) -> Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("job session disappeared before Graph admission"))?;
+        if plans.len() != graph.steps().len() || plans.is_empty() {
+            bail!("prepared Graph plans do not match Graph shape");
+        }
+        let runtime_session = inner
+            .intent_fingerprint
+            .lock()
+            .map_err(|_| anyhow!("job intent fingerprint lock poisoned"))?
+            .unwrap_or(inner.session_fingerprint);
+        let runtime_session = hex::encode(runtime_session);
+        inner
+            .shared_jobs
+            .admit_runtime(
+                graph,
+                plans,
+                SharedRuntimeAdmission {
+                    id: &self.id,
+                    runtime_session: &runtime_session,
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width,
+                    exposed: false,
+                },
+            )
+            .map_err(|error| anyhow!("shared Graph admission failed: {error:?}"))?;
+        let mut state = inner.state.lock().expect("job manager lock");
+        let Some(entry) = state.jobs.get_mut(&self.id) else {
+            drop(state);
+            let _ = inner.shared_jobs.discard_unstarted(&self.id);
+            bail!("job disappeared during shared Graph admission");
+        };
+        if entry.completion.is_some() || entry.shared_job.is_some() {
+            drop(state);
+            let _ = inner.shared_jobs.discard_unstarted(&self.id);
+            bail!("job is no longer eligible for shared Graph admission");
+        }
+        // A local response can be abandoned or handed off before this async
+        // runner reaches shared Graph admission. In that ordering the local
+        // wire disposition is already durable while the shared Job did not yet
+        // exist, so the earlier exposure attempt necessarily observed NotFound.
+        // Reconcile visibility here, still before claim/process launch, so the
+        // canonical JobManager never trails an already-committed host surface.
+        if entry.disposition.exposed()
+            && let Err(error) = reconcile_prelaunch_shared_exposure(
+                &inner.shared_jobs,
+                &self.id,
+                "shared Graph could not reconcile pre-admission exposure before launch",
+            )
+        {
+            drop(state);
+            return Err(error);
+        }
+        entry.shell_guard_generation = shell_guard_generation;
+        entry.shared_graph_authoritative = authoritative;
+        entry.shared_job = Some(SharedJobLease {
+            manager: inner.shared_jobs.clone(),
+            id: self.id.clone(),
+        });
+        entry.updated_at = chrono::Utc::now().to_rfc3339();
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn restart_prepared_graph(
+        &self,
+        source_id: &str,
+        graph: SharedGraph,
+        plans: Vec<SharedNodePlan>,
+        width: usize,
+        shell_guard_generation: Option<[u8; 32]>,
+    ) -> Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("job session disappeared before Graph restart"))?;
+        if plans.len() != graph.steps().len() || plans.is_empty() {
+            bail!("prepared restart plans do not match Graph shape");
+        }
+        let runtime_session = inner
+            .intent_fingerprint
+            .lock()
+            .map_err(|_| anyhow!("job intent fingerprint lock poisoned"))?
+            .unwrap_or(inner.session_fingerprint);
+        let runtime_session = hex::encode(runtime_session);
+        inner
+            .shared_jobs
+            .restart_runtime(
+                source_id,
+                graph,
+                plans,
+                SharedRuntimeAdmission {
+                    id: &self.id,
+                    runtime_session: &runtime_session,
+                    epoch: 1,
+                    admission_sequence: 1,
+                    width,
+                    exposed: false,
+                },
+            )
+            .map_err(|error| anyhow!("shared Graph restart admission failed: {error:?}"))?;
+        let mut state = inner.state.lock().expect("job manager lock");
+        let Some(entry) = state.jobs.get_mut(&self.id) else {
+            drop(state);
+            let _ = inner.shared_jobs.discard_unstarted(&self.id);
+            bail!("restarted job disappeared during shared Graph admission");
+        };
+        if entry.completion.is_some() || entry.shared_job.is_some() {
+            drop(state);
+            let _ = inner.shared_jobs.discard_unstarted(&self.id);
+            bail!("job is no longer eligible for shared Graph restart");
+        }
+        if entry.disposition.exposed()
+            && let Err(error) = reconcile_prelaunch_shared_exposure(
+                &inner.shared_jobs,
+                &self.id,
+                "shared restarted Graph exposure failed before launch",
+            )
+        {
+            drop(state);
+            return Err(error);
+        }
+        entry.shell_guard_generation = shell_guard_generation;
+        entry.shared_graph_authoritative = true;
+        entry.shared_job = Some(SharedJobLease {
+            manager: inner.shared_jobs.clone(),
+            id: self.id.clone(),
+        });
+        entry.updated_at = chrono::Utc::now().to_rfc3339();
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn claim_prepared_shell(
+        &self,
+        tool: SharedNodeTool,
+        arguments: serde_json::Value,
+        shell_guard_generation: Option<[u8; 32]>,
+        result_limit: usize,
+        stream_capacity: u64,
+    ) -> Result<SharedShellWriters> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("job session disappeared before shell claim"))?;
+        {
+            let state = inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("job manager lock poisoned"))?;
+            let entry = state
+                .jobs
+                .get(&self.id)
+                .ok_or_else(|| anyhow!("job disappeared before shared shell claim"))?;
+            if entry.result_limit != result_limit {
+                bail!("shared shell result limit differs from admitted host Job");
+            }
+        }
+        let authority = inner
+            .policy_fingerprint
+            .lock()
+            .map_err(|_| anyhow!("job policy fingerprint lock poisoned"))?
+            .ok_or_else(|| anyhow!("shell execution policy is not bound"))?;
+        if authority == [0; 32] {
+            bail!("shell execution policy fingerprint is invalid");
+        }
+        let graph_input = serde_json::json!({"ops":[[tool.name(), arguments]]});
+        let graph = SharedGraph::compile_with(
+            &graph_input,
+            |name| (name == tool.name()).then_some(tool),
+            |node, args| node == tool && args.is_object(),
+        )
+        .map_err(|error| anyhow!("cannot compile shared shell Job: {error:?}"))?;
+        let work_bytes = stream_capacity.saturating_mul(2).max(1);
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(SharedNodePolicy {
+                budget: SharedSemanticBudget {
+                    work_bytes,
+                    result_bytes: 4 * 1024,
+                },
+                // A standalone shell Job has no sibling Graph node to order.
+                // Keep its shared footprint conservative: `writes` remains an
+                // advisory scheduling hint, never authority or correctness input.
+                footprint: SharedFootprint::unknown(true, true),
+                registry_generation: 1,
+                authority_binding: authority,
+                runtime_binding: authority,
+                task_result_eligible: false,
+            })
+        })
+        .map_err(|error| anyhow!("cannot plan shared shell Job: {error:?}"))?;
+        self.admit_prepared_graph(graph, plans, 1, shell_guard_generation, false)?;
+        let claim = inner
+            .shared_jobs
+            .claim(&self.id, 1, true, 2, |_, _| Ok::<_, SharedJournalError>(()));
+        if let Err(error) = claim {
+            let _ = inner.shared_jobs.discard_unstarted(&self.id);
+            return Err(anyhow!("shared shell Job claim failed: {error:?}"));
+        }
+        let job_owner = inner
+            .shared_jobs
+            .job_output_owner(&self.id)
+            .map_err(|error| anyhow!("cannot derive shared shell output owner: {error:?}"))?;
+        let task_owner = shared_task_output_owner(&self.id)?;
+        let owners = [job_owner, task_owner];
+        let stdout_file = self
+            .stdout_file
+            .try_clone()
+            .context("cannot clone exact stdout spool capability")?;
+        let stderr_file = match self.stderr_file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                rollback_shared_claim(&inner, &self.id);
+                return Err(error).context("cannot clone exact stderr spool capability");
+            }
+        };
+        let (stdout, stderr) = match inner.shared_jobs.attach_process_output_files(
+            &self.id,
+            1,
+            owners,
+            SharedShellOutputFiles {
+                stdout: stdout_file,
+                stderr: stderr_file,
+                stream_capacity,
+            },
+        ) {
+            Ok(writers) => writers,
+            Err(error) => {
+                rollback_shared_claim(&inner, &self.id);
+                return Err(anyhow!(
+                    "shared process output attachment failed: {error:?}"
+                ));
+            }
+        };
+        let state = inner.state.lock().expect("job manager lock");
+        let Some(entry) = state.jobs.get(&self.id) else {
+            drop(state);
+            rollback_shared_process_attachment(&inner, &self.id, &owners, &stdout, &stderr);
+            bail!("job disappeared during shared shell claim");
+        };
+        if entry.completion.is_some() || entry.shared_job.is_none() {
+            drop(state);
+            rollback_shared_process_attachment(&inner, &self.id, &owners, &stdout, &stderr);
+            bail!("job is no longer eligible for shared shell claim");
+        }
+        drop(state);
+        Ok(SharedShellWriters { stdout, stderr })
+    }
+
+    pub(crate) fn shared_manager(&self) -> Result<Arc<SharedJobManager>> {
+        self.inner
+            .upgrade()
+            .map(|inner| inner.shared_jobs.clone())
+            .ok_or_else(|| anyhow!("job session disappeared"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_launched(&self) -> Result<()> {
+        self.mark_node_launched(1)
+    }
+
+    /// Commit the canonical Start checkpoint before the OS is allowed to spawn
+    /// the process. Every production shell Job must already own a shared claim;
+    /// a missing shared entry is split-brain state, never a compatibility path.
+    pub(crate) fn mark_node_launched(&self, coordinate: usize) -> Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("job session disappeared before process launch"))?;
+        let claimed_sequence = match inner.shared_jobs.node_state(&self.id, coordinate) {
+            Ok(SharedNodeState::Claimed { sequence }) => sequence,
+            Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+                bail!("shared shell Job is missing before process launch")
+            }
+            Ok(state) => bail!("shared shell Job has invalid pre-launch state: {state:?}"),
+            Err(error) => bail!("cannot inspect shared shell Job before start: {error:?}"),
+        };
+        let sequence = next_shared_sequence(&inner.shared_jobs, &self.id)?;
+        inner
+            .shared_jobs
+            .start(
+                &self.id,
+                SharedStartRequest {
+                    coordinate,
+                    claimed_sequence,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence,
+                },
+                |_, _| Ok::<_, SharedJournalError>(()),
+            )
+            .map_err(|error| anyhow!("shared shell start checkpoint failed: {error:?}"))?;
+
+        let mut state = inner.state.lock().expect("job manager lock");
+        if state.closed {
+            bail!("job session closed before process launch");
+        }
+        let Some(entry) = state.jobs.get_mut(&self.id) else {
+            bail!("job disappeared before process launch");
+        };
+        if entry.completion.is_some() {
+            bail!("job became terminal before process launch");
+        }
+        entry.phase = JobPhase::Running;
+        entry.updated_at = chrono::Utc::now().to_rfc3339();
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settle_unlaunched(&self) {
+        self.settle_node_unlaunched(1);
+    }
+
+    pub(crate) fn settle_node_unlaunched(&self, coordinate: usize) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let Ok(SharedNodeState::Claimed { sequence: claimed }) =
+            inner.shared_jobs.node_state(&self.id, coordinate)
+        else {
+            return;
+        };
+        let sequence = match next_shared_sequence(&inner.shared_jobs, &self.id) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                tracing::warn!(id = %self.id, %error, "could not advance unlaunched shared shell sequence");
+                return;
+            }
+        };
+        for stream in [SharedOutputStream::Stdout, SharedOutputStream::Stderr] {
+            if let Err(error) = inner
+                .shared_jobs
+                .finish_output(&self.id, coordinate, stream)
+            {
+                tracing::warn!(id = %self.id, ?error, ?stream, "could not finish unlaunched shared shell output");
+            }
+        }
+        if let Err(error) = inner.shared_jobs.settle_unlaunched(
+            &self.id,
+            coordinate,
+            claimed,
+            sequence,
+            |_, _| Ok(()),
+            |_, _| Ok::<_, SharedJournalError>(()),
+        ) {
+            tracing::warn!(id = %self.id, ?error, "could not settle shared shell Job as unlaunched");
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_running(&self, shell_guard_generation: Option<[u8; 32]>) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
@@ -692,29 +1353,68 @@ impl JobHandle {
     /// the producer after the budget is exhausted.
     #[cfg(test)]
     pub(crate) fn reserve_spool(&self, requested: u64) -> u64 {
-        self.spool_account.reserve(requested)
+        self.legacy_spool
+            .as_ref()
+            .map_or(0, |account| account.reserve(requested))
     }
 
     #[cfg(test)]
     pub(crate) fn release_spool(&self, bytes: u64) {
-        self.spool_account.release(bytes);
+        if let Some(account) = &self.legacy_spool {
+            account.release(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_stream_summary(
+        &self,
+        stream: JobStream,
+        force_truncated: bool,
+    ) -> StreamSummary {
+        self.shared_node_stream_summary(1, stream, force_truncated)
+    }
+
+    pub(crate) fn shared_node_stream_summary(
+        &self,
+        coordinate: usize,
+        stream: JobStream,
+        force_truncated: bool,
+    ) -> StreamSummary {
+        let Some(inner) = self.inner.upgrade() else {
+            return fallback_stream_summary(stream_path_handle(self, stream), true);
+        };
+        let shared_stream = match stream {
+            JobStream::Stdout => SharedOutputStream::Stdout,
+            JobStream::Stderr => SharedOutputStream::Stderr,
+        };
+        match inner
+            .shared_jobs
+            .output_summary(&self.id, coordinate, shared_stream)
+        {
+            Ok((summary, _)) => StreamSummary {
+                total_bytes: summary.total_bytes,
+                stored_bytes: summary.retained_bytes,
+                truncated: summary.truncated || force_truncated,
+            },
+            Err(_) => fallback_stream_summary(stream_path_handle(self, stream), true),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn begin_spool_writer(&self) -> Option<SpoolWriterGuard> {
-        self.spool_account.begin_writer()
+        self.drain_writers.begin_one()
     }
 
     pub(crate) fn begin_spool_writers(&self) -> Option<[SpoolWriterGuard; 2]> {
-        self.spool_account.begin_writers::<2>()
+        self.drain_writers.begin::<2>()
     }
 
     pub(crate) fn seal_spool_writers(&self) {
-        self.spool_account.seal_writers();
+        self.drain_writers.seal();
     }
 
     pub(crate) async fn wait_spool_writers_idle(&self) {
-        self.spool_account.wait_writers_idle().await;
+        self.drain_writers.wait_idle().await;
     }
 }
 
@@ -730,6 +1430,72 @@ impl JobStream {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JobOutputStream {
+    Result,
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutputPageRequest {
+    pub node: Option<usize>,
+    pub stream: Option<JobOutputStream>,
+    pub offset: u64,
+    pub requested_bytes: usize,
+    pub response_ceiling: usize,
+    pub base64: bool,
+}
+
+impl JobOutputStream {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Result => "result",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+
+    fn shared(self) -> SharedOutputStream {
+        match self {
+            Self::Result => SharedOutputStream::Result,
+            Self::Stdout => SharedOutputStream::Stdout,
+            Self::Stderr => SharedOutputStream::Stderr,
+        }
+    }
+
+    fn legacy(self) -> Option<JobStream> {
+        match self {
+            Self::Result => None,
+            Self::Stdout => Some(JobStream::Stdout),
+            Self::Stderr => Some(JobStream::Stderr),
+        }
+    }
+}
+
+fn shared_output_stream(stream: JobStream) -> SharedOutputStream {
+    match stream {
+        JobStream::Stdout => SharedOutputStream::Stdout,
+        JobStream::Stderr => SharedOutputStream::Stderr,
+    }
+}
+
+fn fallback_stream_summary(path: &Path, truncated: bool) -> StreamSummary {
+    let stored = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    StreamSummary {
+        total_bytes: stored,
+        stored_bytes: stored,
+        truncated,
+    }
+}
+
+fn stream_path_handle(handle: &JobHandle, stream: JobStream) -> &Path {
+    match stream {
+        JobStream::Stdout => &handle.stdout_path,
+        JobStream::Stderr => &handle.stderr_path,
     }
 }
 
@@ -800,6 +1566,8 @@ type JobResult<T> = std::result::Result<T, JobError>;
 #[derive(Debug, Serialize)]
 struct JobOutputPage<'a> {
     job_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<usize>,
     stream: &'static str,
     offset: u64,
     next_offset: u64,
@@ -814,6 +1582,7 @@ struct JobOutputPage<'a> {
 
 struct PendingJobFiles {
     paths: [PathBuf; 2],
+    files: Option<[Arc<File>; 2]>,
     committed: bool,
 }
 
@@ -823,31 +1592,38 @@ impl PendingJobFiles {
             root.join(format!("{id}.stdout")),
             root.join(format!("{id}.stderr")),
         ];
-        let mut created = Vec::new();
-        for path in &paths {
-            if let Err(error) = create_private_file(path) {
-                for created in created {
-                    let _ = fs::remove_file(created);
-                }
+        let stdout = Arc::new(create_private_file(&paths[0])?);
+        let stderr = match create_private_file(&paths[1]) {
+            Ok(file) => Arc::new(file),
+            Err(error) => {
+                drop(stdout);
+                let _ = fs::remove_file(&paths[0]);
                 return Err(error);
             }
-            created.push(path.clone());
-        }
+        };
         Ok(Self {
             paths,
+            files: Some([stdout, stderr]),
             committed: false,
         })
     }
 
-    fn commit(mut self) -> [PathBuf; 2] {
+    fn handles(&self) -> [Arc<File>; 2] {
+        let files = self.files.as_ref().expect("pending job files stay open");
+        [files[0].clone(), files[1].clone()]
+    }
+
+    fn commit(mut self) {
         self.committed = true;
-        self.paths.clone()
     }
 }
 
 impl Drop for PendingJobFiles {
     fn drop(&mut self) {
         if !self.committed {
+            // Windows cannot remove an open file reliably. Close the exact
+            // admission capabilities before rolling their private names back.
+            drop(self.files.take());
             for path in &self.paths {
                 let _ = fs::remove_file(path);
             }
@@ -874,12 +1650,12 @@ impl JobFinisher {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let spool_account = {
+        let drain_writers = {
             let state = inner.state.lock().expect("job manager lock");
-            state.jobs.get(id).map(|entry| entry.spool_account.clone())
+            state.jobs.get(id).map(|entry| entry.drain_writers.clone())
         };
-        if let Some(account) = spool_account {
-            account.seal_and_wait_writers_idle().await;
+        if let Some(drain) = drain_writers {
+            drain.seal_and_wait_idle().await;
         }
         finish_inner(&inner, id, completion);
     }
@@ -892,13 +1668,26 @@ impl JobManager {
     }
 
     pub(crate) fn with_spool_limit(retention: Duration, spool_limit_bytes: u64) -> Result<Self> {
-        let root = crate::xdg::state_home()?
-            .join("abird/dotlink/jobs")
+        let session_uuid = Uuid::new_v4();
+        let root = crate::private_state::state_dir()?
+            .join("jobs")
             .join(format!(
                 "{SESSION_PREFIX}{}-{}",
                 std::process::id(),
-                Uuid::new_v4().simple()
+                session_uuid.simple()
             ));
+        let session_fingerprint = crate::mcp::sha256(session_uuid.as_bytes());
+        let shared_jobs = Arc::new(
+            SharedJobManager::new(SharedJobLimits {
+                max_retained_jobs: SHARED_MAX_RETAINED_JOBS,
+                max_exposed_jobs: MAX_RETAINED_JOBS,
+                max_hidden_jobs: SHARED_MAX_RETAINED_JOBS,
+                max_active_nodes: MAX_ACTIVE_JOBS,
+                max_hidden_replays: MAX_REQUEST_REPLAYS,
+                max_spool_bytes: spool_limit_bytes,
+            })
+            .map_err(|error| anyhow!("invalid shared JobManager limits: {error:?}"))?,
+        );
         let inner = Arc::new(JobManagerInner {
             root,
             retention_secs: AtomicU64::new(retention.as_secs()),
@@ -911,6 +1700,8 @@ impl JobManager {
             sweeper: Mutex::new(None),
             intent_fingerprint: Mutex::new(None),
             policy_fingerprint: Mutex::new(None),
+            session_fingerprint,
+            shared_jobs,
         });
         Self::start_sweeper(&inner);
         Ok(Self { inner })
@@ -1005,6 +1796,11 @@ impl JobManager {
         F: FnOnce(JobHandle) -> Fut + Send + 'static,
         Fut: Future<Output = JobCompletion> + Send + 'static,
     {
+        // Job admission creates async ownership. Reject synchronous/internal
+        // misuse before materializing session state rather than letting
+        // `tokio::spawn` panic after a Job/request identity was published.
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow!("shell job execution requires an active Tokio runtime"))?;
         self.ensure_session_initialized()?;
         sweep_expired(&self.inner);
         let mut state = self.inner.state.lock().expect("job manager lock");
@@ -1065,9 +1861,10 @@ impl JobManager {
         let id = Uuid::new_v4().to_string();
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
+        let [stdout_file, stderr_file] = files.handles();
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
-        let spool_account = SpoolAccount::new(&self.inner);
+        let drain_writers = DrainWriters::new();
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
             id.clone(),
@@ -1085,7 +1882,8 @@ impl JobManager {
                 terminal_at: None,
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
-                spool_account: spool_account.clone(),
+                drain_writers: drain_writers.clone(),
+                legacy_spool: None,
                 stdout_retained: 0,
                 stderr_retained: 0,
                 stdout_consumed: 0,
@@ -1101,6 +1899,8 @@ impl JobManager {
                 retention: RetentionClass::Ordinary,
                 request_key: request_key.clone(),
                 shell_guard_generation: None,
+                shared_job: None,
+                shared_graph_authoritative: false,
                 retention_anchor: None,
                 notify,
             },
@@ -1113,16 +1913,37 @@ impl JobManager {
             cancel,
             stdout_path,
             stderr_path,
-            spool_account,
+            stdout_file,
+            stderr_file,
+            drain_writers,
+            #[cfg(test)]
+            legacy_spool: None,
             inner: Arc::downgrade(&self.inner),
         };
         let panic_stdout = handle.stdout_path.clone();
         let panic_stderr = handle.stderr_path.clone();
-        let panic_account = handle.spool_account.clone();
+        let panic_drain = handle.drain_writers.clone();
         let finisher = self.finisher();
         let id_for_task = id.clone();
-        let future = runner(handle);
-        let task = tokio::spawn(async move {
+        // Future construction is trusted host code, but it still must not be
+        // able to poison the manager or strand a replay identity before a
+        // managed effect exists. Product runners return `async move` directly;
+        // actual shell preparation/launch happens only when that Future polls.
+        let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner(handle)))
+        {
+            Ok(future) => future,
+            Err(_) => {
+                let removed = remove_job_locked(&mut state, &id);
+                debug_assert!(
+                    removed.is_some(),
+                    "new Job must exist during runner rollback"
+                );
+                return Err(anyhow!(
+                    "shell job runner construction panicked before managed execution"
+                ));
+            }
+        };
+        let task = runtime.spawn(async move {
             let completion = match std::panic::AssertUnwindSafe(future).catch_unwind().await {
                 Ok(completion) => completion,
                 Err(_) => {
@@ -1130,7 +1951,7 @@ impl JobManager {
                     // handles), but blocking spool writes may still be finishing.
                     // Seal/quiesce before freezing the retained prefixes so a
                     // programmer bug cannot strand a permanently-working job.
-                    panic_account.seal_and_wait_writers_idle().await;
+                    panic_drain.seal_and_wait_idle().await;
                     JobCompletion::internal_failed(
                         "shell job runner panicked",
                         incomplete_stream_summary(&panic_stdout),
@@ -1172,8 +1993,10 @@ impl JobManager {
         let id = Uuid::new_v4().to_string();
         let files = PendingJobFiles::create(&self.inner.root, &id)?;
         let [stdout_path, stderr_path] = files.paths.clone();
+        let [stdout_file, stderr_file] = files.handles();
         let cancel = CancellationToken::new();
-        let spool_account = SpoolAccount::new(&self.inner);
+        let drain_writers = DrainWriters::new();
+        let legacy_spool = LegacySpoolAccount::new(&self.inner);
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
             id.clone(),
@@ -1191,7 +2014,8 @@ impl JobManager {
                 terminal_at: None,
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
-                spool_account: spool_account.clone(),
+                drain_writers: drain_writers.clone(),
+                legacy_spool: Some(legacy_spool.clone()),
                 stdout_retained: 0,
                 stderr_retained: 0,
                 stdout_consumed: 0,
@@ -1207,6 +2031,8 @@ impl JobManager {
                 retention: RetentionClass::Ordinary,
                 request_key: None,
                 shell_guard_generation: None,
+                shared_job: None,
+                shared_graph_authoritative: false,
                 retention_anchor: None,
                 notify: Arc::new(Notify::new()),
             },
@@ -1217,7 +2043,10 @@ impl JobManager {
             cancel,
             stdout_path,
             stderr_path,
-            spool_account,
+            stdout_file,
+            stderr_file,
+            drain_writers,
+            legacy_spool: Some(legacy_spool),
             inner: Arc::downgrade(&self.inner),
         })
     }
@@ -1233,6 +2062,21 @@ impl JobManager {
         }
     }
 
+    pub(crate) fn resource_policy_matches(
+        &self,
+        retention: Duration,
+        spool_limit_bytes: u64,
+    ) -> bool {
+        self.inner.retention_secs.load(Ordering::Relaxed) == retention.as_secs()
+            && self.inner.spool_limit_bytes.load(Ordering::Relaxed) == spool_limit_bytes
+            && self
+                .inner
+                .shared_jobs
+                .spool_usage()
+                .is_ok_and(|(_, limit)| limit == spool_limit_bytes)
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_limits(&self, retention: Duration, spool_limit_bytes: u64) {
         self.inner
             .retention_secs
@@ -1273,6 +2117,57 @@ impl JobManager {
         }
     }
 
+    pub(crate) fn policy_fingerprint(&self) -> Result<[u8; 32]> {
+        self.inner
+            .policy_fingerprint
+            .lock()
+            .map_err(|_| anyhow!("job policy fingerprint lock poisoned"))?
+            .ok_or_else(|| anyhow!("job execution policy is not bound"))
+    }
+
+    fn ensure_exposed_graph(&self, id: &str) -> Result<()> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .jobs
+            .get(id)
+            .ok_or_else(|| anyhow!("unknown Job {id}"))?;
+        if !entry.disposition.exposed() || entry.shared_job.is_none() {
+            bail!("Job {id} is not an exposed Graph");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shared_graph(&self, id: &str) -> Result<SharedGraph> {
+        self.ensure_exposed_graph(id)?;
+        self.inner
+            .shared_jobs
+            .graph(id)
+            .map_err(|error| anyhow!("shared Graph is unavailable: {error:?}"))
+    }
+
+    pub(crate) fn shared_snapshot(&self, id: &str) -> Result<SharedSnapshot> {
+        self.ensure_exposed_graph(id)?;
+        self.inner
+            .shared_jobs
+            .runtime_snapshot(id)
+            .map_err(|error| anyhow!("shared Graph status is unavailable: {error:?}"))
+    }
+
+    pub(crate) fn render_graph_result(&self, id: &str, max_bytes: usize) -> Result<Option<String>> {
+        self.inner
+            .shared_jobs
+            .render_graph_result(id, max_bytes)
+            .map_err(|error| anyhow!("shared Graph result is unavailable: {error:?}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_spool_usage(&self) -> Result<(u64, u64)> {
+        self.inner
+            .shared_jobs
+            .spool_usage()
+            .map_err(|error| anyhow!("shared spool usage is unavailable: {error:?}"))
+    }
+
     pub(crate) fn operation_gate(&self) -> Arc<RwLock<()>> {
         self.inner.operation_gate.clone()
     }
@@ -1289,24 +2184,24 @@ impl JobManager {
             let _ = sweeper.await;
         }
 
-        let (runners, spool_accounts) = {
+        let (runners, drain_sets) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             state.closed = true;
             state.request_jobs.clear();
             let mut runners = Vec::new();
-            let mut spool_accounts = Vec::with_capacity(state.jobs.len());
+            let mut drain_sets = Vec::with_capacity(state.jobs.len());
             for entry in state.jobs.values_mut() {
                 // Seal before cancellation so a detached runner subtask cannot
                 // register a new writer after shutdown has observed an idle count.
-                entry.spool_account.seal_writers();
-                spool_accounts.push(entry.spool_account.clone());
+                entry.drain_writers.seal();
+                drain_sets.push(entry.drain_writers.clone());
                 entry.cancel.cancel();
                 if let Some(handle) = entry.runner.take() {
                     handle.abort();
                     runners.push(handle);
                 }
             }
-            (runners, spool_accounts)
+            (runners, drain_sets)
         };
         for runner in runners {
             let _ = runner.await;
@@ -1316,20 +2211,48 @@ impl JobManager {
         // request: a writer already inside cancellation-safe blocking I/O may
         // still be running. Registrations are already sealed; now wait until all
         // existing writers have actually stopped before unlinking spool state.
-        for account in &spool_accounts {
-            account.wait_writers_idle().await;
+        for drain in &drain_sets {
+            drain.wait_idle().await;
         }
 
-        let mut entries = {
-            let mut state = self.inner.state.lock().expect("job manager lock");
+        // Aborting the host runner can bypass its normal finisher. Close the
+        // canonical shared lifecycle before unlinking any file-backed output.
+        // Unknown is intentional: process-tree stop/side-effect completion is
+        // not proven merely because the Tokio owner was aborted.
+        let shared_ids = {
+            let state = self.inner.state.lock().expect("job manager lock");
             state
                 .jobs
-                .drain()
-                .map(|(_, entry)| entry)
+                .values()
+                .filter(|entry| entry.shared_job.is_some())
+                .map(|entry| entry.id.clone())
                 .collect::<Vec<_>>()
         };
-        for entry in &mut entries {
-            cleanup_entry(entry);
+        for id in shared_ids {
+            let completion = JobCompletion::internal_failed(
+                "job session shut down before runner settlement",
+                StreamSummary::default(),
+                StreamSummary::default(),
+            );
+            let _ = settle_shared_completion(&self.inner, &id, &completion, true);
+        }
+
+        let cleanup_ok = {
+            let mut state = self.inner.state.lock().expect("job manager lock");
+            let mut cleanup_ok = true;
+            for entry in state.jobs.values_mut() {
+                cleanup_ok &= cleanup_entry(entry);
+            }
+            if cleanup_ok {
+                state.jobs.clear();
+                state.request_jobs.clear();
+            }
+            cleanup_ok
+        };
+        if !cleanup_ok {
+            return Err(anyhow!(
+                "job shutdown could not safely release all shared/output state; host metadata and spool session retained for inspection"
+            ));
         }
         self.inner
             .session_lock
@@ -1352,6 +2275,43 @@ impl JobManager {
 
     pub(crate) fn cancel(&self, id: &str) -> JobResult<String> {
         sweep_expired(&self.inner);
+        let (should_cancel, shared_owned) = {
+            let state = self.inner.state.lock().expect("job manager lock");
+            let entry = state
+                .available(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            (!entry.status().terminal(), entry.shared_job.is_some())
+        };
+        if should_cancel {
+            match self.inner.shared_jobs.runtime_snapshot(id) {
+                Ok(snapshot)
+                    if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal =>
+                {
+                    let sequence = next_shared_sequence(&self.inner.shared_jobs, id)
+                        .map_err(JobError::Internal)?;
+                    self.inner
+                        .shared_jobs
+                        .cancel(id, sequence, |_, _| Ok::<_, SharedJournalError>(()))
+                        .map_err(|error| {
+                            JobError::Internal(anyhow!(
+                                "shared Job cancellation checkpoint failed: {error:?}"
+                            ))
+                        })?;
+                }
+                Ok(_) => {}
+                Err(aw_tools::filesystem::job_manager::Error::NotFound) if !shared_owned => {}
+                Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+                    return Err(JobError::Internal(anyhow!(
+                        "shared-owned Job {id} disappeared before cancellation"
+                    )));
+                }
+                Err(error) => {
+                    return Err(JobError::Internal(anyhow!(
+                        "cannot inspect shared Job before cancellation: {error:?}"
+                    )));
+                }
+            }
+        }
         let mut state = self.inner.state.lock().expect("job manager lock");
         let entry = state
             .available_mut(id)
@@ -1372,39 +2332,147 @@ impl JobManager {
         Ok(render_status_locked(&self.inner, entry))
     }
 
-    pub(crate) fn list(&self, limit: usize) -> String {
+    /// Snapshot newest-first exposed Jobs, then admit only complete rows whose
+    /// rendered page fits the host projection. The fit callback is deliberately
+    /// transport-neutral: MCP can measure its exact outer wire representation
+    /// while other hosts can apply their own response envelope.
+    pub(crate) fn list_fitted(
+        &self,
+        offset: usize,
+        limit: usize,
+        fits: impl Fn(&str) -> bool,
+    ) -> JobResult<String> {
         sweep_expired(&self.inner);
-        let state = self.inner.state.lock().expect("job manager lock");
-        let mut jobs = state
-            .jobs
-            .values()
-            .filter(|entry| entry.disposition.exposed() && !entry.expiration_pending)
-            .collect::<Vec<_>>();
-        jobs.sort_by_key(|entry| std::cmp::Reverse(entry.created));
-        serde_json::json!({
-            "jobs": jobs.into_iter().take(limit).map(|entry| serde_json::json!({
-                "job_id": entry.id,
-                "status": entry.status(),
-                "phase": entry.phase,
-                "created_at": entry.created_at,
-                "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            })).collect::<Vec<_>>(),
-            "spool_used_bytes": self.inner.spool_used_bytes.load(Ordering::Relaxed),
-            "spool_limit_bytes": self.inner.spool_limit_bytes.load(Ordering::Relaxed),
+        let (rows, total, spool_used_bytes, spool_limit_bytes) = {
+            let state = self.inner.state.lock().expect("job manager lock");
+            let mut jobs = state
+                .jobs
+                .values()
+                .filter(|entry| {
+                    (entry.disposition.exposed()
+                        || (entry.disposition == JobDisposition::Synchronous
+                            && entry.status() == JobStatus::Unknown))
+                        && !entry.expiration_pending
+                })
+                .collect::<Vec<_>>();
+            jobs.sort_by(|left, right| {
+                right
+                    .created
+                    .cmp(&left.created)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            let total = jobs.len();
+            let rows = jobs
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|entry| {
+                    serde_json::json!({
+                        "job_id": entry.id,
+                        "status": projected_status(&self.inner, entry),
+                        "phase": entry.phase,
+                        "created_at": entry.created_at,
+                        "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let (spool_used_bytes, spool_limit_bytes) = physical_spool_usage(&self.inner);
+            (rows, total, spool_used_bytes, spool_limit_bytes)
+        };
+
+        let render = |count: usize| {
+            let next_offset = (offset + count < total).then_some(offset + count);
+            serde_json::json!({
+                "jobs": &rows[..count],
+                "offset": offset,
+                "next_offset": next_offset,
+                "spool_used_bytes": spool_used_bytes,
+                "spool_limit_bytes": spool_limit_bytes,
+            })
+            .to_string()
+        };
+
+        if rows.is_empty() {
+            let page = render(0);
+            return fits(&page).then_some(page).ok_or_else(|| {
+                JobError::Unknown(
+                    "job_list response budget is too small for page metadata; raise the response limit"
+                        .to_owned(),
+                )
+            });
+        }
+
+        let mut best = None;
+        for count in 1..=rows.len() {
+            let candidate = render(count);
+            if fits(&candidate) {
+                best = Some(candidate);
+            } else {
+                break;
+            }
+        }
+        best.ok_or_else(|| {
+            JobError::Unknown(
+                "job_list response budget is too small for one complete Job row; raise the response limit"
+                    .to_owned(),
+            )
         })
-        .to_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list(&self, offset: usize, limit: usize) -> String {
+        self.list_fitted(offset, limit, |_| true)
+            .expect("unbounded test Job list projection")
+    }
+
+    /// Reserve canonical shared user-visible capacity while the optimistic
+    /// shell Job remains hidden. `NotFound` is retained only for pre-shared/test
+    /// legacy entries; every current shell execution owns a shared projection.
+    fn reserve_shared_exposure(&self, id: &str, shared_owned: bool) -> JobResult<()> {
+        match self.inner.shared_jobs.reserve_exposed(id) {
+            Ok(()) => Ok(()),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound) if !shared_owned => Ok(()),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound) => Err(JobError::Internal(
+                anyhow!("shared-owned Job {id} disappeared before exposure reservation"),
+            )),
+            Err(aw_tools::filesystem::job_manager::Error::Capacity) => {
+                Err(JobError::Internal(anyhow!(
+                    "too many retained shell jobs ({MAX_RETAINED_JOBS}); acknowledge output or wait for retention cleanup"
+                )))
+            }
+            Err(error) => Err(JobError::Internal(anyhow!(
+                "shared Job exposure reservation failed for {id}: {error:?}"
+            ))),
+        }
+    }
+
+    fn expose_shared_job(&self, id: &str, shared_owned: bool) -> JobResult<()> {
+        match self.inner.shared_jobs.expose(id) {
+            Ok(()) => Ok(()),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound) if !shared_owned => Ok(()),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound) => Err(JobError::Internal(
+                anyhow!("shared-owned Job {id} disappeared before exposure"),
+            )),
+            Err(error) => Err(JobError::Internal(anyhow!(
+                "shared Job exposure failed for {id}: {error:?}"
+            ))),
+        }
     }
 
     pub(crate) fn expose_compatibility(&self, id: &str) -> JobResult<CallToolResult> {
         let mut state = self.inner.state.lock().expect("job manager lock");
-        let disposition = state
-            .jobs
-            .get(id)
-            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
-            .disposition;
+        let (disposition, shared_owned) = {
+            let entry = state
+                .jobs
+                .get(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            (entry.disposition, entry.shared_job.is_some())
+        };
         match disposition {
             JobDisposition::Pending => {
                 reserve_exposure_slot(&mut state, id)?;
+                self.reserve_shared_exposure(id, shared_owned)?;
+                self.expose_shared_job(id, shared_owned)?;
                 let entry = state
                     .jobs
                     .get_mut(id)
@@ -1436,6 +2504,7 @@ impl JobManager {
             .jobs
             .get(id)
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let shared_owned = entry.shared_job.is_some();
         match entry.disposition {
             JobDisposition::NativeTask => {
                 return Ok(Some(task_from_entry(entry, self.retention())));
@@ -1449,6 +2518,8 @@ impl JobManager {
             return Ok(None);
         }
         reserve_exposure_slot(&mut state, id)?;
+        self.reserve_shared_exposure(id, shared_owned)?;
+        self.expose_shared_job(id, shared_owned)?;
         let entry = state
             .jobs
             .get_mut(id)
@@ -1468,12 +2539,16 @@ impl JobManager {
         budget: Option<usize>,
     ) -> JobResult<JobHandoff> {
         let mut state = self.inner.state.lock().expect("job manager lock");
-        let (disposition, result_limit) = {
+        let (disposition, result_limit, shared_owned) = {
             let entry = state
                 .jobs
                 .get(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-            (entry.disposition, entry.result_limit)
+            (
+                entry.disposition,
+                entry.result_limit,
+                entry.shared_job.is_some(),
+            )
         };
         if disposition == JobDisposition::Pending {
             let native = native_tasks
@@ -1481,6 +2556,8 @@ impl JobManager {
                     !crate::mcp::shell_result_fits_budget(result_limit, budget)
                 });
             reserve_exposure_slot(&mut state, id)?;
+            self.reserve_shared_exposure(id, shared_owned)?;
+            self.expose_shared_job(id, shared_owned)?;
             let entry = state
                 .jobs
                 .get_mut(id)
@@ -1578,19 +2655,21 @@ impl JobManager {
             if !entry.status().terminal() {
                 return Err(JobError::Internal(anyhow!("job {id} is still running")));
             }
-            if entry.any_output_released() {
+            if job_owner_projection(entry, JobStream::Stdout)?.released
+                || job_owner_projection(entry, JobStream::Stderr)?.released
+            {
                 return Ok(None);
             }
             entry.readers += 1;
             ToolResultSnapshot {
+                id: entry.id.clone(),
                 completion: entry
                     .completion
                     .clone()
                     .ok_or_else(|| JobError::Internal(anyhow!("job {id} has no completion")))?,
                 timeout_secs: entry.timeout_secs,
                 result_limit: entry.result_limit,
-                stdout_path: entry.stdout_path.clone(),
-                stderr_path: entry.stderr_path.clone(),
+                output: tool_result_output(entry),
                 _lease: JobReadLease {
                     inner: Arc::downgrade(&self.inner),
                     id: id.to_owned(),
@@ -1611,24 +2690,55 @@ impl JobManager {
     /// the ordinary result is reconstructed from those same bytes on redelivery.
     pub(crate) fn mark_synchronous_result(&self, id: &str) -> JobResult<JobDisposition> {
         let mut state = self.inner.state.lock().expect("job manager lock");
+        let (status, disposition, shared_owned) = {
+            let entry = state
+                .jobs
+                .get(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            (
+                entry.status(),
+                entry.disposition,
+                entry.shared_job.is_some(),
+            )
+        };
+        if !status.terminal() {
+            return Err(JobError::Internal(anyhow!("job {id} is still running")));
+        }
+        if disposition != JobDisposition::Pending {
+            return Ok(disposition);
+        }
+        if status == JobStatus::Unknown {
+            // Preserve the exact first wire representation, but keep uncertain
+            // effects discoverable and pageable for inspection. Unknown is
+            // status evidence, not disposable synchronous output.
+            reserve_exposure_slot(&mut state, id)?;
+            self.reserve_shared_exposure(id, shared_owned)?;
+            self.expose_shared_job(id, shared_owned)?;
+            let entry = state
+                .jobs
+                .get_mut(id)
+                .expect("job validated before unknown-result publication");
+            entry.disposition = JobDisposition::Synchronous;
+            if !release_shared_task_owner(entry) {
+                entry.output_cleanup_pending = true;
+            }
+            entry.retention = RetentionClass::Ordinary;
+            entry.retention_anchor = Some(Instant::now());
+            entry.expiration_pending = false;
+            return Ok(entry.disposition);
+        }
         let entry = state
             .jobs
             .get_mut(id)
-            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        if !entry.status().terminal() {
-            return Err(JobError::Internal(anyhow!("job {id} is still running")));
-        }
-        if entry.disposition != JobDisposition::Pending {
-            return Ok(entry.disposition);
-        }
+            .expect("job validated before synchronous publication");
         entry.disposition = JobDisposition::Synchronous;
+        if !release_shared_task_owner(entry) {
+            entry.output_cleanup_pending = true;
+        }
         if entry.request_key.is_some() {
             entry.retention = RetentionClass::TransportOnly;
-        } else if let Some(completion) = entry.completion.as_mut() {
-            entry.stdout_consumed = completion.stdout.stored_bytes;
-            entry.stderr_consumed = completion.stderr.stored_bytes;
-            entry.output_cleanup_requested = true;
-            maybe_release_output(entry);
+        } else {
+            let _ = consume_complete_job_output(entry);
         }
         Ok(entry.disposition)
     }
@@ -1698,26 +2808,26 @@ impl JobManager {
         let mut remove_hidden = false;
         if let Some(entry) = state.jobs.get_mut(&id) {
             entry.request_key = None;
-            if entry.disposition.exposed() {
+            if entry.disposition.exposed()
+                || (entry.disposition == JobDisposition::Synchronous
+                    && entry.status() == JobStatus::Unknown)
+            {
                 // Transport replay may have kept this handle alive long past its
-                // ordinary TTL. Positive receipt delivery starts a fresh full
-                // user-visible retention window; execution completion remains
-                // independently anchored by `terminal_at`.
+                // ordinary TTL. Positive delivery starts a fresh user-visible
+                // retention window. Unknown synchronous results remain an
+                // inspection surface instead of becoming cleanup-only state.
+                entry.retention = RetentionClass::Ordinary;
                 entry.retention_anchor = Some(Instant::now());
                 entry.expiration_pending = false;
             } else if entry.status().terminal() {
                 entry.retention = RetentionClass::CleanupOnly;
-                if let Some(completion) = entry.completion.as_mut() {
-                    entry.stdout_consumed = completion.stdout.stored_bytes;
-                    entry.stderr_consumed = completion.stderr.stored_bytes;
-                    entry.output_cleanup_requested = true;
-                    maybe_release_output(entry);
+                if consume_complete_job_output(entry) {
                     remove_hidden = entry.all_output_released() && entry.readers == 0;
                 }
             }
         }
         if remove_hidden {
-            let _ = remove_job_locked(&mut state, &id);
+            let _ = cleanup_and_remove_job_locked(&mut state, &id);
         }
         RequestDeliveryAck::Acknowledged
     }
@@ -1752,15 +2862,10 @@ impl JobManager {
             .expect("request mapping validated above");
         entry.request_key = None;
         entry.retention = RetentionClass::CleanupOnly;
-        if let Some(completion) = entry.completion.as_ref() {
-            entry.stdout_consumed = completion.stdout.stored_bytes;
-            entry.stderr_consumed = completion.stderr.stored_bytes;
-            entry.output_cleanup_requested = true;
-            maybe_release_output(entry);
-        }
+        let _ = consume_complete_job_output(entry);
         let remove_hidden = entry.all_output_released() && entry.readers == 0;
         if remove_hidden {
-            let _ = remove_job_locked(&mut state, &id);
+            let _ = cleanup_and_remove_job_locked(&mut state, &id);
         }
         RequestRetirement::Retired
     }
@@ -1782,6 +2887,8 @@ impl JobManager {
         if entry.response_attempts != 0 {
             return RequestRetirement::Busy;
         }
+        let disposition = entry.disposition;
+        let shared_owned = entry.shared_job.is_some();
 
         let needs_ordinary_slot = state.jobs.get(&id).is_some_and(|entry| {
             matches!(
@@ -1790,6 +2897,14 @@ impl JobManager {
             ) && entry.retention != RetentionClass::Ordinary
         });
         if needs_ordinary_slot && !ensure_retained_capacity(&mut state, 1) {
+            return RequestRetirement::Busy;
+        }
+        if matches!(
+            disposition,
+            JobDisposition::Pending | JobDisposition::Synchronous
+        ) && (self.reserve_shared_exposure(&id, shared_owned).is_err()
+            || self.expose_shared_job(&id, shared_owned).is_err())
+        {
             return RequestRetirement::Busy;
         }
 
@@ -1807,6 +2922,9 @@ impl JobManager {
                 // Once the transport key is gone it is ordinary user-visible
                 // retained state and must participate in the shared 256-job cap.
                 entry.disposition = JobDisposition::Compatibility;
+                if !release_shared_task_owner(entry) {
+                    entry.output_cleanup_pending = true;
+                }
                 entry.retention = RetentionClass::Ordinary;
                 entry.retention_anchor = Some(now);
                 entry.expiration_pending = false;
@@ -1834,7 +2952,18 @@ impl JobManager {
         sweep_expired(&self.inner);
         let payload_ceiling =
             job_output_payload_ceiling(response_ceiling).map_err(JobError::Internal)?;
-        let (snapshot, _lease) = {
+        enum Source {
+            Shared {
+                manager: Arc<SharedJobManager>,
+                terminal: bool,
+                _lease: JobReadLease,
+            },
+            Legacy {
+                snapshot: OutputSnapshot,
+                _lease: JobReadLease,
+            },
+        }
+        let source = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
                 .available_mut(id)
@@ -1843,26 +2972,29 @@ impl JobManager {
                 JobStream::Stdout => completion.stdout,
                 JobStream::Stderr => completion.stderr,
             });
-            let stored = summary.map_or_else(
-                || stored_len(stream_path(entry, stream), None),
-                |_| match stream {
-                    JobStream::Stdout => entry.stdout_retained,
-                    JobStream::Stderr => entry.stderr_retained,
-                },
-            );
-            if offset > stored {
-                return Err(JobError::Internal(anyhow!(
-                    "job {id} {} offset {offset} is beyond stored output ({stored} bytes)",
-                    stream.label()
-                )));
-            }
-            if entry.stream_released(stream) {
-                if offset == stored {
+            let owner_projection = job_owner_projection(entry, stream)?;
+            let mirrored_stored = if entry.shared_job.is_some() {
+                owner_projection.retained
+            } else {
+                summary.map_or_else(
+                    || stored_len(stream_path(entry, stream), None),
+                    |_| owner_projection.retained,
+                )
+            };
+            if owner_projection.released {
+                if offset > mirrored_stored {
+                    return Err(JobError::Internal(anyhow!(
+                        "job {id} {} offset {offset} is beyond stored output ({mirrored_stored} bytes)",
+                        stream.label()
+                    )));
+                }
+                if offset == mirrored_stored {
                     return OutputPageRender {
                         id,
-                        stream,
+                        node: None,
+                        stream: stream.label(),
                         offset,
-                        stored_bytes: stored,
+                        stored_bytes: mirrored_stored,
                         total_bytes: summary.map(|value| value.total_bytes),
                         truncated: summary.is_some_and(|value| value.truncated),
                         released: true,
@@ -1876,35 +3008,80 @@ impl JobManager {
                 )));
             }
             entry.readers += 1;
-            (
-                OutputSnapshot {
-                    path: stream_path(entry, stream).to_path_buf(),
+            let lease = JobReadLease {
+                inner: Arc::downgrade(&self.inner),
+                id: id.to_owned(),
+            };
+            if let Some(shared) = entry.shared_job.as_ref() {
+                Source::Shared {
+                    manager: shared.manager.clone(),
                     terminal: entry.status().terminal(),
-                    stored,
-                    total: summary.map(|value| value.total_bytes),
-                    truncated: summary.is_some_and(|value| value.truncated),
-                    released: false,
-                },
-                JobReadLease {
-                    inner: Arc::downgrade(&self.inner),
-                    id: id.to_owned(),
-                },
-            )
+                    _lease: lease,
+                }
+            } else {
+                if offset > mirrored_stored {
+                    return Err(JobError::Internal(anyhow!(
+                        "job {id} {} offset {offset} is beyond stored output ({mirrored_stored} bytes)",
+                        stream.label()
+                    )));
+                }
+                Source::Legacy {
+                    snapshot: OutputSnapshot {
+                        path: stream_path(entry, stream).to_path_buf(),
+                        terminal: entry.status().terminal(),
+                        stored: mirrored_stored,
+                        total: summary.map(|value| value.total_bytes),
+                        truncated: summary.is_some_and(|value| value.truncated),
+                        released: false,
+                    },
+                    _lease: lease,
+                }
+            }
         };
 
         let read_cap = requested_bytes.min(payload_ceiling).max(1);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(&snapshot.path)
-            .with_context(|| format!("cannot open job {} output", stream.label()))
-            .map_err(JobError::Internal)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| JobError::Internal(error.into()))?;
-        let available = snapshot.stored.saturating_sub(offset);
-        let to_read = usize::try_from(available.min(read_cap as u64)).unwrap_or(read_cap);
-        let mut bytes = vec![0_u8; to_read];
-        file.read_exact(&mut bytes)
-            .map_err(|error| JobError::Internal(error.into()))?;
+        let (bytes, snapshot) = match source {
+            Source::Shared {
+                manager,
+                terminal,
+                _lease,
+            } => {
+                let page = manager
+                    .output_page(id, 1, shared_output_stream(stream), offset, read_cap)
+                    .map_err(|error| {
+                        JobError::Internal(anyhow!(
+                            "shared job {id} {} page failed: {error:?}",
+                            stream.label()
+                        ))
+                    })?;
+                (
+                    page.bytes,
+                    OutputSnapshot {
+                        path: PathBuf::new(),
+                        terminal,
+                        stored: page.retained_bytes,
+                        total: Some(page.total_bytes),
+                        truncated: page.truncated,
+                        released: false,
+                    },
+                )
+            }
+            Source::Legacy { snapshot, _lease } => {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .open(&snapshot.path)
+                    .with_context(|| format!("cannot open job {} output", stream.label()))
+                    .map_err(JobError::Internal)?;
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|error| JobError::Internal(error.into()))?;
+                let available = snapshot.stored.saturating_sub(offset);
+                let to_read = usize::try_from(available.min(read_cap as u64)).unwrap_or(read_cap);
+                let mut bytes = vec![0_u8; to_read];
+                file.read_exact(&mut bytes)
+                    .map_err(|error| JobError::Internal(error.into()))?;
+                (bytes, snapshot)
+            }
+        };
         fit_output_page(
             id,
             stream,
@@ -1943,10 +3120,255 @@ impl JobManager {
                 stream.label()
             )));
         }
-        match stream {
-            JobStream::Stdout => entry.stdout_consumed = entry.stdout_consumed.max(offset),
-            JobStream::Stderr => entry.stderr_consumed = entry.stderr_consumed.max(offset),
+        if let Some(shared) = entry.shared_job.as_ref() {
+            let owner = shared.manager.job_output_owner(id).map_err(|error| {
+                JobError::Internal(anyhow!(
+                    "cannot derive shared Job output owner for {id}: {error:?}"
+                ))
+            })?;
+            match shared.manager.acknowledge_output(
+                id,
+                1,
+                shared_output_stream(stream),
+                owner,
+                offset,
+            ) {
+                Ok(_) | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {}
+                Err(error) => {
+                    return Err(JobError::Internal(anyhow!(
+                        "shared Job output acknowledgement failed for {id}: {error:?}"
+                    )));
+                }
+            }
+        } else {
+            match stream {
+                JobStream::Stdout => entry.stdout_consumed = entry.stdout_consumed.max(offset),
+                JobStream::Stderr => entry.stderr_consumed = entry.stderr_consumed.max(offset),
+            }
         }
+        entry.output_cleanup_requested = true;
+        maybe_release_output(entry);
+        Ok(render_status_locked(&self.inner, entry))
+    }
+
+    fn resolve_output_target(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        stream: Option<JobOutputStream>,
+    ) -> JobResult<(Option<Arc<SharedJobManager>>, usize, JobOutputStream)> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let Some(shared) = entry.shared_job.as_ref() else {
+            let coordinate = node.unwrap_or(1);
+            if coordinate != 1 {
+                return Err(JobError::Unknown(format!(
+                    "legacy shell job {id} has only node 1"
+                )));
+            }
+            let selected = stream.unwrap_or(JobOutputStream::Stdout);
+            if selected.legacy().is_none() {
+                return Err(JobError::Unknown(format!(
+                    "legacy shell job {id} has no retained result stream"
+                )));
+            }
+            return Ok((None, 1, selected));
+        };
+        let graph = shared.manager.graph(id).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot inspect shared Job Graph for {id}: {error:?}"
+            ))
+        })?;
+        let total = graph.steps().len();
+        let coordinate = match node {
+            Some(value) if (1..=total).contains(&value) => value,
+            Some(_) => {
+                return Err(JobError::Unknown(format!(
+                    "job {id} node is outside 1..={total}"
+                )));
+            }
+            None if total == 1 => 1,
+            None => {
+                return Err(JobError::Unknown(format!(
+                    "job {id} has {total} nodes; specify node"
+                )));
+            }
+        };
+        let tool = graph.steps()[coordinate - 1].tool;
+        let shell = tool.native().is_none();
+        let selected = stream.unwrap_or(if shell {
+            JobOutputStream::Stdout
+        } else {
+            JobOutputStream::Result
+        });
+        if !shell && selected != JobOutputStream::Result {
+            return Err(JobError::Unknown(format!(
+                "native job node {coordinate} exposes only result"
+            )));
+        }
+        Ok((Some(shared.manager.clone()), coordinate, selected))
+    }
+
+    /// Graph-aware output projection. Existing one-shell compatibility entries
+    /// retain their old stdout/stderr behavior; shared Jobs use structural node
+    /// selection and the canonical shared output streams.
+    pub(crate) fn output_node_page(
+        &self,
+        id: &str,
+        request: OutputPageRequest,
+    ) -> JobResult<String> {
+        let OutputPageRequest {
+            node,
+            stream,
+            offset,
+            requested_bytes,
+            response_ceiling,
+            base64,
+        } = request;
+        sweep_expired(&self.inner);
+        let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
+        let Some(manager) = shared else {
+            return self.output_page(
+                id,
+                selected.legacy().expect("legacy target validated"),
+                offset,
+                requested_bytes,
+                response_ceiling,
+                base64,
+            );
+        };
+        let payload_ceiling =
+            job_output_payload_ceiling(response_ceiling).map_err(JobError::Internal)?;
+        let owner = manager.job_output_owner(id).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot derive shared Job output owner for {id}: {error:?}"
+            ))
+        })?;
+        let owner_state = match manager.output_owner_state(id, coordinate, selected.shared(), owner)
+        {
+            Ok(state) => state,
+            Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                return Err(JobError::Unknown(format!(
+                    "job {id} node {coordinate} {} output is not available yet",
+                    selected.label()
+                )));
+            }
+            Err(error) => {
+                return Err(JobError::Internal(anyhow!(
+                    "cannot inspect job {id} node {coordinate} {} output owner: {error:?}",
+                    selected.label()
+                )));
+            }
+        };
+        let (summary, writer_finished) = match manager.output_summary(
+            id,
+            coordinate,
+            selected.shared(),
+        ) {
+            Ok(value) => value,
+            Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {
+                if offset == owner_state.through {
+                    return OutputPageRender {
+                        id,
+                        node: Some(coordinate),
+                        stream: selected.label(),
+                        offset,
+                        stored_bytes: owner_state.through,
+                        total_bytes: None,
+                        truncated: false,
+                        released: true,
+                        base64,
+                    }
+                    .render(offset, true, &[])
+                    .map_err(JobError::Internal);
+                }
+                return Err(JobError::Unknown(format!(
+                    "job {id} node {coordinate} {} output was already acknowledged and released",
+                    selected.label()
+                )));
+            }
+            Err(error) => {
+                return Err(JobError::Internal(anyhow!(
+                    "cannot inspect job {id} node {coordinate} {} output: {error:?}",
+                    selected.label()
+                )));
+            }
+        };
+        if offset > summary.retained_bytes {
+            return Err(JobError::Unknown(format!(
+                "job {id} node {coordinate} {} offset {offset} exceeds retained output {}",
+                selected.label(),
+                summary.retained_bytes
+            )));
+        }
+        let read_cap = requested_bytes.min(payload_ceiling).max(1);
+        let page = manager
+            .output_page(id, coordinate, selected.shared(), offset, read_cap)
+            .map_err(|error| {
+                JobError::Internal(anyhow!(
+                    "job {id} node {coordinate} {} page failed: {error:?}",
+                    selected.label()
+                ))
+            })?;
+        let snapshot = OutputSnapshot {
+            path: PathBuf::new(),
+            terminal: writer_finished,
+            stored: page.retained_bytes,
+            total: Some(page.total_bytes),
+            truncated: page.truncated,
+            released: owner_state.released,
+        };
+        let render = OutputPageRender {
+            id,
+            node: Some(coordinate),
+            stream: selected.label(),
+            offset,
+            stored_bytes: snapshot.stored,
+            total_bytes: snapshot.total,
+            truncated: snapshot.truncated,
+            released: snapshot.released,
+            base64,
+        };
+        fit_shared_output_page(&render, &page.bytes, &snapshot, payload_ceiling)
+            .map_err(JobError::Internal)
+    }
+
+    pub(crate) fn acknowledge_node_output(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        stream: Option<JobOutputStream>,
+        offset: u64,
+    ) -> JobResult<String> {
+        sweep_expired(&self.inner);
+        let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
+        let Some(manager) = shared else {
+            return self.acknowledge_output(
+                id,
+                selected.legacy().expect("legacy target validated"),
+                offset,
+            );
+        };
+        let owner = manager.job_output_owner(id).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot derive shared Job output owner for {id}: {error:?}"
+            ))
+        })?;
+        match manager.acknowledge_output(id, coordinate, selected.shared(), owner, offset) {
+            Ok(_) | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {}
+            Err(error) => {
+                return Err(JobError::Internal(anyhow!(
+                    "job {id} node {coordinate} {} acknowledgement failed: {error:?}",
+                    selected.label()
+                )));
+            }
+        }
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available_mut(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         entry.output_cleanup_requested = true;
         maybe_release_output(entry);
         Ok(render_status_locked(&self.inner, entry))
@@ -1973,13 +3395,13 @@ impl JobManager {
             {
                 entry.readers += 1;
                 Some(ToolResultSnapshot {
+                    id: entry.id.clone(),
                     completion: entry.completion.clone().ok_or_else(|| {
                         JobError::Internal(anyhow!("task {id} has no completion"))
                     })?,
                     timeout_secs: entry.timeout_secs,
                     result_limit: entry.result_limit,
-                    stdout_path: entry.stdout_path.clone(),
-                    stderr_path: entry.stderr_path.clone(),
+                    output: tool_result_output(entry),
                     _lease: JobReadLease {
                         inner: Arc::downgrade(&self.inner),
                         id: id.to_owned(),
@@ -1993,6 +3415,18 @@ impl JobManager {
         let payload = match status {
             JobStatus::Working => TaskPayload::Working,
             JobStatus::Cancelled => TaskPayload::Cancelled,
+            JobStatus::Unknown => TaskPayload::Failed {
+                error: error_object(
+                    internal_error
+                        .as_deref()
+                        .or_else(|| {
+                            snapshot
+                                .as_ref()
+                                .and_then(|value| value.completion.error.as_deref())
+                        })
+                        .unwrap_or("shell effect state is unknown; inspect before retrying"),
+                ),
+            },
             JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed => {
                 if let Some(message) = internal_error {
                     TaskPayload::Failed {
@@ -2023,13 +3457,37 @@ struct OutputSnapshot {
     released: bool,
 }
 
+enum ToolResultOutput {
+    Shared {
+        manager: Arc<SharedJobManager>,
+        id: String,
+    },
+    Legacy {
+        stdout_path: PathBuf,
+        stderr_path: PathBuf,
+    },
+}
+
 struct ToolResultSnapshot {
+    id: String,
     completion: JobCompletion,
     timeout_secs: u64,
     result_limit: usize,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+    output: ToolResultOutput,
     _lease: JobReadLease,
+}
+
+fn tool_result_output(entry: &JobEntry) -> ToolResultOutput {
+    match entry.shared_job.as_ref() {
+        Some(shared) => ToolResultOutput::Shared {
+            manager: shared.manager.clone(),
+            id: entry.id.clone(),
+        },
+        None => ToolResultOutput::Legacy {
+            stdout_path: entry.stdout_path.clone(),
+            stderr_path: entry.stderr_path.clone(),
+        },
+    }
 }
 
 fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
@@ -2045,9 +3503,45 @@ fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn read_shared_prefix(
+    manager: &SharedJobManager,
+    id: &str,
+    stream: SharedOutputStream,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (summary, _) = manager
+        .output_summary(id, 1, stream)
+        .map_err(|error| anyhow!("cannot inspect shared retained output: {error:?}"))?;
+    let target = summary.retained_bytes.min(limit as u64);
+    let capacity = usize::try_from(target).unwrap_or(limit);
+    let mut bytes = Vec::with_capacity(capacity.min(64 * 1024));
+    let mut offset = 0u64;
+    while offset < target {
+        let remaining = usize::try_from(target - offset).unwrap_or(usize::MAX);
+        let page_limit = remaining.min(MAX_JOB_SPOOL_BYTES_PER_STREAM as usize);
+        let page = manager
+            .output_page(id, 1, stream, offset, page_limit)
+            .map_err(|error| anyhow!("cannot read shared retained output: {error:?}"))?;
+        if page.bytes.is_empty() {
+            bail!("shared retained output made no paging progress");
+        }
+        let take = page.bytes.len().min(remaining);
+        bytes.extend_from_slice(&page.bytes[..take]);
+        offset = offset
+            .checked_add(take as u64)
+            .ok_or_else(|| anyhow!("shared retained output offset overflow"))?;
+    }
+    Ok(bytes)
+}
+
 fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let completion = &snapshot.completion;
-    if let Some(message) = completion.internal_error.as_deref() {
+    if completion.status != JobStatus::Unknown
+        && let Some(message) = completion.internal_error.as_deref()
+    {
         return Ok(CallToolResult::error(vec![ContentBlock::text(
             message.to_owned(),
         )]));
@@ -2058,14 +3552,40 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let stderr_limit = usize::try_from(completion.stderr.stored_bytes)
         .unwrap_or(usize::MAX)
         .min(snapshot.result_limit);
-    let stdout = read_prefix(&snapshot.stdout_path, stdout_limit)?;
-    let stderr = read_prefix(&snapshot.stderr_path, stderr_limit)?;
+    let (stdout, stderr) = match &snapshot.output {
+        ToolResultOutput::Shared { manager, id } => (
+            read_shared_prefix(manager, id, SharedOutputStream::Stdout, stdout_limit)?,
+            read_shared_prefix(manager, id, SharedOutputStream::Stderr, stderr_limit)?,
+        ),
+        ToolResultOutput::Legacy {
+            stdout_path,
+            stderr_path,
+        } => (
+            read_prefix(stdout_path, stdout_limit)?,
+            read_prefix(stderr_path, stderr_limit)?,
+        ),
+    };
     let stdout_truncated =
         completion.stdout.truncated || completion.stdout.total_bytes > snapshot.result_limit as u64;
     let stderr_truncated =
         completion.stderr.truncated || completion.stderr.total_bytes > snapshot.result_limit as u64;
 
     let Some(context) = completion.context.as_ref() else {
+        if completion.status == JobStatus::Unknown {
+            let text = serde_json::json!({
+                "job_id": snapshot.id,
+                "status": "unknown",
+                "observed_status": completion.observed_status.map(JobStatus::as_str),
+                "success": false,
+                "stdout": String::from_utf8_lossy(&stdout),
+                "stderr": String::from_utf8_lossy(&stderr),
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "error": completion.error.as_deref().or(completion.internal_error.as_deref()),
+            })
+            .to_string();
+            return Ok(CallToolResult::error(vec![ContentBlock::text(text)]));
+        }
         if completion.status != JobStatus::Completed {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 completion
@@ -2087,16 +3607,23 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
     };
 
-    let error = (completion.status == JobStatus::TimedOut).then(|| {
-        format!(
+    let observed = completion.observed_status.unwrap_or(completion.status);
+    let error = if completion.status == JobStatus::Unknown {
+        completion.error.clone()
+    } else if completion.status == JobStatus::TimedOut {
+        Some(format!(
             "command timed out after {} seconds and was terminated; use job_start for explicitly background execution or retry with a different timeout when the caller and transport permit it",
             snapshot.timeout_secs
-        )
-    });
-    let text = serde_json::json!({
+        ))
+    } else {
+        None
+    };
+    let mut payload = serde_json::json!({
+        "status": completion.status.as_str(),
+        "observed_status": completion.observed_status.map(JobStatus::as_str),
         "exit_code": completion.exit_code,
         "success": completion.success,
-        "timed_out": completion.status == JobStatus::TimedOut,
+        "timed_out": observed == JobStatus::TimedOut,
         "dir": context.dir,
         "sandboxed": context.sandboxed,
         "network": context.network,
@@ -2105,8 +3632,11 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "error": error.as_deref().or(completion.error.as_deref()),
-    })
-    .to_string();
+    });
+    if completion.status == JobStatus::Unknown {
+        payload["job_id"] = serde_json::Value::String(snapshot.id.clone());
+    }
+    let text = payload.to_string();
     Ok(if completion.status == JobStatus::Completed {
         CallToolResult::success(vec![ContentBlock::text(text)])
     } else {
@@ -2172,7 +3702,8 @@ fn fit_output_page(
 ) -> Result<String> {
     let render = OutputPageRender {
         id,
-        stream,
+        node: None,
+        stream: stream.label(),
         offset,
         stored_bytes: snapshot.stored,
         total_bytes: snapshot.total,
@@ -2251,6 +3782,71 @@ fn fit_output_page(
     Ok(rendered)
 }
 
+fn fit_shared_output_page(
+    render: &OutputPageRender<'_>,
+    bytes: &[u8],
+    snapshot: &OutputSnapshot,
+    payload_ceiling: usize,
+) -> Result<String> {
+    let offset = render.offset;
+    let base64 = render.base64;
+    let empty = render.render(snapshot.stored, false, &[])?;
+    let fixed = serialized_tool_result_len(&empty)?;
+    if fixed > payload_ceiling {
+        bail!("job output metadata leaves no room under the response ceiling");
+    }
+    let data_budget = payload_ceiling - fixed;
+    let take = if base64 {
+        bytes.len().min((data_budget / 4).saturating_mul(3))
+    } else if let Ok(text) = std::str::from_utf8(bytes) {
+        let mut used = 0usize;
+        let mut take = 0usize;
+        for (index, ch) in text.char_indices() {
+            let cost = double_json_data_len(ch.encode_utf8(&mut [0; 4]));
+            let Some(next) = used.checked_add(cost) else {
+                break;
+            };
+            if next > data_budget {
+                break;
+            }
+            used = next;
+            take = index + ch.len_utf8();
+        }
+        take
+    } else {
+        let mut low = 0usize;
+        let mut high = bytes.len();
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let next = offset + middle as u64;
+            let page = render.render(
+                next,
+                snapshot.terminal && next >= snapshot.stored,
+                &bytes[..middle],
+            )?;
+            if serialized_tool_result_len(&page)? <= payload_ceiling {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        text_page_boundary(bytes, low)
+    };
+    if take == 0 && !bytes.is_empty() {
+        bail!("job output metadata leaves no room under the response ceiling");
+    }
+    let next = offset + take as u64;
+    let rendered = render.render(
+        next,
+        snapshot.terminal && next >= snapshot.stored,
+        &bytes[..take],
+    )?;
+    if serialized_tool_result_len(&rendered)? > payload_ceiling {
+        bail!("job output MCP result exceeded its reserved response budget");
+    }
+    Ok(rendered)
+}
+
 fn stream_path(entry: &JobEntry, stream: JobStream) -> &Path {
     match stream {
         JobStream::Stdout => &entry.stdout_path,
@@ -2269,7 +3865,8 @@ fn text_page_boundary(bytes: &[u8], take: usize) -> usize {
 
 struct OutputPageRender<'a> {
     id: &'a str,
-    stream: JobStream,
+    node: Option<usize>,
+    stream: &'static str,
     offset: u64,
     stored_bytes: u64,
     total_bytes: Option<u64>,
@@ -2288,7 +3885,8 @@ impl OutputPageRender<'_> {
         };
         serde_json::to_string(&JobOutputPage {
             job_id: self.id,
-            stream: self.stream.label(),
+            node: self.node,
+            stream: self.stream,
             offset: self.offset,
             next_offset,
             stored_bytes: self.stored_bytes,
@@ -2303,43 +3901,244 @@ impl OutputPageRender<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SharedOwnerProjection {
+    through: u64,
+    retained: u64,
+    released: bool,
+}
+
+fn shared_owner_projection(
+    entry: &JobEntry,
+    stream: JobStream,
+) -> Option<JobResult<SharedOwnerProjection>> {
+    let shared = entry.shared_job.as_ref()?;
+    let owner = match shared.manager.job_output_owner(&entry.id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            return Some(Err(JobError::Internal(anyhow!(
+                "cannot derive shared Job output owner for {}: {error:?}",
+                entry.id
+            ))));
+        }
+    };
+    let owner_state =
+        match shared
+            .manager
+            .output_owner_state(&entry.id, 1, shared_output_stream(stream), owner)
+        {
+            Ok(state) => state,
+            Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                return Some(Ok(SharedOwnerProjection::default()));
+            }
+            Err(error) => {
+                return Some(Err(JobError::Internal(anyhow!(
+                    "cannot inspect shared Job owner state for {} {}: {error:?}",
+                    entry.id,
+                    stream.label()
+                ))));
+            }
+        };
+    let retained = match shared
+        .manager
+        .output_summary(&entry.id, 1, shared_output_stream(stream))
+    {
+        Ok((summary, _)) => summary.retained_bytes,
+        Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => 0,
+        Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => 0,
+        Err(error) => {
+            return Some(Err(JobError::Internal(anyhow!(
+                "cannot inspect shared Job retained output for {} {}: {error:?}",
+                entry.id,
+                stream.label()
+            ))));
+        }
+    };
+    Some(Ok(SharedOwnerProjection {
+        through: owner_state.through,
+        retained,
+        released: owner_state.released
+            || (owner_state.acknowledged && owner_state.through >= retained),
+    }))
+}
+
+fn job_owner_projection(entry: &JobEntry, stream: JobStream) -> JobResult<SharedOwnerProjection> {
+    if let Some(projection) = shared_owner_projection(entry, stream) {
+        return projection;
+    }
+    Ok(match stream {
+        JobStream::Stdout => SharedOwnerProjection {
+            through: entry.stdout_consumed,
+            retained: entry.stdout_retained,
+            released: entry.stdout_released,
+        },
+        JobStream::Stderr => SharedOwnerProjection {
+            through: entry.stderr_consumed,
+            retained: entry.stderr_retained,
+            released: entry.stderr_released,
+        },
+    })
+}
+
+fn shared_snapshot_status(snapshot: &SharedSnapshot) -> &'static str {
+    if snapshot.lifecycle != SharedLifecycle::Terminal {
+        // Keep dotlink's established job-control wire contract: every live
+        // phase is "working". Precise running/cancelling/revoking state is
+        // exposed separately under graph.lifecycle.
+        return "working";
+    }
+    match snapshot.status_label() {
+        // Preserve dotlink's existing terminal vocabulary while retaining the
+        // canonical Graph detail under graph.summary/graph.compact.
+        "ok" | "unchanged" => "completed",
+        "fail" | "mixed" | "revoked" => "failed",
+        "unknown" => "unknown",
+        "cancelled" => "cancelled",
+        // Dotlink previously collapsed this into cancellation. Keep the
+        // canonical no-effect distinction visible instead.
+        "skip" => "skip",
+        _ => "unknown",
+    }
+}
+
+fn shared_lifecycle_label(lifecycle: SharedLifecycle) -> &'static str {
+    match lifecycle {
+        SharedLifecycle::Running => "running",
+        SharedLifecycle::Cancelling => "cancelling",
+        SharedLifecycle::Revoking => "revoking",
+        SharedLifecycle::Terminal => "terminal",
+    }
+}
+
+fn shared_stop_reason_label(reason: SharedStopReason) -> &'static str {
+    match reason {
+        SharedStopReason::Cancelled => "cancelled",
+        SharedStopReason::Revoked => "revoked",
+    }
+}
+
+fn authoritative_graph_snapshot(
+    inner: &JobManagerInner,
+    entry: &JobEntry,
+) -> Option<SharedSnapshot> {
+    if !entry.shared_graph_authoritative {
+        return None;
+    }
+    match inner.shared_jobs.runtime_snapshot(&entry.id) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            tracing::warn!(id = %entry.id, ?error, "authoritative shared Graph status unavailable");
+            None
+        }
+    }
+}
+
+fn projected_status(inner: &JobManagerInner, entry: &JobEntry) -> String {
+    if !entry.shared_graph_authoritative {
+        return entry.status().as_str().to_owned();
+    }
+    authoritative_graph_snapshot(inner, entry)
+        .as_ref()
+        .map_or("unknown", shared_snapshot_status)
+        .to_owned()
+}
+
+fn physical_spool_usage(inner: &JobManagerInner) -> (u64, u64) {
+    let legacy = inner.spool_used_bytes.load(Ordering::Relaxed);
+    match inner.shared_jobs.spool_usage() {
+        Ok((shared, limit)) => (shared.saturating_add(legacy), limit),
+        Err(error) => {
+            tracing::warn!(?error, "cannot inspect shared Job spool usage");
+            (legacy, inner.spool_limit_bytes.load(Ordering::Relaxed))
+        }
+    }
+}
+
 fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
     let completion = entry.completion.as_ref();
-    let stdout_stored = completion.map_or_else(
-        || stored_len(&entry.stdout_path, None),
-        |_| entry.stdout_retained,
-    );
-    let stderr_stored = completion.map_or_else(
-        || stored_len(&entry.stderr_path, None),
-        |_| entry.stderr_retained,
-    );
+    let (spool_used_bytes, spool_session_limit_bytes) = physical_spool_usage(inner);
+    let shared_snapshot = authoritative_graph_snapshot(inner, entry);
+    let status = if entry.shared_graph_authoritative {
+        shared_snapshot
+            .as_ref()
+            .map_or("unknown", shared_snapshot_status)
+            .to_owned()
+    } else {
+        entry.status().as_str().to_owned()
+    };
+    let graph = if entry.shared_graph_authoritative {
+        let compact = inner.shared_jobs.render_job_status(&entry.id).ok();
+        Some(match shared_snapshot.as_ref() {
+            Some(snapshot) => serde_json::json!({
+                "lifecycle": shared_lifecycle_label(snapshot.lifecycle),
+                "stop_reason": snapshot.stop_reason.map(shared_stop_reason_label),
+                "finished": snapshot.finished,
+                "total": snapshot.total,
+                "summary": snapshot.summary.map(|(primary, more, incomplete)| serde_json::json!({
+                    "primary": primary.as_str(),
+                    "more": more,
+                    "incomplete": incomplete,
+                })),
+                "compact": compact,
+            }),
+            None => serde_json::json!({
+                "lifecycle": "unknown",
+                "finished": serde_json::Value::Null,
+                "total": serde_json::Value::Null,
+                "summary": serde_json::Value::Null,
+                "compact": compact,
+            }),
+        })
+    } else {
+        None
+    };
+    let stdout_owner =
+        job_owner_projection(entry, JobStream::Stdout).unwrap_or_else(|_| SharedOwnerProjection {
+            retained: completion.map_or_else(
+                || stored_len(&entry.stdout_path, None),
+                |_| entry.stdout_retained,
+            ),
+            ..Default::default()
+        });
+    let stderr_owner =
+        job_owner_projection(entry, JobStream::Stderr).unwrap_or_else(|_| SharedOwnerProjection {
+            retained: completion.map_or_else(
+                || stored_len(&entry.stderr_path, None),
+                |_| entry.stderr_retained,
+            ),
+            ..Default::default()
+        });
+    let stdout_stored = stdout_owner.retained;
+    let stderr_stored = stderr_owner.retained;
     serde_json::json!({
         "job_id": entry.id,
         "task_id": entry.id,
-        "status": entry.status(),
+        "status": status,
         "phase": entry.phase,
+        "graph": graph,
         "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         "timeout_secs": entry.timeout_secs,
         "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
-        "spool_used_bytes": inner.spool_used_bytes.load(Ordering::Relaxed),
-        "spool_session_limit_bytes": inner.spool_limit_bytes.load(Ordering::Relaxed),
+        "spool_used_bytes": spool_used_bytes,
+        "spool_session_limit_bytes": spool_session_limit_bytes,
         "cancel_requested": entry.cancel.is_cancelled(),
         "exit_code": completion.and_then(|value| value.exit_code),
         "success": completion.map(|value| value.success),
         "error": completion.and_then(|value| value.error.as_deref()),
+        "observed_status": completion.and_then(|value| value.observed_status.map(JobStatus::as_str)),
         "stdout": {
             "stored_bytes": stdout_stored,
-            "acknowledged_bytes": entry.stdout_consumed,
+            "acknowledged_bytes": stdout_owner.through,
             "total_bytes": completion.map(|value| value.stdout.total_bytes),
             "truncated": completion.is_some_and(|value| value.stdout.truncated),
-            "released": entry.stdout_released,
+            "released": stdout_owner.released,
         },
         "stderr": {
             "stored_bytes": stderr_stored,
-            "acknowledged_bytes": entry.stderr_consumed,
+            "acknowledged_bytes": stderr_owner.through,
             "total_bytes": completion.map(|value| value.stderr.total_bytes),
             "truncated": completion.is_some_and(|value| value.stderr.truncated),
-            "released": entry.stderr_released,
+            "released": stderr_owner.released,
         },
         "output": "use job_output to read; job_ack explicitly advances cleanup watermarks",
         "cancel": "use job_cancel while status=working",
@@ -2367,7 +4166,37 @@ fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
     } else if entry.request_key.is_none() && entry.response_attempts == 0 {
         // Local transports have no durable request identity to replay. Make an
         // abandoned execution discoverable through job_list instead of hiding a
-        // side effect behind an irrecoverable lost response.
+        // side effect behind an irrecoverable lost response. The local retained
+        // slot was reserved at admission, so shared exposure capacity is not an
+        // independent admission decision here.
+        if let Some(shared) = entry.shared_job.as_ref() {
+            let reserved = match shared.manager.reserve_exposed(&entry.id) {
+                Ok(()) => true,
+                Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+                    tracing::error!(id = %entry.id, "shared-owned Job disappeared during abandoned-response exposure reservation");
+                    false
+                }
+                Err(error) => {
+                    tracing::error!(id = %entry.id, ?error, "shared Job exposure reservation failed during abandoned-response recovery");
+                    false
+                }
+            };
+            if reserved {
+                match shared.manager.expose(&entry.id) {
+                    Ok(()) => {}
+                    Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+                        tracing::error!(id = %entry.id, "shared-owned Job disappeared during abandoned-response publication");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(id = %entry.id, ?error, "reserved shared Job publication failed during abandoned-response recovery");
+                        return;
+                    }
+                }
+            } else {
+                return;
+            }
+        }
         commit_exposure(entry, JobDisposition::Compatibility);
     }
 }
@@ -2378,6 +4207,9 @@ fn commit_exposure(entry: &mut JobEntry, disposition: JobDisposition) {
         JobDisposition::Compatibility | JobDisposition::NativeTask
     ));
     entry.disposition = disposition;
+    if disposition == JobDisposition::Compatibility && !release_shared_task_owner(entry) {
+        entry.output_cleanup_pending = true;
+    }
     entry.retention = RetentionClass::Ordinary;
     entry.retention_anchor = Some(Instant::now());
     entry.expiration_pending = false;
@@ -2424,7 +4256,7 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
         serde_json::json!({
             "job_id": entry.id,
             "task_id": entry.id,
-            "status": entry.status(),
+            "status": projected_status(inner, entry),
             "phase": entry.phase,
             "timeout_secs": entry.timeout_secs,
             "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
@@ -2439,23 +4271,230 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
     )])
 }
 
+pub(crate) fn shared_process_terminal(completion: &JobCompletion) -> SharedProcessTerminal {
+    let output = SharedProcessOutputMeta {
+        stdout_bytes: completion.stdout.total_bytes,
+        stderr_bytes: completion.stderr.total_bytes,
+        stdout_truncated: completion.stdout.truncated,
+        stderr_truncated: completion.stderr.truncated,
+        complete: completion.output_complete,
+    };
+    let exit = match completion.status {
+        JobStatus::Completed => match completion.exit_code {
+            Some(code) => SharedProcessExit::Code(code),
+            None if completion.success => SharedProcessExit::Code(0),
+            None => SharedProcessExit::Signal,
+        },
+        JobStatus::TimedOut if completion.stop_proven => SharedProcessExit::DeadlineExceeded,
+        JobStatus::Cancelled if completion.stop_proven => SharedProcessExit::Cancelled,
+        JobStatus::TimedOut | JobStatus::Cancelled => SharedProcessExit::Unknown,
+        JobStatus::Failed | JobStatus::Unknown => SharedProcessExit::Unknown,
+        JobStatus::Working => SharedProcessExit::Unknown,
+    };
+    SharedProcessTerminal { exit, output }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedSettlement {
+    /// This host entry predates/does not own a canonical shared projection.
+    LegacyOnly,
+    /// The canonical shared lifecycle is terminal with a known outcome.
+    Terminal,
+    /// The shared lifecycle is terminal-unknown or could not be checkpointed.
+    Uncertain,
+}
+
+fn shared_terminal_settlement(state: SharedNodeState) -> Option<SharedSettlement> {
+    match state {
+        SharedNodeState::Terminal { status, .. } => {
+            Some(if status.primary == SharedPrimary::Unknown {
+                SharedSettlement::Uncertain
+            } else {
+                SharedSettlement::Terminal
+            })
+        }
+        _ => None,
+    }
+}
+
+fn settle_shared_completion(
+    inner: &JobManagerInner,
+    id: &str,
+    completion: &JobCompletion,
+    shared_owned: bool,
+) -> SharedSettlement {
+    let terminal = (!completion.spawn_failed).then(|| shared_process_terminal(completion));
+    // A concurrent cancel/revoke may advance the shared sequence between the
+    // projection and checkpoint. Re-read a bounded number of times; this only
+    // records the already-observed process outcome and never relaunches work.
+    for _ in 0..4 {
+        let state = match inner.shared_jobs.node_state(id, 1) {
+            Ok(state) => state,
+            Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+                return if shared_owned {
+                    tracing::warn!(%id, "shared-owned shell Job disappeared during settlement");
+                    SharedSettlement::Uncertain
+                } else {
+                    SharedSettlement::LegacyOnly
+                };
+            }
+            Err(error) => {
+                tracing::warn!(%id, ?error, "cannot inspect shared shell Job during settlement");
+                return SharedSettlement::Uncertain;
+            }
+        };
+        if let Some(settlement) = shared_terminal_settlement(state) {
+            return settlement;
+        }
+        match state {
+            SharedNodeState::Pending => {
+                tracing::warn!(%id, "shared shell Job remained pending at host completion");
+                return SharedSettlement::Uncertain;
+            }
+            SharedNodeState::Claimed { sequence: claimed } => {
+                // Host completion without a canonical Start checkpoint is an
+                // invariant violation. Fail closed: never project it as a
+                // successful shell or infer no-effect from host state alone.
+                let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
+                    return SharedSettlement::Uncertain;
+                };
+                let status = SharedStatus {
+                    primary: SharedPrimary::Unknown,
+                    more: false,
+                    incomplete: false,
+                };
+                match inner.shared_jobs.settle(
+                    id,
+                    1,
+                    SharedNodeState::Claimed { sequence: claimed },
+                    status,
+                    sequence,
+                    |_, _| Ok::<_, SharedJournalError>(()),
+                ) {
+                    Ok(()) => return SharedSettlement::Uncertain,
+                    Err(error) => {
+                        tracing::debug!(%id, ?error, "shared claimed settlement raced another transition; revalidating");
+                    }
+                }
+            }
+            SharedNodeState::Running { sequence: running } => {
+                let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
+                    return SharedSettlement::Uncertain;
+                };
+                let settled = if completion.spawn_failed {
+                    inner
+                        .shared_jobs
+                        .settle(
+                            id,
+                            1,
+                            SharedNodeState::Running { sequence: running },
+                            SharedStatus {
+                                primary: SharedPrimary::Fail,
+                                more: false,
+                                incomplete: false,
+                            },
+                            sequence,
+                            |_, _| Ok::<_, SharedJournalError>(()),
+                        )
+                        .map(|()| SharedStatus {
+                            primary: SharedPrimary::Fail,
+                            more: false,
+                            incomplete: false,
+                        })
+                } else {
+                    inner.shared_jobs.settle_process(
+                        id,
+                        1,
+                        SharedNodeState::Running { sequence: running },
+                        terminal.expect("non-spawn-failure process terminal"),
+                        sequence,
+                        |_, _| Ok::<_, SharedJournalError>(()),
+                    )
+                };
+                match settled {
+                    Ok(status) => {
+                        return if status.primary == SharedPrimary::Unknown {
+                            SharedSettlement::Uncertain
+                        } else {
+                            SharedSettlement::Terminal
+                        };
+                    }
+                    Err(error) => {
+                        tracing::debug!(%id, ?error, "shared process settlement raced another transition; revalidating");
+                    }
+                }
+            }
+            SharedNodeState::Terminal { .. } => unreachable!("handled above"),
+        }
+    }
+    tracing::warn!(%id, "shared shell Job could not reach a consistent terminal checkpoint");
+    SharedSettlement::Uncertain
+}
+
+fn fail_closed_shared_completion(mut completion: JobCompletion) -> JobCompletion {
+    // Canonical shared uncertainty dominates the host's local terminal class.
+    // Preserve an infrastructure error as diagnostic evidence, but never let a
+    // post-admission failure look like a proven no-effect failure/retry signal.
+    let observed = completion.observed_status.unwrap_or(completion.status);
+    let detail = completion
+        .error
+        .as_deref()
+        .or(completion.internal_error.as_deref())
+        .unwrap_or("terminal host outcome could not be certified");
+    if completion.status != JobStatus::Unknown && completion.observed_status.is_none() {
+        completion.observed_status = Some(completion.status);
+    }
+    completion.status = JobStatus::Unknown;
+    completion.success = false;
+    completion.stop_proven = false;
+    completion.error = Some(bounded_job_error(format!(
+        "shared shell lifecycle outcome is uncertain after observed {}: {}; inspect the Job/effects before retrying",
+        observed.as_str(),
+        detail
+    )));
+    completion
+}
+
 fn finish_inner(inner: &JobManagerInner, id: &str, completion: JobCompletion) {
+    let (authoritative, shared_owned) = inner
+        .state
+        .lock()
+        .expect("job manager lock")
+        .jobs
+        .get(id)
+        .map_or((false, false), |entry| {
+            (entry.shared_graph_authoritative, entry.shared_job.is_some())
+        });
+    let completion = if authoritative {
+        completion
+    } else {
+        match settle_shared_completion(inner, id, &completion, shared_owned) {
+            SharedSettlement::LegacyOnly | SharedSettlement::Terminal => completion,
+            SharedSettlement::Uncertain => fail_closed_shared_completion(completion),
+        }
+    };
     let mut state = inner.state.lock().expect("job manager lock");
     if let Some(entry) = state.jobs.get_mut(id) {
         entry.runner = None;
         entry.phase = JobPhase::Terminal;
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.terminal_at = Some(Instant::now());
-        entry.stdout_retained = completion.stdout.stored_bytes;
-        entry.stderr_retained = completion.stderr.stored_bytes;
+        if entry.shared_job.is_none() {
+            entry.stdout_retained = completion.stdout.stored_bytes;
+            entry.stderr_retained = completion.stderr.stored_bytes;
+        }
         entry.completion = Some(completion);
-        if entry.output_cleanup_requested {
+        if !release_shared_task_owner(entry) {
+            entry.output_cleanup_pending = true;
+        }
+        if entry.output_cleanup_requested || entry.output_cleanup_pending {
             maybe_release_output(entry);
         }
         entry.notify.notify_waiters();
     }
 }
 
+#[cfg(test)]
 fn reserve_spool_bytes(inner: &JobManagerInner, requested: u64) -> u64 {
     if requested == 0 {
         return 0;
@@ -2499,14 +4538,253 @@ fn release_spool_bytes(inner: &JobManagerInner, bytes: u64) {
     }
 }
 
+fn acknowledge_shared_owner(
+    entry: &JobEntry,
+    owner: SharedOutputOwner,
+    stream: JobStream,
+    through: u64,
+) -> bool {
+    let Some(shared) = entry.shared_job.as_ref() else {
+        return false;
+    };
+    match shared.manager.acknowledge_output(
+        &entry.id,
+        1,
+        shared_output_stream(stream),
+        owner,
+        through,
+    ) {
+        Ok(_) | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => true,
+        Err(error) => {
+            tracing::warn!(id = %entry.id, ?stream, ?error, "shared Job output acknowledgement failed");
+            false
+        }
+    }
+}
+
+/// Once the response is permanently non-Task, the prospective Task owner no
+/// longer needs to pin raw output. This is called only after terminal metadata
+/// fixes the complete retained prefix, so future bytes cannot appear beyond the
+/// acknowledgement watermark.
+fn release_shared_task_owner(entry: &JobEntry) -> bool {
+    if entry.shared_graph_authoritative {
+        return true;
+    }
+    if !(entry.retention == RetentionClass::CleanupOnly
+        || matches!(
+            entry.disposition,
+            JobDisposition::Synchronous | JobDisposition::Compatibility
+        ))
+        || !entry.status().terminal()
+    {
+        return true;
+    }
+    if entry.shared_job.is_none() {
+        return true;
+    }
+    let Some(completion) = entry.completion.as_ref() else {
+        return false;
+    };
+    let owner = match shared_task_output_owner(&entry.id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(id = %entry.id, %error, "cannot derive shared non-Task output owner");
+            return false;
+        }
+    };
+    let mut ready = true;
+    for (stream, through) in [
+        (JobStream::Stdout, completion.stdout.stored_bytes),
+        (JobStream::Stderr, completion.stderr.stored_bytes),
+    ] {
+        if !acknowledge_shared_owner(entry, owner, stream, through) {
+            ready = false;
+        }
+    }
+    ready
+}
+
+/// Once the compatibility Job owner has released both streams, retain only the
+/// exact prefix still needed by a committed native Task. The shared JobManager
+/// remains the sole physical spool/quota owner; dotlink mirrors its retained
+/// lengths only after each shared transition succeeds.
+fn compact_shared_native_task_stream(entry: &mut JobEntry, stream: JobStream) -> bool {
+    if !entry.disposition.native_task() {
+        return true;
+    }
+    let Some(shared) = entry.shared_job.as_ref() else {
+        return false;
+    };
+    let Some(completion) = entry.completion.as_ref() else {
+        return false;
+    };
+    let owner = match shared_task_output_owner(&entry.id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!(id = %entry.id, %error, "cannot derive shared native-Task output owner");
+            return false;
+        }
+    };
+    let keep_result =
+        completion.internal_error.is_none() && completion.status != JobStatus::Cancelled;
+    let retained = match shared
+        .manager
+        .output_summary(&entry.id, 1, shared_output_stream(stream))
+    {
+        Ok((summary, _)) => summary.retained_bytes,
+        Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => 0,
+        Err(error) => {
+            tracing::warn!(id = %entry.id, ?stream, ?error, "cannot inspect shared native-Task output before compaction");
+            return false;
+        }
+    };
+    let keep = if keep_result {
+        retained.min(entry.result_limit as u64)
+    } else {
+        0
+    };
+    let retained = match shared.manager.compact_output_for_owner(
+        &entry.id,
+        1,
+        shared_output_stream(stream),
+        owner,
+        keep,
+    ) {
+        Ok(retained) => retained,
+        Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => 0,
+        Err(error) => {
+            tracing::warn!(
+                id = %entry.id,
+                ?stream,
+                ?error,
+                "shared native-Task output compaction failed"
+            );
+            return false;
+        }
+    };
+    let _ = retained;
+    true
+}
+
+fn graph_output_streams() -> [SharedOutputStream; 3] {
+    [
+        SharedOutputStream::Result,
+        SharedOutputStream::Stdout,
+        SharedOutputStream::Stderr,
+    ]
+}
+
+fn authoritative_graph_outputs_released(entry: &JobEntry) -> bool {
+    let Some(shared) = entry.shared_job.as_ref() else {
+        return false;
+    };
+    let Ok(graph) = shared.manager.graph(&entry.id) else {
+        return false;
+    };
+    for coordinate in 1..=graph.steps().len() {
+        for stream in graph_output_streams() {
+            match shared.manager.output_summary(&entry.id, coordinate, stream) {
+                Ok((summary, _)) if summary.retained_bytes == 0 => {}
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing)
+                | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {}
+                Ok(_) | Err(_) => return false,
+            }
+        }
+    }
+    true
+}
+
+fn acknowledge_authoritative_graph_outputs(entry: &JobEntry, owner: SharedOutputOwner) -> bool {
+    let Some(shared) = entry.shared_job.as_ref() else {
+        return false;
+    };
+    let Ok(graph) = shared.manager.graph(&entry.id) else {
+        return false;
+    };
+    let mut ready = true;
+    for coordinate in 1..=graph.steps().len() {
+        for stream in graph_output_streams() {
+            let through = match shared.manager.output_summary(&entry.id, coordinate, stream) {
+                Ok((summary, _)) => summary.retained_bytes,
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing)
+                | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => continue,
+                Err(error) => {
+                    tracing::warn!(id = %entry.id, coordinate, ?stream, ?error, "cannot inspect Graph output before complete consumption");
+                    ready = false;
+                    continue;
+                }
+            };
+            match shared
+                .manager
+                .acknowledge_output(&entry.id, coordinate, stream, owner, through)
+            {
+                Ok(_) | Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => {}
+                Err(error) => {
+                    tracing::warn!(id = %entry.id, coordinate, ?stream, ?error, "cannot acknowledge complete Graph output");
+                    ready = false;
+                }
+            }
+        }
+    }
+    ready
+}
+
+fn consume_complete_job_output(entry: &mut JobEntry) -> bool {
+    let Some(completion) = entry.completion.as_ref() else {
+        return false;
+    };
+    if let Some(shared) = entry.shared_job.as_ref() {
+        let owner = match shared.manager.job_output_owner(&entry.id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                tracing::warn!(id = %entry.id, ?error, "cannot derive shared Job output owner for complete consumption");
+                return false;
+            }
+        };
+        let mut acknowledged = true;
+        if entry.shared_graph_authoritative {
+            acknowledged = acknowledge_authoritative_graph_outputs(entry, owner);
+        } else {
+            for (stream, through) in [
+                (JobStream::Stdout, completion.stdout.stored_bytes),
+                (JobStream::Stderr, completion.stderr.stored_bytes),
+            ] {
+                if !acknowledge_shared_owner(entry, owner, stream, through) {
+                    acknowledged = false;
+                }
+            }
+        }
+        if !acknowledged {
+            return false;
+        }
+    } else {
+        entry.stdout_consumed = completion.stdout.stored_bytes;
+        entry.stderr_consumed = completion.stderr.stored_bytes;
+    }
+    entry.output_cleanup_requested = true;
+    maybe_release_output(entry);
+    true
+}
+
 fn maybe_release_output(entry: &mut JobEntry) {
     if !entry.output_cleanup_requested {
+        return;
+    }
+    if entry.shared_job.is_some() {
+        // Shared ownership is stream-local. Reconcile after every ACK so one
+        // fully released stream can compact independently of the other; an
+        // active host reader still fences physical spool mutation globally.
+        if entry.readers != 0 {
+            entry.output_cleanup_pending = true;
+            return;
+        }
+        release_acknowledged_output(entry);
         return;
     }
     let Some(completion) = entry.completion.as_ref() else {
         return;
     };
-    if entry.all_output_released()
+    if (entry.all_output_released() && !entry.output_cleanup_pending)
         || entry.stdout_consumed < completion.stdout.stored_bytes
         || entry.stderr_consumed < completion.stderr.stored_bytes
     {
@@ -2520,6 +4798,29 @@ fn maybe_release_output(entry: &mut JobEntry) {
 }
 
 fn release_acknowledged_output(entry: &mut JobEntry) {
+    if entry.shared_job.is_some() {
+        if entry.shared_graph_authoritative {
+            entry.output_cleanup_pending = !authoritative_graph_outputs_released(entry);
+            return;
+        }
+        let non_task_owner_ready = release_shared_task_owner(entry);
+        let stdout_ready =
+            job_owner_projection(entry, JobStream::Stdout).is_ok_and(|state| state.released);
+        let stderr_ready =
+            job_owner_projection(entry, JobStream::Stderr).is_ok_and(|state| state.released);
+        let stdout_retention_ready =
+            !stdout_ready || compact_shared_native_task_stream(entry, JobStream::Stdout);
+        let stderr_retention_ready =
+            !stderr_ready || compact_shared_native_task_stream(entry, JobStream::Stderr);
+        entry.output_cleanup_pending = !stdout_ready
+            || !stderr_ready
+            || !non_task_owner_ready
+            || !stdout_retention_ready
+            || !stderr_retention_ready;
+        return;
+    }
+    // Legacy/test-only entries that never joined the shared lifecycle retain the
+    // historical local file cleanup behavior.
     if entry.disposition.native_task() {
         let _ = compact_native_task_output(entry);
     } else {
@@ -2527,7 +4828,11 @@ fn release_acknowledged_output(entry: &mut JobEntry) {
     }
 }
 
-fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> Option<u64> {
+fn truncate_file_releasing(
+    account: Option<&LegacySpoolAccount>,
+    path: &Path,
+    keep: u64,
+) -> Option<u64> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2555,7 +4860,9 @@ fn truncate_file_releasing(account: &SpoolAccount, path: &Path, keep: u64) -> Op
         .and_then(|file| file.set_len(keep))
     {
         Ok(()) => {
-            account.release(len - keep);
+            if let Some(account) = account {
+                account.release(len - keep);
+            }
             Some(keep)
         }
         Err(error) => {
@@ -2588,12 +4895,20 @@ fn compact_native_task_output(entry: &mut JobEntry) -> bool {
     let stdout_retained = if entry.stdout_released {
         Some(entry.stdout_retained)
     } else {
-        truncate_file_releasing(&entry.spool_account, &entry.stdout_path, stdout_keep)
+        truncate_file_releasing(
+            entry.legacy_spool.as_deref(),
+            &entry.stdout_path,
+            stdout_keep,
+        )
     };
     let stderr_retained = if entry.stderr_released {
         Some(entry.stderr_retained)
     } else {
-        truncate_file_releasing(&entry.spool_account, &entry.stderr_path, stderr_keep)
+        truncate_file_releasing(
+            entry.legacy_spool.as_deref(),
+            &entry.stderr_path,
+            stderr_keep,
+        )
     };
     if let Some(retained) = stdout_retained {
         entry.stdout_retained = retained;
@@ -2604,10 +4919,8 @@ fn compact_native_task_output(entry: &mut JobEntry) -> bool {
         entry.stderr_released = true;
     }
     let success = entry.all_output_released();
-    if success {
-        entry
-            .spool_account
-            .reconcile_to(entry.stdout_retained.saturating_add(entry.stderr_retained));
+    if success && let Some(account) = &entry.legacy_spool {
+        account.reconcile_to(entry.stdout_retained.saturating_add(entry.stderr_retained));
     }
     entry.output_cleanup_pending = !success;
     success
@@ -2617,21 +4930,21 @@ fn release_output_files(entry: &mut JobEntry) -> bool {
     if entry.all_output_released() {
         return true;
     }
-    let stdout_ok =
-        entry.stdout_released || remove_file_releasing(&entry.spool_account, &entry.stdout_path);
+    let stdout_ok = entry.stdout_released
+        || remove_file_releasing(entry.legacy_spool.as_deref(), &entry.stdout_path);
     if stdout_ok {
         entry.stdout_retained = 0;
         entry.stdout_released = true;
     }
-    let stderr_ok =
-        entry.stderr_released || remove_file_releasing(&entry.spool_account, &entry.stderr_path);
+    let stderr_ok = entry.stderr_released
+        || remove_file_releasing(entry.legacy_spool.as_deref(), &entry.stderr_path);
     if stderr_ok {
         entry.stderr_retained = 0;
         entry.stderr_released = true;
     }
     let success = entry.all_output_released();
-    if success {
-        entry.spool_account.reconcile_to(0);
+    if success && let Some(account) = &entry.legacy_spool {
+        account.reconcile_to(0);
     }
     entry.output_cleanup_pending = !success;
     success
@@ -2654,7 +4967,7 @@ fn release_reader(inner: &Arc<JobManagerInner>, id: &str) {
             } else if entry.retention == RetentionClass::CleanupOnly {
                 release_acknowledged_output(entry);
                 if entry.all_output_released() {
-                    removed = remove_job_locked(&mut state, id);
+                    removed = cleanup_and_remove_job_locked(&mut state, id);
                 }
             } else if entry.output_cleanup_pending {
                 release_acknowledged_output(entry);
@@ -2729,22 +5042,21 @@ fn cleanup_stale_sessions(parent: &Path, current: &Path) {
     }
 }
 
-fn create_private_file(path: &Path) -> Result<()> {
+fn create_private_file(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create_new(true)
         .read(true)
         .write(true)
         .open(path)
         .with_context(|| format!("cannot create private job spool {}", path.display()))?;
-    drop(file);
     if let Err(error) = crate::setup::set_private_file_permissions(path) {
-        // `create_new` made this pathname ours. A hardening failure must roll it
-        // back here because the caller cannot know whether creation happened
-        // before the permission operation failed.
+        // `create_new` made this pathname ours. Close the capability before
+        // removing its name so rollback is reliable on Windows too.
+        drop(file);
         let _ = fs::remove_file(path);
         return Err(error);
     }
-    Ok(())
+    Ok(file)
 }
 
 fn incomplete_stream_summary(path: &Path) -> StreamSummary {
@@ -2760,15 +5072,19 @@ fn stored_len(path: &Path, hint: Option<u64>) -> u64 {
     hint.unwrap_or_else(|| fs::metadata(path).map_or(0, |metadata| metadata.len()))
 }
 
-fn remove_file_releasing(account: &SpoolAccount, path: &Path) -> bool {
+fn remove_file_releasing(account: Option<&LegacySpoolAccount>, path: &Path) -> bool {
     let bytes = fs::metadata(path).map_or(0, |metadata| metadata.len());
     match fs::remove_file(path) {
         Ok(()) => {
-            account.release(bytes);
+            if let Some(account) = account {
+                account.release(bytes);
+            }
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            account.release(bytes);
+            if let Some(account) = account {
+                account.release(bytes);
+            }
             true
         }
         Err(error) => {
@@ -2779,19 +5095,29 @@ fn remove_file_releasing(account: &SpoolAccount, path: &Path) -> bool {
 }
 
 fn cleanup_entry(entry: &mut JobEntry) -> bool {
-    let stdout_ok = remove_file_releasing(&entry.spool_account, &entry.stdout_path);
+    if let Some(shared) = entry.shared_job.take() {
+        match shared.manager.expire_terminal(&entry.id) {
+            Ok(()) => drop(shared),
+            Err(error) => {
+                tracing::warn!(id = %entry.id, ?error, "shared-owned Job is missing or not ready for host spool cleanup");
+                entry.shared_job = Some(shared);
+                return false;
+            }
+        }
+    }
+    let stdout_ok = remove_file_releasing(entry.legacy_spool.as_deref(), &entry.stdout_path);
     if stdout_ok {
         entry.stdout_retained = 0;
         entry.stdout_released = true;
     }
-    let stderr_ok = remove_file_releasing(&entry.spool_account, &entry.stderr_path);
+    let stderr_ok = remove_file_releasing(entry.legacy_spool.as_deref(), &entry.stderr_path);
     if stderr_ok {
         entry.stderr_retained = 0;
         entry.stderr_released = true;
     }
     let success = stdout_ok && stderr_ok;
-    if success {
-        entry.spool_account.reconcile_to(0);
+    if success && let Some(account) = &entry.legacy_spool {
+        account.reconcile_to(0);
     }
     success
 }
@@ -2807,6 +5133,16 @@ fn remove_job_locked(state: &mut JobState, id: &str) -> Option<JobEntry> {
         state.request_jobs.remove(key);
     }
     Some(entry)
+}
+
+fn cleanup_and_remove_job_locked(state: &mut JobState, id: &str) -> Option<JobEntry> {
+    if !state.jobs.get_mut(id).is_some_and(cleanup_entry) {
+        if let Some(entry) = state.jobs.get_mut(id) {
+            entry.output_cleanup_pending = true;
+        }
+        return None;
+    }
+    remove_job_locked(state, id)
 }
 
 fn retained_job_slots(state: &JobState) -> usize {
@@ -2834,6 +5170,7 @@ fn reclaimable_terminal(entry: &JobEntry) -> bool {
         || entry.response_attempts != 0
         || entry.readers != 0
         || entry.disposition.native_task()
+        || entry.status() == JobStatus::Unknown
     {
         return false;
     }
@@ -2917,7 +5254,7 @@ fn sweep_expired(inner: &JobManagerInner) {
                 false
             };
             if released {
-                let _ = remove_job_locked(&mut state, &id);
+                let _ = cleanup_and_remove_job_locked(&mut state, &id);
             }
         }
         for entry in state.jobs.values_mut() {
@@ -2967,6 +5304,7 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
         JobStatus::Working => TaskStatus::Working,
         JobStatus::Cancelled => TaskStatus::Cancelled,
         JobStatus::Completed | JobStatus::TimedOut => TaskStatus::Completed,
+        JobStatus::Unknown => TaskStatus::Failed,
         JobStatus::Failed
             if entry
                 .completion
@@ -3004,6 +5342,7 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
         })
 }
 
+#[cfg(test)]
 pub(crate) fn spool_limit() -> u64 {
     MAX_JOB_SPOOL_BYTES_PER_STREAM
 }
@@ -3011,6 +5350,168 @@ pub(crate) fn spool_limit() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_unknown_completion_preserves_fail_closed_process_evidence() {
+        let stdout = StreamSummary {
+            total_bytes: 7,
+            stored_bytes: 7,
+            truncated: false,
+        };
+        let completion = JobCompletion::unknown_with_output(
+            "process custody became uncertain",
+            stdout,
+            StreamSummary::default(),
+        );
+        assert_eq!(completion.status, JobStatus::Unknown);
+        assert!(!completion.success);
+        assert!(!completion.stop_proven);
+        assert!(completion.internal_error.is_none());
+        assert_eq!(completion.stdout.stored_bytes, 7);
+        assert_eq!(
+            shared_process_terminal(&completion).status().primary,
+            SharedPrimary::Unknown
+        );
+    }
+
+    #[test]
+    fn shared_graph_skip_is_not_host_cancellation_without_cancel_stop_reason() {
+        let skipped = SharedSnapshot {
+            id: "skip".into(),
+            label: "graph".into(),
+            lifecycle: SharedLifecycle::Terminal,
+            stop_reason: None,
+            sequence: 1,
+            finished: 2,
+            total: 2,
+            summary: Some((SharedPrimary::Skip, false, false)),
+            detail: None,
+        };
+        let completion = JobCompletion::from_shared_graph(&skipped);
+        assert_eq!(completion.status, JobStatus::Failed);
+        assert!(!completion.success);
+        assert!(completion.stop_proven);
+
+        let cancelled = SharedSnapshot {
+            id: "cancelled".into(),
+            stop_reason: Some(SharedStopReason::Cancelled),
+            ..skipped
+        };
+        let completion = JobCompletion::from_shared_graph(&cancelled);
+        assert_eq!(completion.status, JobStatus::Cancelled);
+        assert!(!completion.success);
+        assert!(completion.stop_proven);
+
+        let cancelled_unknown = SharedSnapshot {
+            id: "cancelled-unknown".into(),
+            summary: Some((SharedPrimary::Unknown, false, false)),
+            ..cancelled
+        };
+        let completion = JobCompletion::from_shared_graph(&cancelled_unknown);
+        assert_eq!(completion.status, JobStatus::Unknown);
+        assert!(!completion.success);
+        assert!(!completion.stop_proven);
+    }
+
+    #[test]
+    fn authoritative_graph_status_and_list_preserve_canonical_skip_ranges() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let graph = SharedGraph::compile(
+            &serde_json::json!({"ops":[
+                ["read", {"path":"a"}, "*"],
+                ["read", {"path":"b"}, "*"]
+            ]}),
+            |_, _| true,
+        )
+        .unwrap();
+        let plans = plan_graph(&graph, |coordinate, _| {
+            Ok::<_, ()>(SharedNodePolicy {
+                budget: SharedSemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 128,
+                },
+                footprint: SharedFootprint::none(),
+                registry_generation: 1,
+                authority_binding: [coordinate as u8; 32],
+                runtime_binding: [9; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        job.admit_prepared_graph(graph, plans, 2, None, true)
+            .unwrap();
+        manager.expose_compatibility(&job.id).unwrap();
+        let shared = manager.inner.shared_jobs.clone();
+        for coordinate in 1..=2 {
+            let claimed = next_shared_sequence(&shared, &job.id).unwrap();
+            shared
+                .claim(&job.id, coordinate, true, claimed, |_, _| {
+                    Ok::<_, SharedJournalError>(())
+                })
+                .unwrap();
+            let settle = next_shared_sequence(&shared, &job.id).unwrap();
+            shared
+                .settle_unlaunched(
+                    &job.id,
+                    coordinate,
+                    claimed,
+                    settle,
+                    |_, sequence| {
+                        if sequence == claimed {
+                            Ok(())
+                        } else {
+                            Err(aw_tools::filesystem::job::Error::StaleGeneration)
+                        }
+                    },
+                    |_, _| Ok::<_, SharedJournalError>(()),
+                )
+                .unwrap();
+        }
+        let snapshot = shared.runtime_snapshot(&job.id).unwrap();
+        assert_eq!(snapshot.stop_reason, None);
+        assert_eq!(snapshot.summary, Some((SharedPrimary::Skip, false, false)));
+        manager.finish(&job.id, JobCompletion::from_shared_graph(&snapshot));
+
+        let status: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert_eq!(status["status"], "skip");
+        assert_eq!(status["graph"]["finished"], 2);
+        assert_eq!(status["graph"]["total"], 2);
+        assert_eq!(status["graph"]["summary"]["primary"], "skip");
+        assert!(
+            status["graph"]["compact"]
+                .as_str()
+                .is_some_and(|value| value.contains("1-2 skip"))
+        );
+
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
+        let row = listed["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["job_id"] == job.id)
+            .unwrap();
+        assert_eq!(row["status"], "skip");
+    }
+
+    #[test]
+    fn unproven_cancel_or_timeout_maps_to_shared_unknown() {
+        for mut completion in [
+            JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default()),
+            JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default()),
+        ] {
+            completion.stop_proven = false;
+            assert_eq!(
+                shared_process_terminal(&completion).exit,
+                SharedProcessExit::Unknown
+            );
+            assert_eq!(
+                shared_process_terminal(&completion).status().primary,
+                SharedPrimary::Unknown
+            );
+        }
+    }
 
     #[test]
     fn working_task_ttl_is_unlimited_until_queue_and_execution_finish() {
@@ -3114,6 +5615,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spawn_without_tokio_runtime_fails_before_job_or_session_admission() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let root = manager.protected_path();
+        let error = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("no-runtime".to_owned()),
+                |_job| {
+                    std::future::ready(JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an active Tokio runtime")
+        );
+        assert!(manager.inner.state.lock().unwrap().jobs.is_empty());
+        assert!(manager.request_job_id("no-runtime").is_none());
+        assert!(
+            !root.exists(),
+            "runtime preflight must precede session materialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_runner_constructor_rolls_back_admission_without_poisoning_manager() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let request_key = "constructor-panic".to_owned();
+        let error = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some(request_key.clone()),
+                |_job| -> std::future::Ready<JobCompletion> { panic!("runner constructor bug") },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runner construction panicked before managed execution")
+        );
+        assert!(manager.request_job_id(&request_key).is_none());
+        assert_eq!(manager.inner.state.lock().unwrap().jobs.len(), 0);
+        assert!(
+            std::fs::read_dir(manager.protected_path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.ends_with(".stdout") && !name.ends_with(".stderr")
+                }),
+            "failed admission must not leave spool files"
+        );
+
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some(request_key.clone()),
+                |_job| async {
+                    JobCompletion::completed(
+                        Some(0),
+                        true,
+                        StreamSummary::default(),
+                        StreamSummary::default(),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(started.is_new);
+        manager.wait_until(&started.id, None).await.unwrap();
+        assert_eq!(
+            manager.request_job_id(&request_key),
+            Some(started.id.clone())
+        );
+        drop(started);
+        manager.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn panicking_runner_becomes_terminal_internal_failure() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
@@ -3189,15 +5778,15 @@ mod tests {
     #[tokio::test]
     async fn sealing_spool_writers_blocks_late_registration() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
-        let account = SpoolAccount::new(&manager.inner);
-        let writer = account.begin_writer().expect("writer registration is open");
-        account.seal_writers();
+        let account = DrainWriters::new();
+        let writer = account.begin_one().expect("writer registration is open");
+        account.seal();
         assert!(
-            account.begin_writer().is_none(),
+            account.begin_one().is_none(),
             "sealed terminal/shutdown state must reject every later writer registration"
         );
         drop(writer);
-        account.wait_writers_idle().await;
+        account.wait_idle().await;
         drop(account);
         manager.shutdown().await.unwrap();
     }
@@ -3205,11 +5794,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_idle_wait_cannot_miss_the_final_drop() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
-        let account = SpoolAccount::new(&manager.inner);
+        let account = DrainWriters::new();
         for _ in 0..256 {
-            let writer = account.begin_writer().expect("writer registration is open");
+            let writer = account.begin_one().expect("writer registration is open");
             let waiter_account = account.clone();
-            let waiter = tokio::spawn(async move { waiter_account.wait_writers_idle().await });
+            let waiter = tokio::spawn(async move { waiter_account.wait_idle().await });
             tokio::task::yield_now().await;
             drop(writer);
             tokio::time::timeout(Duration::from_secs(1), waiter)
@@ -3476,7 +6065,8 @@ mod tests {
         for sample in samples {
             let render = OutputPageRender {
                 id: "job",
-                stream: JobStream::Stdout,
+                node: None,
+                stream: "stdout",
                 offset: 0,
                 stored_bytes: sample.len() as u64,
                 total_bytes: Some(sample.len() as u64),
@@ -3641,6 +6231,9 @@ mod tests {
                 .contains_key(&stuck.id),
             "failed cleanup stays retryable while a later safe candidate is reclaimed"
         );
+        // Repair the deliberate test-only filesystem corruption before asking
+        // ordinary shutdown to prove complete cleanup.
+        fs::remove_dir(&stuck.stderr_path).unwrap();
         manager.shutdown().await.unwrap();
     }
 
@@ -3834,8 +6427,11 @@ mod tests {
         // regular spool. This deterministically exercises the retryable-failure
         // contract without relying on platform-specific sharing violations.
         let bad = tempfile::tempdir().unwrap();
-        assert!(!remove_file_releasing(&job.spool_account, bad.path()));
-        assert!(truncate_file_releasing(&job.spool_account, bad.path(), 0).is_none());
+        assert!(!remove_file_releasing(
+            job.legacy_spool.as_deref(),
+            bad.path()
+        ));
+        assert!(truncate_file_releasing(job.legacy_spool.as_deref(), bad.path(), 0).is_none());
         manager.finish(
             &job.id,
             JobCompletion::completed(
@@ -3930,7 +6526,7 @@ mod tests {
         );
         assert!(!manager.owns_request_key(&request_key));
         assert!(manager.status(&id).is_err());
-        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
         assert!(listed["jobs"].as_array().unwrap().is_empty());
         manager.shutdown().await.unwrap();
     }
@@ -4173,6 +6769,128 @@ mod tests {
         manager.shutdown().await.unwrap();
     }
 
+    #[test]
+    fn failed_prelaunch_shared_exposure_discards_provisional_job() {
+        let manager = SharedJobManager::new(SharedJobLimits {
+            max_retained_jobs: 2,
+            max_exposed_jobs: 1,
+            max_hidden_jobs: 2,
+            max_active_nodes: 1,
+            max_hidden_replays: 2,
+            max_spool_bytes: 1024,
+        })
+        .unwrap();
+        let graph = SharedGraph::compile(
+            &serde_json::json!({"ops":[["read", {"path":"a"}]]}),
+            |_, _| true,
+        )
+        .unwrap();
+        let plans = plan_graph(&graph, |_, _| {
+            Ok::<_, ()>(SharedNodePolicy {
+                budget: SharedSemanticBudget {
+                    work_bytes: 1,
+                    result_bytes: 128,
+                },
+                footprint: SharedFootprint::none(),
+                registry_generation: 1,
+                authority_binding: [1; 32],
+                runtime_binding: [2; 32],
+                task_result_eligible: false,
+            })
+        })
+        .unwrap();
+        for (id, exposed) in [("visible", true), ("candidate", false)] {
+            manager
+                .admit_runtime(
+                    graph.clone(),
+                    plans.clone(),
+                    SharedRuntimeAdmission {
+                        id,
+                        runtime_session: "s",
+                        epoch: 1,
+                        admission_sequence: 1,
+                        width: 1,
+                        exposed,
+                    },
+                )
+                .unwrap();
+        }
+        let error = reconcile_prelaunch_shared_exposure(
+            &manager,
+            "candidate",
+            "fixture prelaunch exposure failed",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Capacity"), "{error}");
+        assert!(matches!(
+            manager.runtime_snapshot("candidate"),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound)
+        ));
+        assert_eq!(manager.get("visible").unwrap().id, "visible");
+    }
+
+    #[tokio::test]
+    async fn exposure_committed_before_shared_admission_is_reconciled_before_launch() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let release = Arc::new(Notify::new());
+        let claimed = Arc::new(Notify::new());
+        let runner_manager = manager.clone();
+        let runner_release = release.clone();
+        let runner_claimed = claimed.clone();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                None,
+                move |job| {
+                    let runner_manager = runner_manager.clone();
+                    async move {
+                        runner_release.notified().await;
+                        let writers = claim_shared_shell_writers(&runner_manager, &job);
+                        // The local compatibility representation was committed
+                        // before this shared admission. The shared Job must be
+                        // visible before any process/effect can be marked live.
+                        assert!(runner_manager.inner.shared_jobs.get(&job.id).is_ok());
+                        runner_claimed.notify_one();
+                        job.mark_launched().unwrap();
+                        writers.stdout.finish().unwrap();
+                        writers.stderr.finish().unwrap();
+                        JobCompletion::completed(
+                            Some(0),
+                            true,
+                            job.shared_stream_summary(JobStream::Stdout, false),
+                            job.shared_stream_summary(JobStream::Stderr, false),
+                        )
+                    }
+                },
+            )
+            .unwrap();
+        let id = started.id.clone();
+        drop(started);
+        {
+            let state = manager.inner.state.lock().unwrap();
+            assert_eq!(state.jobs[&id].disposition, JobDisposition::Compatibility);
+            assert!(state.jobs[&id].shared_job.is_none());
+        }
+        assert!(matches!(
+            manager.inner.shared_jobs.runtime_snapshot(&id),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound)
+        ));
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), claimed.notified())
+            .await
+            .expect("shared admission must reconcile exposure");
+        assert_eq!(manager.inner.shared_jobs.get(&id).unwrap().id, id);
+        assert!(matches!(
+            manager
+                .wait_until(&id, Some(TokioInstant::now() + Duration::from_secs(2)))
+                .await
+                .unwrap(),
+            JobWait::Terminal
+        ));
+        manager.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn abandoned_local_response_becomes_recoverable_compatibility_job() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
@@ -4193,7 +6911,7 @@ mod tests {
             assert_eq!(entry.retention, RetentionClass::Ordinary);
             assert!(entry.retention_anchor.is_some());
         }
-        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
         assert_eq!(listed["jobs"][0]["job_id"], id);
         manager.shutdown().await.unwrap();
     }
@@ -4617,7 +7335,7 @@ mod tests {
             assert_eq!(entry.retention, RetentionClass::Ordinary);
             assert_eq!(retained_job_slots(&state), 1);
         }
-        let list: serde_json::Value = serde_json::from_str(&manager.list(16)).unwrap();
+        let list: serde_json::Value = serde_json::from_str(&manager.list(0, 16)).unwrap();
         assert!(
             list["jobs"]
                 .as_array()
@@ -4662,6 +7380,73 @@ mod tests {
             state.jobs[&started.id].request_key.as_deref(),
             Some("other-key")
         );
+    }
+
+    #[tokio::test]
+    async fn shared_hidden_synchronous_delivery_releases_owners_unlinks_spools_and_metadata() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let runner_manager = manager.clone();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("shared-hidden-delivery".to_owned()),
+                move |job| {
+                    let runner_manager = runner_manager.clone();
+                    async move {
+                        let writers = claim_shared_shell_writers(&runner_manager, &job);
+                        job.mark_launched().unwrap();
+                        assert_eq!(writers.stdout.append(b"exact").unwrap(), 5);
+                        writers.stdout.finish().unwrap();
+                        writers.stderr.finish().unwrap();
+                        JobCompletion::completed(
+                            Some(0),
+                            true,
+                            job.shared_stream_summary(JobStream::Stdout, false),
+                            job.shared_stream_summary(JobStream::Stderr, false),
+                        )
+                    }
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        let (stdout_path, stderr_path) = {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&started.id];
+            (entry.stdout_path.clone(), entry.stderr_path.clone())
+        };
+        let rendered = manager.tool_result(&started.id, None).unwrap().unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&rendered.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(rendered["stdout"], "exact");
+        manager.mark_synchronous_result(&started.id).unwrap();
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&started.id];
+            assert_eq!(entry.retention, RetentionClass::TransportOnly);
+            assert!(!entry.all_output_released());
+            assert!(stdout_path.exists() && stderr_path.exists());
+        }
+        assert_eq!(
+            manager.acknowledge_request_delivery("shared-hidden-delivery"),
+            RequestDeliveryAck::Acknowledged
+        );
+        assert!(
+            !manager
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains_key(&started.id),
+            "positive delivery must not leave shared hidden metadata in CleanupOnly"
+        );
+        assert!(!stdout_path.exists() && !stderr_path.exists());
+        assert_eq!(manager.inner.shared_jobs.spool_usage().unwrap().0, 0);
+        manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -4911,6 +7696,113 @@ mod tests {
         manager.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn job_list_pages_newest_first_with_advancing_offset() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let job = manager.create_for_test(30).unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                ),
+            );
+            manager.expose_compatibility(&job.id).unwrap();
+            ids.push(job.id.clone());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let first: serde_json::Value = serde_json::from_str(&manager.list(0, 2)).unwrap();
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["next_offset"], 2);
+        let first_ids = first["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| job["job_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, vec![ids[2].as_str(), ids[1].as_str()]);
+
+        let second: serde_json::Value = serde_json::from_str(&manager.list(2, 2)).unwrap();
+        assert_eq!(second["offset"], 2);
+        assert!(second["next_offset"].is_null());
+        assert_eq!(second["jobs"][0]["job_id"], ids[0]);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_list_budget_keeps_rows_atomic_and_cursor_advancing() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        for _ in 0..3 {
+            let job = manager.create_for_test(30).unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                ),
+            );
+            manager.expose_compatibility(&job.id).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let one = manager.list(0, 1);
+        let ceiling = one.len();
+        let fitted = manager
+            .list_fitted(0, 3, |page| page.len() <= ceiling)
+            .unwrap();
+        let fitted: serde_json::Value = serde_json::from_str(&fitted).unwrap();
+        assert_eq!(fitted["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(fitted["offset"], 0);
+        assert_eq!(fitted["next_offset"], 1);
+
+        let error = manager.list_fitted(0, 3, |_| false).unwrap_err();
+        assert!(error.to_string().contains("one complete Job row"));
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_list_breaks_equal_creation_times_by_job_id() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let job = manager.create_for_test(30).unwrap();
+            manager.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                ),
+            );
+            manager.expose_compatibility(&job.id).unwrap();
+            ids.push(job.id.clone());
+        }
+        let tied = Instant::now();
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            for id in &ids {
+                state.jobs.get_mut(id).unwrap().created = tied;
+            }
+        }
+        ids.sort();
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 3)).unwrap();
+        let actual = listed["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| job["job_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, ids);
+        manager.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn request_key_deduplicates_runner_creation_and_list_recovers_exposed_job() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -4951,7 +7843,7 @@ mod tests {
         assert!(!duplicate.is_new);
         assert_eq!(duplicate.id, first.id);
         manager.expose_compatibility(&first.id).unwrap();
-        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
         assert_eq!(listed["jobs"][0]["job_id"], first.id);
         for _ in 0..100 {
             let status: serde_json::Value =
@@ -5064,6 +7956,22 @@ mod tests {
     }
 
     #[test]
+    fn resource_policy_match_proves_shared_physical_spool_limit() {
+        let manager = JobManager::with_spool_limit(Duration::from_secs(77), 4096).unwrap();
+        assert!(manager.resource_policy_matches(Duration::from_secs(77), 4096));
+        assert!(!manager.resource_policy_matches(Duration::from_secs(78), 4096));
+        assert!(!manager.resource_policy_matches(Duration::from_secs(77), 8192));
+        manager
+            .inner
+            .spool_limit_bytes
+            .store(8192, Ordering::Relaxed);
+        assert!(
+            !manager.resource_policy_matches(Duration::from_secs(77), 8192),
+            "legacy mirror alone must not widen the shared physical quota"
+        );
+    }
+
+    #[test]
     fn aggregate_spool_quota_is_atomic_reclaimable_and_never_overcommits() {
         let manager = JobManager::with_spool_limit(Duration::from_secs(60), 10).unwrap();
         assert_eq!(reserve_spool_bytes(&manager.inner, 8), 8);
@@ -5080,7 +7988,7 @@ mod tests {
         let manager = JobManager::with_spool_limit(Duration::from_secs(60), 64).unwrap();
         let job = manager.create_for_test(30).unwrap();
         assert_eq!(job.reserve_spool(16), 16);
-        assert_eq!(job.spool_account.charged(), 16);
+        assert_eq!(job.legacy_spool.as_ref().unwrap().charged(), 16);
         assert_eq!(manager.inner.spool_used_bytes.load(Ordering::Relaxed), 16);
 
         manager.finish(
@@ -5097,7 +8005,7 @@ mod tests {
             .acknowledge_output(&job.id, JobStream::Stdout, 0)
             .unwrap();
 
-        assert_eq!(job.spool_account.charged(), 0);
+        assert_eq!(job.legacy_spool.as_ref().unwrap().charged(), 0);
         assert_eq!(manager.inner.spool_used_bytes.load(Ordering::Relaxed), 0);
     }
 
@@ -5358,7 +8266,7 @@ mod tests {
         fs::create_dir(&job.stderr_path).unwrap();
 
         assert!(matches!(manager.status(&job.id), Err(JobError::Unknown(_))));
-        let listed: serde_json::Value = serde_json::from_str(&manager.list(64)).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
         assert!(
             listed["jobs"]
                 .as_array()
@@ -5456,6 +8364,620 @@ mod tests {
         let error = JobError::Unknown(format!("unknown task {huge}")).into_mcp();
         assert!(error.message.len() <= MAX_JOB_ERROR_BYTES);
         assert!(error.message.ends_with('…'));
+    }
+
+    fn claim_shared_shell_writers(manager: &JobManager, job: &JobHandle) -> SharedShellWriters {
+        assert!(manager.bind_policy([9; 32]));
+        let result_limit = manager
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&job.id)
+            .expect("test Job remains admitted")
+            .result_limit;
+        job.claim_prepared_shell(
+            SharedNodeTool::Bash,
+            serde_json::json!({
+                "command":"printf ok",
+                "dir":".",
+                "stdin":null,
+                "timeout_secs":30,
+                "max_output_bytes":result_limit
+            }),
+            None,
+            result_limit,
+            MAX_JOB_SPOOL_BYTES_PER_STREAM,
+        )
+        .unwrap()
+    }
+
+    fn claim_shared_shell(manager: &JobManager, job: &JobHandle) {
+        let _ = claim_shared_shell_writers(manager, job);
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_host_metadata_when_shared_owned_state_is_missing() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let root = manager.protected_path().to_path_buf();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.settle_unlaunched();
+        manager.inner.shared_jobs.expire_terminal(&job.id).unwrap();
+        drop(job);
+
+        let error = manager.shutdown().await.unwrap_err().to_string();
+        assert!(error.contains("retained for inspection"), "{error}");
+        assert!(root.exists());
+        let state = manager.inner.state.lock().unwrap();
+        assert_eq!(state.jobs.len(), 1);
+        let entry = state.jobs.values().next().unwrap();
+        assert!(entry.shared_job.is_some());
+        assert!(entry.stdout_path.exists());
+        assert!(entry.stderr_path.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_expires_unacknowledged_shared_output_before_removing_session_dir() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let root = manager.inner.root.clone();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        assert_eq!(writers.stdout.append(b"retained-without-ack").unwrap(), 20);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let stdout = job.shared_stream_summary(JobStream::Stdout, false);
+        let stderr = job.shared_stream_summary(JobStream::Stderr, false);
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(Some(0), true, stdout, stderr),
+        );
+        assert!(root.exists());
+        assert!(job.stdout_path.exists());
+        let owner = manager.inner.shared_jobs.job_output_owner(&job.id).unwrap();
+        let owner_state = manager
+            .inner
+            .shared_jobs
+            .output_owner_state(&job.id, 1, SharedOutputStream::Stdout, owner)
+            .unwrap();
+        assert!(!owner_state.acknowledged);
+        drop(job);
+
+        manager.shutdown().await.unwrap();
+        assert!(
+            !root.exists(),
+            "shutdown must expire terminal shared output and close file handles before removing the session directory"
+        );
+    }
+
+    #[test]
+    fn shared_native_task_keeps_pending_owner_then_compacts_exact_task_prefix() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        assert_eq!(writers.stdout.append(b"abcdefgh").unwrap(), 8);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        let stdout = job.shared_stream_summary(JobStream::Stdout, false);
+        let stderr = job.shared_stream_summary(JobStream::Stderr, false);
+        assert_eq!(stdout.stored_bytes, 8);
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(Some(0), true, stdout, stderr),
+        );
+        {
+            let state = manager.inner.state.lock().unwrap();
+            let entry = &state.jobs[&job.id];
+            assert_eq!(entry.disposition, JobDisposition::Pending);
+            let (summary, _) = manager
+                .inner
+                .shared_jobs
+                .output_summary(&job.id, 1, SharedOutputStream::Stdout)
+                .unwrap();
+            assert_eq!(
+                summary.retained_bytes, 8,
+                "Pending must preserve Task owner"
+            );
+        }
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            state.jobs.get_mut(&job.id).unwrap().result_limit = 4;
+        }
+        manager.expose_native_task(&job.id, None).unwrap().unwrap();
+        let first: serde_json::Value = serde_json::from_str(
+            &manager
+                .acknowledge_output(&job.id, JobStream::Stdout, 8)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first["stdout"]["stored_bytes"], 4);
+        assert_eq!(first["stdout"]["acknowledged_bytes"], 8);
+        assert_eq!(first["stdout"]["released"], true);
+        let (shared, _) = manager
+            .inner
+            .shared_jobs
+            .output_summary(&job.id, 1, SharedOutputStream::Stdout)
+            .unwrap();
+        assert_eq!(shared.retained_bytes, 4);
+        assert_eq!(manager.inner.shared_jobs.spool_usage().unwrap().0, 4);
+        assert_eq!(fs::metadata(&job.stdout_path).unwrap().len(), 4);
+
+        // Lost Job-owner ACK response remains replay-safe after Task compaction.
+        let replay: serde_json::Value = serde_json::from_str(
+            &manager
+                .acknowledge_output(&job.id, JobStream::Stdout, 8)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay["stdout"]["stored_bytes"], 4);
+        assert_eq!(replay["stdout"]["acknowledged_bytes"], 8);
+
+        let detailed = manager.detailed_task(&job.id).unwrap();
+        let TaskPayload::Completed { result } = detailed.payload else {
+            panic!("shared compacted native task must remain complete")
+        };
+        let rendered = serde_json::Value::Object(result).to_string();
+        assert!(rendered.contains("abcd"), "{rendered}");
+        assert!(!rendered.contains("efgh"), "{rendered}");
+    }
+
+    #[test]
+    fn shared_shell_claim_rolls_back_if_host_entry_became_terminal_before_binding() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        manager.finish(&job.id, JobCompletion::failed("pre-launch host failure"));
+        assert!(manager.bind_policy([9; 32]));
+        assert!(
+            job.claim_prepared_shell(
+                SharedNodeTool::Bash,
+                serde_json::json!({
+                    "command":"printf ok",
+                    "dir":".",
+                    "stdin":null,
+                    "timeout_secs":30,
+                    "max_output_bytes":1024
+                }),
+                None,
+                1024,
+                1024,
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            manager.inner.shared_jobs.runtime_snapshot(&job.id),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn shared_owned_cancel_fails_closed_if_canonical_job_disappears() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.settle_unlaunched();
+        manager.inner.shared_jobs.expire_terminal(&job.id).unwrap();
+        let error = manager.cancel(&job.id).unwrap_err().to_string();
+        assert!(error.contains("shared-owned Job"), "{error}");
+        assert!(
+            manager.inner.state.lock().unwrap().jobs[&job.id]
+                .shared_job
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn shared_owned_completion_becomes_unknown_if_canonical_job_disappears() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.settle_unlaunched();
+        manager.inner.shared_jobs.expire_terminal(&job.id).unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        let state = manager.inner.state.lock().unwrap();
+        let completion = state.jobs[&job.id].completion.as_ref().unwrap();
+        assert_eq!(completion.status, JobStatus::Unknown);
+        assert_eq!(completion.observed_status, Some(JobStatus::Completed));
+        assert!(!completion.success);
+    }
+
+    #[test]
+    fn shared_owned_cleanup_retains_spools_if_canonical_job_disappears() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.settle_unlaunched();
+        manager.inner.shared_jobs.expire_terminal(&job.id).unwrap();
+        let mut state = manager.inner.state.lock().unwrap();
+        let entry = state.jobs.get_mut(&job.id).unwrap();
+        assert!(!cleanup_entry(entry));
+        assert!(entry.shared_job.is_some());
+        assert!(entry.stdout_path.exists());
+        assert!(entry.stderr_path.exists());
+    }
+
+    #[test]
+    fn shell_start_requires_canonical_shared_claim() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let error = job.mark_launched().unwrap_err().to_string();
+        assert!(
+            error.contains("shared shell Job is missing before process launch"),
+            "{error}"
+        );
+        assert!(matches!(
+            manager.inner.shared_jobs.runtime_snapshot(&job.id),
+            Err(aw_tools::filesystem::job_manager::Error::NotFound)
+        ));
+    }
+
+    #[test]
+    fn proven_spawn_refusal_after_start_is_canonical_fail() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        job.mark_launched().unwrap();
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        manager.finish(&job.id, JobCompletion::spawn_failed("spawn refused"));
+        let snapshot = manager.inner.shared_jobs.runtime_snapshot(&job.id).unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+        assert_eq!(snapshot.summary, Some((SharedPrimary::Fail, false, false)));
+        let state = manager.inner.state.lock().unwrap();
+        assert_eq!(
+            state.jobs[&job.id].completion.as_ref().unwrap().status,
+            JobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn shared_shell_claim_settles_proven_unlaunched_without_effect() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        assert!(matches!(
+            manager.inner.shared_jobs.node_state(&job.id, 1).unwrap(),
+            SharedNodeState::Claimed { .. }
+        ));
+
+        job.settle_unlaunched();
+        manager.finish(&job.id, JobCompletion::failed("spawn refused"));
+        let snapshot = manager.inner.shared_jobs.runtime_snapshot(&job.id).unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+        assert_eq!(snapshot.summary, Some((SharedPrimary::Skip, false, false)));
+    }
+
+    #[test]
+    fn claimed_shared_shell_completion_is_never_projected_as_success() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        assert!(matches!(
+            manager.inner.shared_jobs.node_state(&job.id, 1).unwrap(),
+            SharedNodeState::Claimed { .. }
+        ));
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        let state = manager.inner.state.lock().unwrap();
+        let entry = state.jobs.get(&job.id).unwrap();
+        let completion = entry.completion.as_ref().unwrap();
+        assert_eq!(completion.status, JobStatus::Unknown);
+        assert_eq!(completion.observed_status, Some(JobStatus::Completed));
+        assert!(completion.internal_error.is_none());
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|value| value.contains("uncertain"))
+        );
+        assert!(!completion.success);
+        drop(state);
+        assert!(matches!(
+            manager.inner.shared_jobs.node_state(&job.id, 1).unwrap(),
+            SharedNodeState::Terminal {
+                status: SharedStatus {
+                    primary: SharedPrimary::Unknown,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shared_internal_failure_with_uncertain_effect_projects_unknown_and_keeps_evidence() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::internal_failed(
+                "post-spawn setup failed after process launch",
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        let state = manager.inner.state.lock().unwrap();
+        let entry = state.jobs.get(&job.id).unwrap();
+        let completion = entry.completion.as_ref().unwrap();
+        assert_eq!(completion.status, JobStatus::Unknown);
+        assert_eq!(completion.observed_status, Some(JobStatus::Failed));
+        assert!(
+            completion
+                .internal_error
+                .as_deref()
+                .is_some_and(|value| value.contains("post-spawn setup failed"))
+        );
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|value| value.contains("uncertain") && value.contains("inspect"))
+        );
+        drop(state);
+        assert!(matches!(
+            manager.inner.shared_jobs.node_state(&job.id, 1).unwrap(),
+            SharedNodeState::Terminal {
+                status: SharedStatus {
+                    primary: SharedPrimary::Unknown,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_unknown_synchronous_result_remains_inspectable() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::internal_failed(
+                "post-launch host failure",
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        assert_eq!(
+            manager.mark_synchronous_result(&job.id).unwrap(),
+            JobDisposition::Synchronous
+        );
+        let state = manager.inner.state.lock().unwrap();
+        let entry = state.jobs.get(&job.id).unwrap();
+        assert_eq!(entry.retention, RetentionClass::Ordinary);
+        assert_eq!(entry.disposition, JobDisposition::Synchronous);
+        assert_eq!(entry.status(), JobStatus::Unknown);
+        drop(state);
+        assert!(matches!(
+            manager.replay_handoff(&job.id).unwrap(),
+            Some(JobHandoff::Synchronous)
+        ));
+        let listed: serde_json::Value = serde_json::from_str(&manager.list(0, 64)).unwrap();
+        assert!(
+            listed["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["job_id"] == job.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_unknown_synchronous_request_keeps_inspection_job() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let runner = manager.clone();
+        let started = manager
+            .spawn(
+                30,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                Some("unknown-sync-delivery".to_owned()),
+                move |job| {
+                    let runner = runner.clone();
+                    async move {
+                        let writers = claim_shared_shell_writers(&runner, &job);
+                        writers.stdout.finish().unwrap();
+                        writers.stderr.finish().unwrap();
+                        JobCompletion::internal_failed(
+                            "post-launch host failure",
+                            StreamSummary::default(),
+                            StreamSummary::default(),
+                        )
+                    }
+                },
+            )
+            .unwrap();
+        manager.wait_until(&started.id, None).await.unwrap();
+        assert_eq!(
+            manager.mark_synchronous_result(&started.id).unwrap(),
+            JobDisposition::Synchronous
+        );
+        assert_eq!(
+            manager.acknowledge_request_delivery("unknown-sync-delivery"),
+            RequestDeliveryAck::Acknowledged
+        );
+        assert!(manager.request_job_id("unknown-sync-delivery").is_none());
+        let status: serde_json::Value =
+            serde_json::from_str(&manager.status(&started.id).unwrap()).unwrap();
+        assert_eq!(status["status"], "unknown");
+        assert!(manager.list(0, 64).contains(&started.id));
+    }
+
+    #[test]
+    fn acknowledged_unknown_remains_inspectable_until_ordinary_ttl() {
+        let manager = JobManager::new(Duration::from_secs(1)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let writers = claim_shared_shell_writers(&manager, &job);
+        writers.stdout.finish().unwrap();
+        writers.stderr.finish().unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::internal_failed(
+                "post-launch host failure",
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        assert_eq!(
+            manager.mark_synchronous_result(&job.id).unwrap(),
+            JobDisposition::Synchronous
+        );
+        manager
+            .acknowledge_output(&job.id, JobStream::Stdout, 0)
+            .unwrap();
+        manager
+            .acknowledge_output(&job.id, JobStream::Stderr, 0)
+            .unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&manager.status(&job.id).unwrap()).unwrap();
+        assert_eq!(status["status"], "unknown");
+        assert!(manager.list(0, 64).contains(&job.id));
+
+        {
+            let mut state = manager.inner.state.lock().unwrap();
+            let entry = state.jobs.get_mut(&job.id).unwrap();
+            let old = Instant::now() - Duration::from_secs(2);
+            entry.terminal_at = Some(old);
+            entry.retention_anchor = Some(old);
+        }
+        assert!(matches!(manager.status(&job.id), Err(JobError::Unknown(_))));
+        assert!(!manager.list(0, 64).contains(&job.id));
+    }
+
+    #[test]
+    fn optimistic_shell_reserves_shared_exposure_without_publishing_until_handoff() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.mark_launched().unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        assert!(matches!(
+            manager.inner.shared_jobs.get(&job.id),
+            Err(aw_tools::filesystem::job_manager::Error::NotExposed)
+        ));
+        manager.reserve_shared_exposure(&job.id, true).unwrap();
+        assert!(matches!(
+            manager.inner.shared_jobs.get(&job.id),
+            Err(aw_tools::filesystem::job_manager::Error::NotExposed)
+        ));
+        assert!(
+            manager
+                .inner
+                .shared_jobs
+                .list(0, 16)
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+
+        manager.expose_compatibility(&job.id).unwrap();
+        assert_eq!(manager.inner.shared_jobs.get(&job.id).unwrap().id, job.id);
+        assert_eq!(
+            manager.inner.state.lock().unwrap().jobs[&job.id].disposition,
+            JobDisposition::Compatibility
+        );
+    }
+
+    #[test]
+    fn shared_shell_launch_and_terminal_exit_are_canonical_job_state() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.mark_launched().unwrap();
+        assert!(matches!(
+            manager.inner.shared_jobs.node_state(&job.id, 1).unwrap(),
+            SharedNodeState::Running { .. }
+        ));
+
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary::default(),
+                StreamSummary::default(),
+            ),
+        );
+        let snapshot = manager.inner.shared_jobs.runtime_snapshot(&job.id).unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+        assert_eq!(snapshot.summary, Some((SharedPrimary::Ok, false, false)));
+
+        manager.expose_compatibility(&job.id).unwrap();
+        assert_eq!(manager.inner.shared_jobs.get(&job.id).unwrap().id, job.id);
+    }
+
+    #[test]
+    fn job_cancel_checkpoints_shared_cancellation_before_signalling_runner() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.mark_launched().unwrap();
+        assert!(!job.cancel.is_cancelled());
+
+        manager.cancel(&job.id).unwrap();
+        let snapshot = manager.inner.shared_jobs.runtime_snapshot(&job.id).unwrap();
+        assert_eq!(
+            snapshot.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Cancelling
+        );
+        assert_eq!(
+            snapshot.stop_reason,
+            Some(aw_tools::filesystem::job::StopReason::Cancelled)
+        );
+        assert!(job.cancel.is_cancelled());
+
+        manager.finish(
+            &job.id,
+            JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default()),
+        );
+        let terminal = manager.inner.shared_jobs.runtime_snapshot(&job.id).unwrap();
+        assert_eq!(
+            terminal.lifecycle,
+            aw_tools::filesystem::job::Lifecycle::Terminal
+        );
+        assert_eq!(
+            terminal.stop_reason,
+            Some(aw_tools::filesystem::job::StopReason::Cancelled)
+        );
     }
 
     #[test]

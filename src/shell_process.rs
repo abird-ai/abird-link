@@ -124,23 +124,37 @@ impl Guard {
         }
     }
 
-    pub(crate) fn terminate(&mut self) {
+    /// Request termination of the OS containment object. Success means the
+    /// kernel accepted termination for the complete object represented here;
+    /// it is not, by itself, proof that an unsandboxed Unix command had no
+    /// descendants that deliberately escaped its process group.
+    pub(crate) fn terminate(&mut self) -> io::Result<()> {
         if !self.active {
-            return;
+            return Ok(());
         }
-        self.active = false;
         #[cfg(unix)]
         {
             // SAFETY: negative PID addresses only the shell's own process group.
-            unsafe { libc::kill(-self.group, libc::SIGKILL) };
+            let rc = unsafe { libc::kill(-self.group, libc::SIGKILL) };
+            if rc != 0 {
+                let error = io::Error::last_os_error();
+                // ESRCH means the complete process group is already absent.
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
         }
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;
             // SAFETY: the job belongs to this invocation.
-            unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) };
+            if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
+        self.active = false;
+        Ok(())
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -150,7 +164,7 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.terminate();
+        let _ = self.terminate();
     }
 }
 
@@ -192,7 +206,7 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let mut tree = Guard::attach(&child).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        tree.terminate();
+        tree.terminate().unwrap();
         let _ = child.wait().await;
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         assert!(!output.exists(), "killed descendant must not run later");

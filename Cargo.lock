@@ -121,6 +121,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "aw-tools"
+version = "0.15.0"
+source = "git+https://github.com/abird-ai/aw?rev=4a23e92a8f516971bb232b98e4fc000554bcc4ba#4a23e92a8f516971bb232b98e4fc000554bcc4ba"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "globset",
+ "ignore",
+ "libc",
+ "memchr",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "aw-tools-fs-unix"
+version = "0.15.0"
+source = "git+https://github.com/abird-ai/aw?rev=4a23e92a8f516971bb232b98e4fc000554bcc4ba#4a23e92a8f516971bb232b98e4fc000554bcc4ba"
+dependencies = [
+ "aw-tools",
+ "getrandom 0.3.4",
+ "libc",
+ "sha2",
+]
+
+[[package]]
+name = "aw-tools-fs-win"
+version = "0.15.0"
+source = "git+https://github.com/abird-ai/aw?rev=4a23e92a8f516971bb232b98e4fc000554bcc4ba#4a23e92a8f516971bb232b98e4fc000554bcc4ba"
+dependencies = [
+ "aw-tools",
+ "getrandom 0.3.4",
+ "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "awaitdrop"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -608,6 +649,9 @@ version = "0.14.3"
 dependencies = [
  "anyhow",
  "argon2",
+ "aw-tools",
+ "aw-tools-fs-unix",
+ "aw-tools-fs-win",
  "axum",
  "base64 0.22.1",
  "bytes",

@@ -1697,6 +1697,39 @@ impl RequestReplayLedger {
         true
     }
 
+    /// Drop a stale cached shell body while preserving the exact inner execution
+    /// as the recovery owner. This is used only when the Job request key still
+    /// exists but its committed response representation changed before delivery.
+    fn invalidate_ready_for_shell_recovery(
+        &self,
+        key: &str,
+        namespace: [u8; 32],
+        fingerprint: [u8; 32],
+    ) -> bool {
+        let mut state = self.slot();
+        let released = state.entries.get(key).and_then(|record| {
+            (Self::same_identity(record, namespace, fingerprint)
+                && matches!(record.state, RequestReplayEntry::Ready { .. }))
+            .then(|| Self::state_bytes(&record.state))
+        });
+        let Some(released) = released else {
+            return false;
+        };
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(released);
+        let until = Self::identity_until(Instant::now());
+        if let Some(record) = state.entries.get_mut(key) {
+            record.state = RequestReplayEntry::RecoverableShell { until };
+            record.delivery_leases = 0;
+            record.deferred_expiry = None;
+        }
+        state.expirations.push_back(ReplayExpiration {
+            until,
+            key: key.to_owned(),
+            kind: ReplayExpirationKind::ExpireIdentity,
+        });
+        true
+    }
+
     fn complete(
         &self,
         key: &str,
@@ -2511,6 +2544,20 @@ impl TunnelClient {
             .shell_guard_generation_is_current(terminal.shell_guard_generation)
     }
 
+    fn cached_job_delivery_matches(
+        terminal: &CachedReplayTerminal,
+        state: Option<crate::jobs::RequestDeliveryState>,
+    ) -> bool {
+        if !terminal.finalize_job_delivery {
+            return true;
+        }
+        matches!(
+            (state, terminal.requires_job_owner),
+            (Some(crate::jobs::RequestDeliveryState::Synchronous), false)
+                | (Some(crate::jobs::RequestDeliveryState::Durable), true)
+        )
+    }
+
     async fn process_replay_protected_jsonrpc(
         &self,
         mcp: &EmbeddedMcp,
@@ -2628,14 +2675,21 @@ impl TunnelClient {
                         }
                         continue;
                     }
-                    if terminal.requires_job_owner
-                        && !mcp.machine.has_job_request_delivery(replay.request_key)
-                    {
-                        let _ = self.replays.invalidate_ready(
-                            replay.request_key,
-                            replay.namespace,
-                            replay.fingerprint,
-                        );
+                    let delivery_state = mcp.machine.job_request_delivery_state(replay.request_key);
+                    if !Self::cached_job_delivery_matches(&terminal, delivery_state) {
+                        if delivery_state.is_some() {
+                            let _ = self.replays.invalidate_ready_for_shell_recovery(
+                                replay.request_key,
+                                replay.namespace,
+                                replay.fingerprint,
+                            );
+                        } else {
+                            let _ = self.replays.invalidate_ready(
+                                replay.request_key,
+                                replay.namespace,
+                                replay.fingerprint,
+                            );
+                        }
                         continue;
                     }
                     let delivered = self
@@ -2659,9 +2713,8 @@ impl TunnelClient {
                             crate::jobs::RequestDeliveryAck::Pending => {
                                 error!(
                                     request_key = %replay.request_key,
-                                    "delivered shell response reached an uncommitted inner job; retiring it to the compatibility surface"
+                                    "delivered shell response violated the pre-delivery committed-representation invariant"
                                 );
-                                let _ = mcp.machine.retire_job_request_delivery(replay.request_key);
                             }
                         }
                     }
@@ -3872,10 +3925,15 @@ mod tests {
             stdin: None,
             timeout_secs: Some(5),
             max_output_bytes: Some(4096),
+            writes: None,
         };
         let original = mcp
             .machine
-            .start_shell_job(shell_args.clone(), false, Some(request_key.clone()))
+            .start_shell_job(
+                shell_args.clone(),
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                Some(request_key.clone()),
+            )
             .unwrap();
         drop(original);
         assert_eq!(
@@ -3892,8 +3950,9 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(2),
                         max_output_bytes: Some(1024),
+                        writes: None,
                     },
-                    false,
+                    aw_tools::filesystem::batch::NodeTool::Bash,
                     None,
                 ) {
                     Ok(started) => {
@@ -4359,7 +4418,7 @@ mod tests {
         assert!(read.to_string().contains("first"));
         let edited = call(
             "edit",
-            json!({"path":"nested/test.txt", "edits":[{"old_text":"first", "new_text":"second"}]}),
+            json!({"path":"nested/test.txt", "edits":[["first", "second"]]}),
         )
         .await;
         assert_ne!(edited["result"]["isError"], true, "{edited}");
@@ -4370,37 +4429,38 @@ mod tests {
         let grepped = call("grep", json!({"pattern":"seco", "path":"nested"})).await;
         assert_ne!(grepped["result"]["isError"], true, "{grepped}");
         assert!(
-            grepped.to_string().contains("nested/test.txt:1: second"),
+            grepped.to_string().contains("nested/test.txt:1:second"),
             "{grepped}"
         );
         let grep_count = call(
             "grep",
-            json!({"pattern":"seco", "path":"nested", "output_mode":"count"}),
+            json!({"pattern":"seco", "path":"nested", "mode":"count"}),
         )
         .await;
         assert_ne!(grep_count["result"]["isError"], true, "{grep_count}");
-        let counted: Value =
-            serde_json::from_str(grep_count["result"]["content"][0]["text"].as_str().unwrap())
-                .unwrap();
-        assert_eq!(counted["page_total"], serde_json::json!(1));
+        let counted = grep_count["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(counted, "1  nested/test.txt\n");
 
-        // Multi-file edit in one call, with the top-level default path unused
-        // because every entry names its own file.
+        // Canonical edit is one file per call; multi-file changes compose from
+        // multiple exact edits (or one strict patch), never a second wire form.
         let prepared = call(
             "write",
             json!({"path":"nested/other.txt", "content":"other"}),
         )
         .await;
         assert_ne!(prepared["result"]["isError"], true, "{prepared}");
-        let multi = call(
+        let first_edit = call(
             "edit",
-            json!({"edits":[
-                {"path":"nested/test.txt", "old_text":"second", "new_text":"second!"},
-                {"path":"nested/other.txt", "old_text":"other", "new_text":"another"}
-            ]}),
+            json!({"path":"nested/test.txt", "edits":[["second", "second!"]]}),
         )
         .await;
-        assert_ne!(multi["result"]["isError"], true, "{multi}");
+        assert_ne!(first_edit["result"]["isError"], true, "{first_edit}");
+        let second_edit = call(
+            "edit",
+            json!({"path":"nested/other.txt", "edits":[["other", "another"]]}),
+        )
+        .await;
+        assert_ne!(second_edit["result"]["isError"], true, "{second_edit}");
         assert_eq!(
             fs::read_to_string(root.join("nested/test.txt")).unwrap(),
             "second!"
@@ -4417,13 +4477,10 @@ mod tests {
         )
         .await;
         assert_ne!(patched_file["result"]["isError"], true, "{patched_file}");
-        let patch_receipt: Value = serde_json::from_str(
-            patched_file["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(patch_receipt["mode"], "strict");
+        assert_eq!(
+            patched_file["result"]["content"][0]["text"].as_str(),
+            Some("ok")
+        );
         assert_eq!(
             fs::read_to_string(root.join("nested/test.txt")).unwrap(),
             "second! patched"
@@ -4460,64 +4517,63 @@ mod tests {
         assert_eq!(fs::read(root.join("nested/data.bin")).unwrap(), b"aXYd");
         fs::create_dir(root.join("nested/deeper")).unwrap();
         fs::write(root.join("nested/deeper/child.txt"), b"child").unwrap();
-        let listed = call("ls", json!({"path":"nested", "depth":5})).await;
-        let listing: Value =
-            serde_json::from_str(listed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(listing["truncated"], Value::Bool(false));
-        let listed_paths: Vec<&str> = listing["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["path"].as_str().unwrap())
-            .collect();
-        assert!(
-            listed_paths.contains(&"nested/test.txt"),
-            "{listed_paths:?}"
-        );
-        assert!(
-            listed_paths.contains(&"nested/data.bin"),
-            "{listed_paths:?}"
-        );
-        assert!(
-            listed_paths.contains(&"nested/deeper/child.txt"),
-            "{listed_paths:?}"
-        );
-        assert!(
-            listed_paths
-                .iter()
-                .all(|path| !path.starts_with("/proc/self/fd/"))
-        );
+        let found = call("find", json!({"path":"nested", "depth":5})).await;
+        assert_ne!(found["result"]["isError"], true, "{found}");
+        let found_text = found["result"]["content"][0]["text"].as_str().unwrap();
+        for path in [
+            "nested/test.txt",
+            "nested/data.bin",
+            "nested/deeper/child.txt",
+        ] {
+            assert!(found_text.contains(path), "{found_text}");
+        }
+        assert!(!found_text.contains("/proc/self/fd/"), "{found_text}");
+
         let limited = call("ls", json!({"path":"nested", "limit":2})).await;
-        let limited_payload: Value =
-            serde_json::from_str(limited["result"]["content"][0]["text"].as_str().unwrap())
-                .unwrap();
-        assert_eq!(limited_payload["truncated"], Value::Bool(true));
-        let limited_entries = limited_payload["entries"].as_array().unwrap();
-        assert_eq!(limited_entries.len(), 2);
-        assert!(
-            limited_entries[0]["path"].as_str().unwrap()
-                <= limited_entries[1]["path"].as_str().unwrap()
+        assert_ne!(limited["result"]["isError"], true, "{limited}");
+        let limited_text = limited["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(limited_text.ends_with("more offset=2\n"), "{limited_text}");
+        assert_eq!(
+            limited_text
+                .lines()
+                .filter(|line| !line.starts_with("more "))
+                .count(),
+            2
         );
 
-        let root_listing = call("ls", json!({"path":".", "depth":10})).await;
-        let root_payload: Value = serde_json::from_str(
-            root_listing["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap(),
+        let root_listing = call("find", json!({"path":".", "depth":10})).await;
+        assert_ne!(root_listing["result"]["isError"], true, "{root_listing}");
+        let root_text = root_listing["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(!root_text.contains("denied"), "{root_text}");
+        assert!(
+            !root_text.contains("protected"),
+            "protected paths must not appear in discovery: {root_text}"
+        );
+
+        // Lifecycle tools use exact destination semantics and never overwrite.
+        let copied = call(
+            "cp",
+            json!({"from":"nested/test.txt", "to":"nested/copied.txt"}),
         )
-        .unwrap();
-        let entries = root_payload["entries"].as_array().unwrap();
-        assert!(
-            entries
-                .iter()
-                .all(|entry| !entry["path"].as_str().unwrap().starts_with("denied"))
+        .await;
+        assert_ne!(copied["result"]["isError"], true, "{copied}");
+        assert_eq!(
+            fs::read_to_string(root.join("nested/copied.txt")).unwrap(),
+            "second! patched"
         );
-        assert!(
-            entries
-                .iter()
-                .all(|entry| !entry["path"].as_str().unwrap().starts_with("protected")),
-            "protected paths must not appear in directory listings"
-        );
+        let moved = call(
+            "mv",
+            json!({"from":"nested/copied.txt", "to":"nested/moved.txt"}),
+        )
+        .await;
+        assert_ne!(moved["result"]["isError"], true, "{moved}");
+        assert!(!root.join("nested/copied.txt").exists());
+        assert!(root.join("nested/moved.txt").exists());
+        let removed = call("rm", json!({"paths":["nested/moved.txt"]})).await;
+        assert_ne!(removed["result"]["isError"], true, "{removed}");
+        assert!(!root.join("nested/moved.txt").exists());
 
         let refused = call("write", json!({"path":"denied/secret", "content":"bad"})).await;
         assert_eq!(refused["result"]["isError"], true, "{refused}");
@@ -4727,12 +4783,19 @@ mod tests {
             .iter()
             .find(|value| value.get("id") == Some(&json!(43)))
             .expect("oversized binary tool response");
-        assert_eq!(result["result"]["isError"], true);
+        assert_ne!(result["result"]["isError"], true, "{result}");
         let text = result["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("cannot fit this encoding"), "{text}");
+        let page: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["total_size"], exceeds_after_base64 as u64);
+        assert_eq!(page["truncated"], true);
+        let next = page["next_offset"].as_u64().expect("paged binary cursor");
+        assert!(next > 0 && next < exceeds_after_base64 as u64, "{page}");
+        assert_eq!(page["status"], format!("more offset={next}"));
         assert!(
-            text.contains(&crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES.to_string()),
-            "{text}"
+            serde_json::to_vec(&result["result"]).unwrap().len()
+                <= crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES,
+            "paged result exceeded authenticated hosted result budget"
         );
     }
 
@@ -5211,6 +5274,87 @@ mod tests {
     }
 
     #[test]
+    fn cached_shell_finalization_requires_matching_committed_inner_representation() {
+        let terminal = CachedReplayTerminal {
+            body: Bytes::from_static(b"x"),
+            finalize_job_delivery: true,
+            requires_job_owner: false,
+            shell_guard_generation: None,
+            recover_after_body_expiry: true,
+        };
+        assert!(TunnelClient::cached_job_delivery_matches(
+            &terminal,
+            Some(crate::jobs::RequestDeliveryState::Synchronous)
+        ));
+        assert!(!TunnelClient::cached_job_delivery_matches(
+            &terminal,
+            Some(crate::jobs::RequestDeliveryState::Pending)
+        ));
+        assert!(!TunnelClient::cached_job_delivery_matches(&terminal, None));
+
+        let durable = CachedReplayTerminal {
+            requires_job_owner: true,
+            ..terminal.clone()
+        };
+        assert!(TunnelClient::cached_job_delivery_matches(
+            &durable,
+            Some(crate::jobs::RequestDeliveryState::Durable)
+        ));
+        assert!(!TunnelClient::cached_job_delivery_matches(
+            &durable,
+            Some(crate::jobs::RequestDeliveryState::Synchronous)
+        ));
+    }
+
+    #[test]
+    fn stale_cached_shell_body_returns_to_recoverable_inner_owner() {
+        let ledger = RequestReplayLedger::default();
+        let namespace = [91; 32];
+        let fingerprint = [92; 32];
+        ledger.activate_scope(namespace, [0; 32]);
+        assert!(matches!(
+            ledger
+                .claim("recover-stale", namespace, [0; 32], fingerprint)
+                .unwrap(),
+            RequestReplayClaim::Leader
+        ));
+        ledger
+            .complete(
+                "recover-stale",
+                namespace,
+                fingerprint,
+                ReplayTerminal {
+                    response: TunnelResponse {
+                        request_id: "recover-stale".into(),
+                        channel: Some("main".into()),
+                        resp_json: Some(json!({"jsonrpc":"2.0","id":1,"result":{}})),
+                        resp_headers: BTreeMap::new(),
+                        resp_code: 200,
+                        resp_type: "jsonrpc_response".into(),
+                    },
+                    finalize_job_delivery: true,
+                    requires_job_owner: false,
+                    shell_guard_generation: None,
+                    recoverable_shell: false,
+                },
+            )
+            .unwrap();
+        assert!(ledger.slot().reserved_bytes > 0);
+        assert!(ledger.invalidate_ready_for_shell_recovery(
+            "recover-stale",
+            namespace,
+            fingerprint
+        ));
+        assert_eq!(ledger.slot().reserved_bytes, 0);
+        assert!(matches!(
+            ledger
+                .claim("recover-stale", namespace, [0; 32], fingerprint)
+                .unwrap(),
+            RequestReplayClaim::RecoverableShell
+        ));
+    }
+
+    #[test]
     fn replay_ledger_reserves_worst_case_before_execution_and_shrinks_on_completion() {
         let ledger = RequestReplayLedger::default();
         let namespace = [3; 32];
@@ -5468,8 +5612,9 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(5),
                     max_output_bytes: Some(1024),
+                    writes: None,
                 },
-                false,
+                aw_tools::filesystem::batch::NodeTool::Bash,
                 Some(request_key.clone()),
             )
             .unwrap();
@@ -6908,10 +7053,10 @@ name"
             "jsonrpc":"2.0", "id":1, "method":"tools/call",
             "params": {
                 "name":"job_start",
-                "arguments": {
+                "arguments": {"ops":[["bash", {
                     "command": format!("printf held > '{}'; sleep 1", marker.display()),
                     "timeout_secs": 3
-                }
+                }]]}
             }
         });
         mcp.dispatch(&BTreeMap::new(), &background).await.unwrap();
@@ -7044,7 +7189,7 @@ name"
                 &call(
                     1,
                     "job_start",
-                    json!({"command":"printf started; sleep 5", "timeout_secs":8}),
+                    json!({"ops":[["bash", {"command":"printf started; sleep 5", "timeout_secs":8}]]}),
                 ),
             )
             .await
@@ -7096,7 +7241,10 @@ name"
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        #[cfg(windows)]
         assert_eq!(final_status.as_deref(), Some("cancelled"));
+        #[cfg(unix)]
+        assert_eq!(final_status.as_deref(), Some("unknown"));
     }
 
     #[test]

@@ -315,7 +315,27 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
     assert_eq!(
         tools,
         [
-            "bedit", "bread", "bwrite", "edit", "grep", "ls", "patch", "read", "write"
+            "batch",
+            "bedit",
+            "bread",
+            "bwrite",
+            "cp",
+            "edit",
+            "find",
+            "grep",
+            "job_ack",
+            "job_cancel",
+            "job_get",
+            "job_list",
+            "job_output",
+            "job_restart",
+            "job_start",
+            "ls",
+            "mv",
+            "patch",
+            "read",
+            "rm",
+            "write"
         ]
     );
 
@@ -334,34 +354,114 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
         "write",
         json!({"path": "nested/a.txt", "content": "alpha line\n"}),
     );
-    let listing = call(4, "ls", json!({"path": ".", "depth": 2}));
-    let read = call(5, "read", json!({"path": "nested/a.txt"}));
-    let grepped = call(6, "grep", json!({"pattern": "alpha", "path": "nested"}));
+    let listing = call(4, "ls", json!({"path": "nested"}));
+    let found = call(5, "find", json!({"path": ".", "depth": 2}));
+    let read = call(
+        6,
+        "read",
+        json!({"path": "nested/a.txt", "numbered": false}),
+    );
+    let grepped = call(7, "grep", json!({"pattern": "alpha", "path": "nested"}));
     let edited = call(
-        7,
+        8,
         "edit",
-        json!({"path": "nested/a.txt", "edits": [{"old_text": "alpha", "new_text": "beta"}]}),
+        json!({"path": "nested/a.txt", "edits": [["alpha", "beta"]]}),
     );
     let patched = call(
-        8,
+        9,
         "patch",
         json!({"patch": "*** Begin Patch\n*** Update File: nested/a.txt\n@@\n-beta line\n+gamma line\n*** End Patch"}),
     );
     call(
-        9,
+        10,
         "bwrite",
         json!({"path": "nested/b.bin", "data": "YWJjZA=="}),
     );
     let bedited = call(
-        10,
+        11,
         "bedit",
         json!({"path": "nested/b.bin", "edits": [{"offset": 1, "length": 2, "data": "WFk="}]}),
     );
     let bread = call(
-        11,
+        12,
         "bread",
         json!({"path": "nested/b.bin", "format": "base64"}),
     );
+    let copied = call(
+        13,
+        "cp",
+        json!({"from": "nested/a.txt", "to": "nested/copied.txt"}),
+    );
+    let moved = call(
+        14,
+        "mv",
+        json!({"from": "nested/copied.txt", "to": "nested/moved.txt"}),
+    );
+    let removed = call(15, "rm", json!({"paths": ["nested/moved.txt"]}));
+
+    let batch = call(
+        16,
+        "batch",
+        json!({"ops": [["read", {"path": "nested/a.txt", "numbered": false}]]}),
+    );
+    assert!(
+        text_of(&batch).contains("gamma line"),
+        "{}",
+        text_of(&batch)
+    );
+
+    let started = call(
+        17,
+        "job_start",
+        json!({"ops": [["read", {"path": "nested/a.txt", "numbered": false}]]}),
+    );
+    let started: Value = serde_json::from_str(text_of(&started)).unwrap();
+    let job_id = started["job_id"].as_str().unwrap().to_owned();
+
+    let terminal = loop {
+        let status = call(18, "job_get", json!({"id": job_id}));
+        let status: Value = serde_json::from_str(text_of(&status)).unwrap();
+        if status["status"] != "working" {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(terminal["status"], "completed", "{terminal}");
+
+    let output = call(
+        19,
+        "job_output",
+        json!({"id": job_id, "node": 1, "stream": "result", "encoding": "text"}),
+    );
+    let output: Value = serde_json::from_str(text_of(&output)).unwrap();
+    assert!(
+        output["data"]
+            .as_str()
+            .is_some_and(|data| data.contains("gamma line")),
+        "{output}"
+    );
+    let acknowledged = output["next_offset"].as_u64().unwrap();
+    call(
+        20,
+        "job_ack",
+        json!({"id": job_id, "node": 1, "stream": "result", "offset": acknowledged}),
+    );
+
+    let listed_jobs = call(21, "job_list", json!({"offset": 0, "limit": 64}));
+    let listed_jobs: Value = serde_json::from_str(text_of(&listed_jobs)).unwrap();
+    assert!(
+        listed_jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|job| job["job_id"] == job_id),
+        "{listed_jobs}"
+    );
+    call(22, "job_cancel", json!({"id": job_id}));
+
+    let restarted = call(23, "job_restart", json!({"id": job_id}));
+    let restarted: Value = serde_json::from_str(text_of(&restarted)).unwrap();
+    assert_ne!(restarted["job_id"], job_id);
     probe.finish();
 
     assert_eq!(
@@ -369,23 +469,20 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
         "gamma line\n"
     );
     assert_eq!(std::fs::read(root.join("nested/b.bin")).unwrap(), b"aXYd");
+    assert!(!root.join("nested/copied.txt").exists());
+    assert!(!root.join("nested/moved.txt").exists());
 
-    let listing: Value = serde_json::from_str(text_of(&listing)).unwrap();
-    let paths = listing["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry["path"].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
-    assert!(paths.contains(&"nested/a.txt".to_owned()), "{paths:?}");
-    assert_eq!(text_of(&read), "1\talpha line");
-    assert!(text_of(&grepped).contains("nested/a.txt:1: alpha line"));
-    let edit_receipt: Value = serde_json::from_str(text_of(&edited)).unwrap();
-    assert_eq!(edit_receipt["changed_files"], json!(1));
-    let patch_receipt: Value = serde_json::from_str(text_of(&patched)).unwrap();
-    assert_eq!(patch_receipt["mode"], json!("strict"));
-    let bedit_receipt: Value = serde_json::from_str(text_of(&bedited)).unwrap();
-    assert_eq!(bedit_receipt["bytes_written"], json!(2));
+    assert!(text_of(&listing).contains("a.txt"), "{}", text_of(&listing));
+    assert!(
+        text_of(&found).contains("nested/a.txt"),
+        "{}",
+        text_of(&found)
+    );
+    assert_eq!(text_of(&read), "alpha line\n");
+    assert!(text_of(&grepped).contains("nested/a.txt:1:alpha line"));
+    for output in [&edited, &patched, &bedited, &copied, &moved, &removed] {
+        assert_eq!(text_of(output), "ok", "{output}");
+    }
     let bread: Value = serde_json::from_str(text_of(&bread)).unwrap();
     // "abcd" with bytes 1..3 replaced by "XY".
     assert_eq!(bread["data"], json!("YVhZZA=="));
@@ -404,13 +501,17 @@ fn text_tools_share_binary_detection_without_restricting_binary_tools() {
 
     for (id, name, arguments) in [
         (2, "read", json!({"path": "bytes.dat"})),
-        (3, "read", json!({"path": "bytes.dat", "offset": 2})),
+        (
+            3,
+            "read",
+            json!({"path": "bytes.dat", "line": 1, "byte": 2}),
+        ),
         (
             4,
             "edit",
             json!({
                 "path": "bytes.dat",
-                "edits": [{"old_text": "needle", "new_text": "changed"}]
+                "edits": [["needle", "changed"]]
             }),
         ),
         (
@@ -423,7 +524,7 @@ fn text_tools_share_binary_detection_without_restricting_binary_tools() {
             "edit",
             json!({
                 "path": "plain.txt",
-                "edits": [{"old_text": "original", "new_text": "left\0right"}]
+                "edits": [["original", "left\0right"]]
             }),
         ),
         (
@@ -452,7 +553,7 @@ fn text_tools_share_binary_detection_without_restricting_binary_tools() {
         let result = probe.request(&call_request(
             id,
             "grep",
-            json!({"path": ".", "pattern": "needle", "output_mode": mode}),
+            json!({"path": ".", "pattern": "needle", "mode": mode}),
         ));
         assert_ne!(result["result"]["isError"], true, "{result}");
         assert!(

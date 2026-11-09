@@ -1835,7 +1835,7 @@ impl Server {
 }
 
 pub fn state_dir() -> Result<PathBuf> {
-    Ok(crate::xdg::state_home()?.join("abird/dotlink"))
+    crate::private_state::state_dir()
 }
 
 pub fn state_path(profile: Option<&str>) -> Result<PathBuf> {

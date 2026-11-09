@@ -4,14 +4,15 @@
 //! owns what they share: who may read or write what, the descriptor-rooted file
 //! primitives, the advertised-tool table and the MCP server handler.
 
+mod shared_fs;
 mod tools;
+pub(crate) use aw_tools::mutation::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 #[cfg(test)]
 pub(crate) use tools::shell::ShellArgs;
 #[cfg(test)]
 pub(crate) use tools::test_support::test_machine;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use tools::test_support::trusted_bubblewrap_available;
-pub(crate) use tools::{MAX_EDIT_FILES, MAX_EDIT_OPS};
 
 use std::{
     collections::BTreeSet,
@@ -35,7 +36,7 @@ use rmcp::{
 };
 
 use serde_json::Value;
-use tokio::{fs, io::AsyncReadExt, sync::RwLock};
+use tokio::{fs, sync::RwLock};
 use uuid::Uuid;
 
 use crate::logging::{LogConfig, LogOutcome};
@@ -176,6 +177,7 @@ struct RuntimeConfig {
     max_output_bytes: usize,
     max_read_bytes: usize,
     max_write_bytes: usize,
+    shared_caps: aw_tools::filesystem::schema::SchemaCaps,
     task_result_budget: Option<usize>,
     protected_paths: Vec<PathBuf>,
 }
@@ -183,6 +185,7 @@ struct RuntimeConfig {
 #[derive(Clone, Debug, Default)]
 struct PreparedLaunchers {
     shell: Option<tools::shell::PreparedExecutable>,
+    shell_tool: Option<aw_tools::filesystem::batch::NodeTool>,
     #[cfg(target_os = "linux")]
     bwrap: Option<tools::shell::PreparedExecutable>,
 }
@@ -192,8 +195,10 @@ impl PreparedLaunchers {
     fn for_test(shell: Option<PathBuf>, bwrap: Option<PathBuf>) -> Self {
         #[cfg(not(target_os = "linux"))]
         let _ = &bwrap;
+        let shell_tool = shell.as_ref().map(|_| platform_shell_node_tool());
         Self {
             shell: shell.map(tools::shell::PreparedExecutable::for_test),
+            shell_tool,
             #[cfg(target_os = "linux")]
             bwrap: bwrap.map(tools::shell::PreparedExecutable::for_test_sandbox_launcher),
         }
@@ -242,6 +247,7 @@ pub struct LocalMachine {
     router: OnceLock<Arc<ToolRouter<Self>>>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     secure_fs: Arc<crate::secure_fs::SecureFs>,
+    shared_fs: shared_fs::SharedCapabilitySet,
 }
 
 #[derive(Debug)]
@@ -255,18 +261,8 @@ pub(crate) struct PreparedMachine {
     spool_limit: u64,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     secure_fs: Arc<crate::secure_fs::SecureFs>,
+    shared_fs: shared_fs::SharedCapabilitySet,
 }
-
-/// A write that is staged but not yet visible; see `LocalMachine::stage_write`.
-/// Both backends stage beside the target and install in one step; the shared
-/// mode and naming policy lives in [`crate::staging`].
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Debug)]
-pub(crate) struct PendingWrite(crate::secure_fs::StagedWrite);
-
-#[cfg(windows)]
-#[derive(Debug)]
-pub(crate) struct PendingWrite(crate::staging::StagedWrite);
 
 /// Smallest accepted profile byte limit. Below this the fixed JSON reply framing
 /// and a truncation marker no longer fit, so a configured ceiling could not be
@@ -308,14 +304,6 @@ pub(crate) fn serialized_text_tool_result_fixed_len() -> usize {
 
 pub(crate) fn serialized_text_tool_result_len(text: &str) -> usize {
     serialized_text_tool_result_fixed_len().saturating_add(serialized_text_content_len(text))
-}
-
-pub(crate) fn serialized_text_tool_result_parts_len(parts: &[&str]) -> usize {
-    parts
-        .iter()
-        .fold(serialized_text_tool_result_fixed_len(), |total, part| {
-            total.saturating_add(serialized_text_content_len(part))
-        })
 }
 
 fn serialized_error_text_tool_result_fixed_len() -> usize {
@@ -538,32 +526,55 @@ fn checked_job_retention(value: u64) -> Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(value))
 }
 
-/// Name of the shell tool this platform advertises. Derived from `TOOL_SPECS`
-/// through [`Capabilities::allows`], so a new shell variant cannot be added to
-/// the table and missed here.
+/// Canonical shell node corresponding to a model-visible tool name.
+fn shell_node_tool(name: &str) -> Option<aw_tools::filesystem::batch::NodeTool> {
+    use aw_tools::filesystem::batch::NodeTool;
+    match name {
+        "bash" => Some(NodeTool::Bash),
+        "pwsh" => Some(NodeTool::Pwsh),
+        "powershell" => Some(NodeTool::Powershell),
+        _ => None,
+    }
+}
+
+fn platform_shell_node_tool() -> aw_tools::filesystem::batch::NodeTool {
+    shell_node_tool(shell_tool_name()).expect("platform shell name maps to a canonical ShellNode")
+}
+
+/// Name of the shell tool this host would prepare from its current executable
+/// search. Runtime machines bind the exact prepared node independently so a
+/// later PATH change cannot retarget an already-authorized shell.
 pub fn shell_tool_name() -> &'static str {
-    let shell = Capabilities {
-        shell: true,
-        ..Capabilities::default()
-    };
-    TOOL_SPECS
-        .iter()
-        .find(|spec| shell.allows(spec.capability))
-        .map_or("bash", |spec| spec.name)
+    #[cfg(windows)]
+    {
+        if resolve_executable("pwsh.exe").is_some() {
+            "pwsh"
+        } else {
+            "powershell"
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        "bash"
+    }
 }
 
-/// True for the shell tool this platform advertises. Tool visibility, the
-/// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
-/// this one question, so a new shell variant cannot be missed in one of them.
+/// True for a canonical shell tool on this platform. This classifies tool
+/// semantics only; runtime visibility is narrower and requires an exact
+/// prepared launcher identity.
 pub fn is_shell_tool(name: &str) -> bool {
-    name == shell_tool_name()
+    if cfg!(windows) {
+        matches!(name, "pwsh" | "powershell")
+    } else {
+        name == "bash"
+    }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 enum AccessNeed {
     Read,
     Write,
-    ReadWrite,
 }
 
 /// What a runtime may advertise. Named fields, not positional booleans, so a
@@ -576,12 +587,14 @@ pub struct Capabilities {
     pub shell: bool,
 }
 
-/// What one tool needs. `ShellUnix`/`ShellWindows` are the same grant with a
-/// platform-dependent tool name.
+/// What one tool needs. Shell variants classify the model-visible interpreter;
+/// `Capabilities::shell` grants only coarse shell authority. The exact prepared
+/// interpreter identity (`bash`, `pwsh`, `powershell`) is the visibility gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Capability {
     Read,
     Write,
+    ReadAndWrite,
     ReadWrite,
     ShellUnix,
     ShellWindows,
@@ -608,6 +621,12 @@ pub struct ToolSpec {
 pub const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "ls",
+        capability: Capability::Read,
+        request_replay: false,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "find",
         capability: Capability::Read,
         request_replay: false,
         concurrent_read: true,
@@ -643,6 +662,24 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         concurrent_read: false,
     },
     ToolSpec {
+        name: "cp",
+        capability: Capability::ReadAndWrite,
+        request_replay: true,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "mv",
+        capability: Capability::Write,
+        request_replay: true,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "rm",
+        capability: Capability::Write,
+        request_replay: true,
+        concurrent_read: false,
+    },
+    ToolSpec {
         name: "edit",
         capability: Capability::ReadWrite,
         request_replay: true,
@@ -667,8 +704,20 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         concurrent_read: false,
     },
     ToolSpec {
+        name: "pwsh",
+        capability: Capability::ShellWindows,
+        request_replay: true,
+        concurrent_read: false,
+    },
+    ToolSpec {
         name: "powershell",
         capability: Capability::ShellWindows,
+        request_replay: true,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "batch",
+        capability: Capability::Job,
         request_replay: true,
         concurrent_read: false,
     },
@@ -708,6 +757,12 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         request_replay: false,
         concurrent_read: false,
     },
+    ToolSpec {
+        name: "job_restart",
+        capability: Capability::Job,
+        request_replay: true,
+        concurrent_read: false,
+    },
 ];
 
 /// Whether a `tools/call` must be executed at most once for one authenticated
@@ -726,14 +781,15 @@ impl Capabilities {
         match capability {
             Capability::Read => self.read,
             Capability::Write => self.write,
+            Capability::ReadAndWrite => self.read && self.write,
             Capability::ReadWrite => self.read_write,
-            Capability::ShellUnix => self.shell && !cfg!(windows),
-            Capability::ShellWindows => self.shell && cfg!(windows),
-            Capability::Job => self.shell,
+            Capability::ShellUnix | Capability::ShellWindows => self.shell,
+            Capability::Job => self.shell || self.read || self.write || self.read_write,
         }
     }
 }
 
+#[cfg(test)]
 fn contains_parent_component(path: &Path) -> bool {
     path.components()
         .any(|component| component == Component::ParentDir)
@@ -781,38 +837,7 @@ async fn canonicalize_grant(base_dir: &Path, path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn text_path_label(value: &str) -> String {
-    if value.is_empty() {
-        return ".".to_owned();
-    }
-    if value
-        .chars()
-        .any(|ch| ch == ':' || ch == '"' || ch == '\\' || ch.is_control())
-    {
-        return serde_json::to_string(value).expect("path text serializes as JSON string");
-    }
-    value.to_owned()
-}
-
 #[cfg(unix)]
-fn byte_path_label(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len().saturating_add(3));
-    output.push_str("b\"");
-    for &byte in bytes {
-        match byte {
-            b'"' => output.push_str("\\\""),
-            b'\\' => output.push_str("\\\\"),
-            0x20..=0x7e => output.push(char::from(byte)),
-            _ => {
-                write!(&mut output, "\\x{byte:02X}").expect("write to String cannot fail");
-            }
-        }
-    }
-    output.push('"');
-    output
-}
-
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
@@ -950,6 +975,7 @@ impl AccessPolicy {
         })
     }
 
+    #[cfg(test)]
     fn lexical_target(&self, input: &str) -> Result<PathBuf> {
         let path = Path::new(input);
         if contains_parent_component(path) {
@@ -1022,6 +1048,7 @@ impl AccessPolicy {
         !self.denied_write(path) && self.grant_write(path)
     }
 
+    #[cfg(test)]
     fn check_denies(&self, path: &Path, need: AccessNeed) -> Result<()> {
         match need {
             AccessNeed::Read if self.denied_read(path) => {
@@ -1030,13 +1057,11 @@ impl AccessPolicy {
             AccessNeed::Write if self.denied_write(path) => {
                 bail!("write access is denied by policy: {}", path.display())
             }
-            AccessNeed::ReadWrite if self.denied_read(path) || self.denied_write(path) => {
-                bail!("read+write access is denied by policy: {}", path.display())
-            }
             _ => Ok(()),
         }
     }
 
+    #[cfg(test)]
     fn check(&self, path: &Path, need: AccessNeed) -> Result<()> {
         self.check_denies(path, need)?;
         match need {
@@ -1046,13 +1071,11 @@ impl AccessPolicy {
             AccessNeed::Write if !self.can_write(path) => {
                 bail!("write access is not allowed: {}", path.display())
             }
-            AccessNeed::ReadWrite if !(self.can_read(path) && self.can_write(path)) => {
-                bail!("read+write access is not allowed: {}", path.display())
-            }
             _ => Ok(()),
         }
     }
 
+    #[cfg(test)]
     async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
         let target = self.lexical_target(input)?;
         self.check_denies(&target, need)?;
@@ -1063,6 +1086,7 @@ impl AccessPolicy {
         Ok(canonical)
     }
 
+    #[cfg(test)]
     async fn resolve_for_create(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
         let target = self.lexical_target(input)?;
         self.check_denies(&target, need)?;
@@ -1122,31 +1146,6 @@ impl AccessPolicy {
             return value;
         }
         value.replace(std::path::MAIN_SEPARATOR, "/")
-    }
-
-    /// Path label for line-oriented text protocols such as grep content mode.
-    /// Ordinary UTF-8 paths retain the familiar `path:line:` shape. Paths that
-    /// could inject delimiters/newlines are JSON-quoted; invalid UTF-8 Unix
-    /// names use an explicit byte string so distinct files never collapse via
-    /// lossy conversion.
-    fn relative_text_display(&self, path: &Path) -> String {
-        let relative = path.strip_prefix(&self.base_dir).unwrap_or(path);
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt as _;
-            let bytes = relative.as_os_str().as_bytes();
-            if bytes.is_empty() {
-                return ".".to_owned();
-            }
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                return text_path_label(text);
-            }
-            byte_path_label(bytes)
-        }
-        #[cfg(not(unix))]
-        {
-            text_path_label(&self.relative_display(path))
-        }
     }
 
     fn sandbox_mounts(&self) -> Vec<(PathBuf, bool)> {
@@ -1679,6 +1678,7 @@ fn prepared_authority_value(
         "deny_write_roots": config.access.deny_write_roots.iter().map(|path| authority_path_identity(path)).collect::<Vec<_>>(),
         "protected_paths": protected_paths,
         "cache_mounts": caches,
+        "shell_tool": launchers.shell_tool.map(aw_tools::filesystem::batch::NodeTool::name),
         "shell_program": shell_program_authority,
         "bwrap_program": bwrap_program_authority,
     });
@@ -1721,6 +1721,16 @@ fn prepared_authority_value(
     Ok(authority)
 }
 
+fn local_prepared_policy_fingerprint(authority: &serde_json::Value) -> Result<[u8; 32]> {
+    Ok(crate::mcp::sha256(
+        &serde_json::to_vec(&serde_json::json!({
+            "v": "dotlink-local-prepared-authority-v1",
+            "authority": authority,
+        }))
+        .map_err(|error| anyhow!("cannot serialize prepared execution authority: {error}"))?,
+    ))
+}
+
 impl PreparedMachine {
     pub(crate) fn authority_value(&self) -> &serde_json::Value {
         &self.authority
@@ -1740,6 +1750,33 @@ impl PreparedMachine {
 }
 
 impl LocalMachine {
+    #[cfg(test)]
+    pub(crate) fn bind_test_execution_policy(self) -> Result<Self> {
+        let mut fingerprint_config = self.config.clone();
+        let job_root = self.jobs.protected_path().to_path_buf();
+        for path in guard_identities(
+            &fingerprint_config.access.base_dir,
+            std::slice::from_ref(&job_root),
+        )? {
+            if !fingerprint_config.protected_paths.contains(&path) {
+                fingerprint_config.protected_paths.push(path);
+            }
+        }
+        let mut authority = prepared_authority_value(
+            &fingerprint_config,
+            &self.launchers,
+            &job_root,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            &self.secure_fs,
+        )?;
+        authority["shared_filesystem"] = shared_fs::authority_value(&self.shared_fs)?;
+        let policy = local_prepared_policy_fingerprint(&authority)?;
+        if !self.jobs.bind_policy(policy) {
+            bail!("test machine execution authority conflicts with its Job session");
+        }
+        Ok(self)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn new(args: MachineConfig) -> Result<Self> {
         let retention = checked_job_retention(args.job_retention_secs)?;
@@ -1759,6 +1796,11 @@ impl LocalMachine {
         let max_output_bytes = checked_byte_limit("max_output_bytes", args.max_output_bytes)?;
         let max_read_bytes = checked_byte_limit("max_read_bytes", args.max_read_bytes)?;
         let max_write_bytes = checked_byte_limit("max_write_bytes", args.max_write_bytes)?;
+        let shared_caps = tools::shared_native::caps(max_read_bytes, max_write_bytes).map_err(|reason| {
+            crate::recovery::operator(anyhow!(
+                "filesystem profile limits are incompatible with the shared tool engine: {reason}"
+            ))
+        })?;
         let retention = checked_job_retention(args.job_retention_secs)?;
 
         let access = AccessPolicy::resolve(args.access).await?;
@@ -1845,17 +1887,27 @@ impl LocalMachine {
         #[cfg(target_os = "linux")]
         validate_host_mount_policy(&access, &args.host_shell, &protected_paths)?;
 
-        let shell_launcher = if args.allow_shell {
+        let (shell_launcher, shell_tool) = if args.allow_shell {
             #[cfg(windows)]
-            let program = resolve_executable("pwsh.exe")
-                .or_else(|| resolve_executable("powershell.exe"))
-                .ok_or_else(|| anyhow!("PowerShell was not found in PATH"))?;
+            let (program, tool) = if let Some(program) = resolve_executable("pwsh.exe") {
+                (program, aw_tools::filesystem::batch::NodeTool::Pwsh)
+            } else if let Some(program) = resolve_executable("powershell.exe") {
+                (program, aw_tools::filesystem::batch::NodeTool::Powershell)
+            } else {
+                return Err(anyhow!("PowerShell was not found in PATH"));
+            };
             #[cfg(not(windows))]
-            let program = resolve_executable("bash")
-                .ok_or_else(|| anyhow!("an executable bash was not found in PATH"))?;
-            Some(tools::shell::PreparedExecutable::prepare(program)?)
+            let (program, tool) = (
+                resolve_executable("bash")
+                    .ok_or_else(|| anyhow!("an executable bash was not found in PATH"))?,
+                aw_tools::filesystem::batch::NodeTool::Bash,
+            );
+            (
+                Some(tools::shell::PreparedExecutable::prepare(program)?),
+                Some(tool),
+            )
         } else {
-            None
+            (None, None)
         };
 
         #[cfg(target_os = "linux")]
@@ -1875,6 +1927,7 @@ impl LocalMachine {
 
         let launchers = PreparedLaunchers {
             shell: shell_launcher,
+            shell_tool,
             #[cfg(target_os = "linux")]
             bwrap: bwrap_launcher,
         };
@@ -1899,16 +1952,19 @@ impl LocalMachine {
             max_output_bytes,
             max_read_bytes,
             max_write_bytes,
+            shared_caps,
             task_result_budget: args.task_result_budget,
             protected_paths,
         };
-        let authority = prepared_authority_value(
+        let shared_fs = shared_fs::prepare(&config.access, &config.protected_paths)?;
+        let mut authority = prepared_authority_value(
             &config,
             &launchers,
             job_root,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             &secure_fs,
         )?;
+        authority["shared_filesystem"] = shared_fs::authority_value(&shared_fs)?;
         Ok(PreparedMachine {
             config,
             launchers,
@@ -1919,17 +1975,27 @@ impl LocalMachine {
             spool_limit: args.job_spool_bytes,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
+            shared_fs,
         })
     }
 
     pub(crate) fn from_prepared(
         prepared: PreparedMachine,
         jobs: crate::jobs::JobManager,
+        expected_policy: [u8; 32],
     ) -> Result<Self> {
         if prepared.job_root != jobs.protected_path() {
             bail!("internal error: prepared machine belongs to a different job session");
         }
-        jobs.set_limits(prepared.retention, prepared.spool_limit);
+        if !jobs.resource_policy_matches(prepared.retention, prepared.spool_limit) {
+            bail!("internal error: prepared machine resource policy differs from job session");
+        }
+        if prepared.shared_fs.base() != prepared.config.access.base_dir {
+            bail!("internal error: shared filesystem belongs to a different base directory");
+        }
+        if expected_policy == [0; 32] || !jobs.bind_policy(expected_policy) {
+            bail!("internal error: prepared execution authority differs from Job session");
+        }
         let operation_gate = jobs.operation_gate();
         Ok(Self {
             config: prepared.config,
@@ -1941,6 +2007,7 @@ impl LocalMachine {
             router: OnceLock::new(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs: prepared.secure_fs,
+            shared_fs: prepared.shared_fs,
         })
     }
 
@@ -1950,7 +2017,8 @@ impl LocalMachine {
     ) -> Result<Self> {
         let prepared = Self::prepare_with_job_root(args, jobs.protected_path()).await?;
         prepared.validate_launchers().await?;
-        Self::from_prepared(prepared, jobs)
+        let expected_policy = local_prepared_policy_fingerprint(prepared.authority_value())?;
+        Self::from_prepared(prepared, jobs, expected_policy)
     }
 
     /// Re-resolve every guarded name and rerun the startup checks, so one
@@ -2034,7 +2102,7 @@ impl LocalMachine {
         self.config
             .max_write_bytes
             .saturating_mul(MAX_JSON_ESCAPE)
-            .saturating_add(tools::MAX_EDIT_OPS.saturating_mul(EDIT_PATH_ENVELOPE_BYTES))
+            .saturating_add(MAX_EDIT_OPS.saturating_mul(EDIT_PATH_ENVELOPE_BYTES))
             .saturating_add(MAX_REQUEST_FRAMING_BYTES)
     }
 
@@ -2070,247 +2138,56 @@ impl LocalMachine {
             }
         )
     }
-
-    fn ensure_not_protected(&self, path: &Path) -> Result<()> {
-        for protected in &self.config.protected_paths {
-            if path == protected || path.starts_with(protected) {
-                bail!(
-                    "path is protected by dotlink and cannot be accessed through filesystem tools"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Windows replacement can briefly make an existing target unavailable
-    /// to pathname resolution. Reserve the lexical names before canonicalizing
-    /// them, then keep this guard through commit. The admission namespace is
-    /// distinct from the canonical mutation locks acquired after resolution.
-    pub(crate) async fn reserve_mutation_names<'a>(
-        &self,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<crate::mutation::MutationNameGuard> {
-        crate::mutation::reserve_names(paths).await
-    }
-
-    /// One resolved-target guard spans planning through commit, shared by every
-    /// mutating tool.
-    pub(crate) async fn lock_mutations<'a>(
-        &self,
-        paths: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<crate::mutation::MutationGuard> {
-        crate::mutation::lock(paths).await
-    }
-
-    async fn resolve_existing(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
-        let lexical = self.config.access.lexical_target(input)?;
-        self.ensure_not_protected(&lexical)?;
-        let resolved = self.config.access.resolve_existing(input, need).await?;
-        self.ensure_not_protected(&resolved)?;
-        Ok(resolved)
-    }
-
-    async fn resolve_for_create(&self, input: &str, need: AccessNeed) -> Result<PathBuf> {
-        let lexical = self.config.access.lexical_target(input)?;
-        self.ensure_not_protected(&lexical)?;
-        let resolved = self.config.access.resolve_for_create(input, need).await?;
-        self.ensure_not_protected(&resolved)?;
-        Ok(resolved)
-    }
-
-    #[cfg(any(test, windows))]
-    async fn require_regular_file(&self, path: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(path).await?;
-        if !metadata.is_file() {
-            bail!("path is not a regular file: {}", path.display());
-        }
-        Ok(())
-    }
-
-    // Tokio file writes may finish on a background blocking task even after
-    // write_all returns. Flush before acknowledging a mutating MCP call.
-    // Size checks before reading are not sufficient: a concurrent shell can
-    // extend a file while it is being read. Bound actual I/O to one byte over
-    // the limit so even adversarial growth cannot cause unbounded allocation.
-    async fn read_bounded(file: &mut fs::File, limit: usize) -> Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-        let mut bounded = file.take(limit.saturating_add(1) as u64);
-        bounded.read_to_end(&mut bytes).await?;
-        if bytes.len() > limit {
-            bail!("file exceeded the {} byte read limit", limit);
-        }
-        Ok(bytes)
-    }
-
-    async fn open_read_file(&self, path: &Path) -> Result<fs::File> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            Ok(fs::File::from_std(self.secure_fs.open_read(path)?))
-        }
-        #[cfg(windows)]
-        {
-            Ok(fs::File::from_std(crate::windows_fs::open_file(
-                path, false,
-            )?))
-        }
-    }
-
-    async fn open_edit_file(&self, path: &Path) -> Result<fs::File> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            Ok(fs::File::from_std(self.secure_fs.open_edit(path)?))
-        }
-        #[cfg(windows)]
-        {
-            Ok(fs::File::from_std(crate::windows_fs::open_file(
-                path, true,
-            )?))
-        }
-    }
-
-    /// Replace a file's content without ever exposing a partial write, and
-    /// without truncating the original: the bytes are staged beside the target
-    /// and renamed over it, preserving the existing mode.
-    pub(crate) async fn write_file_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        self.commit_write(self.stage_replace_write(path, bytes).await?)
-            .await
-    }
-
-    /// Prepare an in-place update: the bytes are flushed beside the target and
-    /// removed again if the value is dropped without being committed. The
-    /// expected length/digest is re-checked at commit.
-    pub(crate) async fn stage_update_write(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        expected: (u64, [u8; 32]),
-    ) -> Result<PendingWrite> {
-        self.stage_write_mode(path, bytes, false, false, Some(expected))
-            .await
-    }
-
-    /// Descriptor-pinned streamed replacement. Unlike `stage_update_write`,
-    /// the caller produces output in bounded chunks instead of allocating a
-    /// full replacement. Both backends reuse their existing temp ownership,
-    /// mode/ACL handling, digest precondition and atomic commit path.
-    pub(crate) async fn stage_update_with(
-        &self,
-        path: &Path,
-        expected: (u64, [u8; 32]),
-        write: impl FnOnce(&mut std::fs::File) -> Result<()>,
-    ) -> Result<PendingWrite> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            Ok(PendingWrite(crate::blocking::run(|| {
-                self.secure_fs.stage_update_with(path, expected, write)
-            })?))
-        }
-        #[cfg(windows)]
-        {
-            Ok(PendingWrite(
-                crate::staging::stage_with_path(path, false, Some(expected), write).await?,
-            ))
-        }
-    }
-
-    /// Prepare a create-or-replace write that needs only write authority.
-    pub(crate) async fn stage_replace_write(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-    ) -> Result<PendingWrite> {
-        self.stage_write_mode(path, bytes, false, true, None).await
-    }
-
-    /// Prepare a create-only write. The target is installed only when the
-    /// staged value is committed, so a reader never observes an empty file and
-    /// an existing path cannot be replaced.
-    pub(crate) async fn stage_create_write(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-    ) -> Result<PendingWrite> {
-        self.stage_write_mode(path, bytes, true, true, None).await
-    }
-
-    async fn stage_write_mode(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        create_only: bool,
-        write_only: bool,
-        expected: Option<(u64, [u8; 32])>,
-    ) -> Result<PendingWrite> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            // Run descriptor-rooted staging as one synchronous segment:
-            // cancellation cannot outlive its caller's mutation lock.
-            let staged = crate::blocking::run(|| match (create_only, write_only) {
-                (true, _) => self.secure_fs.stage_create(path, bytes),
-                (false, true) => self.secure_fs.stage(path, bytes),
-                (false, false) => {
-                    let expected = expected.ok_or_else(|| {
-                        anyhow!("internal error: an update requires an expected snapshot")
-                    })?;
-                    self.secure_fs.stage_update(path, bytes, expected)
-                }
-            })?;
-            Ok(PendingWrite(staged))
-        }
-        #[cfg(windows)]
-        {
-            let _ = write_only;
-            Ok(PendingWrite(
-                crate::staging::stage_path(path, bytes, create_only, expected).await?,
-            ))
-        }
-    }
-
-    /// Make a staged write visible.
-    pub(crate) async fn commit_write(&self, pending: PendingWrite) -> Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            crate::blocking::run(|| pending.0.commit())
-        }
-        #[cfg(windows)]
-        {
-            pending.0.commit().await
-        }
-    }
 }
 
 impl LocalMachine {
-    /// Every advertised tool, merged from the per-family routers. Each family
-    /// names its own `#[tool_router]`, so tools stay with their implementation.
+    /// Product-owned non-filesystem routes. The canonical filesystem surface is
+    /// added separately from `aw-tools`; compatibility lives only at input and
+    /// projection boundaries, never in a second native filesystem engine.
     fn all_tools() -> ToolRouter<Self> {
-        let mut router = Self::discovery_router();
-        router.merge(Self::text_router());
-        router.merge(Self::grep_router());
-        router.merge(Self::edit_router());
-        router.merge(Self::patch_router());
-        router.merge(Self::binary_router());
-        router.merge(Self::shell_router());
+        let mut router = Self::shell_router();
         router.merge(Self::jobs_router());
-        if let Some(edit) = router.map.get_mut("edit") {
-            tools::edit::with_edit_limits(&mut edit.attr);
-        }
-        if let Some(bedit) = router.map.get_mut("bedit") {
-            tools::binary::with_bedit_limits(&mut bedit.attr);
-        }
         router
     }
 
-    pub fn tool_router_for_policy(capabilities: Capabilities) -> ToolRouter<Self> {
+    fn tool_router_for_policy_with_caps(
+        capabilities: Capabilities,
+        caps: aw_tools::filesystem::schema::SchemaCaps,
+        shell_tool: Option<aw_tools::filesystem::batch::NodeTool>,
+    ) -> ToolRouter<Self> {
         let mut router = Self::all_tools();
+        // Add/replace the complete canonical filesystem surface BEFORE policy
+        // filtering so new shared tools can never bypass dotlink visibility.
+        tools::shared_native::canonicalize_router(&mut router, caps);
+        tools::jobs::canonicalize_graph_router(&mut router, capabilities, shell_tool);
         for spec in TOOL_SPECS {
-            if !capabilities.allows(spec.capability) {
+            let shell_matches = match spec.capability {
+                Capability::ShellUnix | Capability::ShellWindows => {
+                    shell_tool.is_some_and(|tool| tool.name() == spec.name)
+                }
+                _ => true,
+            };
+            if !capabilities.allows(spec.capability) || !shell_matches {
                 router.disable_route(spec.name);
             }
         }
         router
     }
 
+    pub fn tool_router_for_policy(capabilities: Capabilities) -> ToolRouter<Self> {
+        Self::tool_router_for_policy_with_caps(
+            capabilities,
+            tools::shared_native::caps(
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+                crate::limits::DEFAULT_TRANSFER_BYTES,
+            )
+            .expect("built-in transfer ceilings fit shared tool limits"),
+            capabilities.shell.then_some(platform_shell_node_tool()),
+        )
+    }
+
     fn capabilities(&self) -> Capabilities {
+        debug_assert_eq!(self.shared_fs.base(), self.config.access.base_dir);
         self.config.access.capabilities(self.config.allow_shell)
     }
 
@@ -2402,9 +2279,29 @@ impl LocalMachine {
         self.jobs.discard_hidden_request_delivery(request_key)
     }
 
+    async fn dispatch_tool_call(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        result_budget: Option<usize>,
+    ) -> Result<CallToolResponse, McpError> {
+        if tools::shared_native::is_native(request.name.as_ref()) {
+            tools::shared_native::call(self, request, context, result_budget).await
+        } else {
+            self.policy_tool_router()
+                .call(ToolCallContext::new(self, request, context))
+                .await
+        }
+    }
+
     fn policy_tool_router(&self) -> &ToolRouter<Self> {
-        self.router
-            .get_or_init(|| Arc::new(Self::tool_router_for_policy(self.capabilities())))
+        self.router.get_or_init(|| {
+            Arc::new(Self::tool_router_for_policy_with_caps(
+                self.capabilities(),
+                self.config.shared_caps,
+                self.launchers.shell_tool,
+            ))
+        })
     }
 
     /// Non-caching policy lookup used by HTTP transports before rmcp's
@@ -2454,10 +2351,17 @@ impl LocalMachine {
     /// itself own the execution gate. Putting these calls behind that same gate
     /// would make a serialized job impossible to poll or cancel. Starting a job
     /// is deliberately excluded: it acquires and transfers the gate to the job.
-    fn is_job_control_tool(name: &str) -> bool {
+    fn bypass_outer_operation_gate(name: &str) -> bool {
         matches!(
             name,
-            "job_list" | "job_get" | "job_output" | "job_ack" | "job_cancel"
+            "batch"
+                | "job_start"
+                | "job_restart"
+                | "job_list"
+                | "job_get"
+                | "job_output"
+                | "job_ack"
+                | "job_cancel"
         )
     }
 
@@ -2561,8 +2465,6 @@ impl rmcp::ServerHandler for LocalMachine {
                         self.config.max_shell_timeout_secs,
                         self.config.max_output_bytes,
                     );
-                    tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
-                    tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
                     tools::jobs::with_job_limits(
                         &mut tool,
                         self.config.max_shell_timeout_secs,
@@ -2585,8 +2487,6 @@ impl rmcp::ServerHandler for LocalMachine {
                 self.config.max_shell_timeout_secs,
                 self.config.max_output_bytes,
             );
-            tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
-            tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
             tools::jobs::with_job_limits(
                 &mut tool,
                 self.config.max_shell_timeout_secs,
@@ -2696,35 +2596,35 @@ impl rmcp::ServerHandler for LocalMachine {
             return result;
         }
 
-        let context = ToolCallContext::new(self, request, context);
-
-        // Linux native filesystem tools use descriptor-rooted operations;
-        // independent MCP requests may execute concurrently by default.
-        // --serialize opts into exclusive execution for predictable ordering.
-        // Other platforms retain their conservative operation gate until
-        // equivalent secure handle-based filesystem access is available.
-        let result = if Self::is_job_control_tool(&name) {
-            self.policy_tool_router().call(context).await
+        // Shared native filesystem calls and legacy/non-filesystem routes use
+        // the same outer product ordering policy. The shared CapabilitySet owns
+        // native authorization/path/mutation safety; --serialize remains an
+        // explicit product-wide ordering option.
+        let result = if Self::bypass_outer_operation_gate(&name) {
+            self.dispatch_tool_call(request, context, result_budget)
+                .await
         } else if self.serialize {
             let _guard = self.operation_gate.write().await;
-            self.policy_tool_router().call(context).await
+            self.dispatch_tool_call(request, context, result_budget)
+                .await
         } else {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                // Native file operations use checked directory handles, and
-                // Bubblewrap gives each shell its own process/filesystem view.
-                self.policy_tool_router().call(context).await
+                self.dispatch_tool_call(request, context, result_budget)
+                    .await
             }
             #[cfg(windows)]
             {
-                // Until Windows gets descriptor-relative tools,
-                // preserve their conservative filesystem topology gate.
+                // Preserve the conservative Windows topology gate even though
+                // the shared backend itself is handle-pinned and fail-closed.
                 if Self::is_concurrent_read_tool(&name) {
                     let _guard = self.operation_gate.read().await;
-                    self.policy_tool_router().call(context).await
+                    self.dispatch_tool_call(request, context, result_budget)
+                        .await
                 } else {
                     let _guard = self.operation_gate.write().await;
-                    self.policy_tool_router().call(context).await
+                    self.dispatch_tool_call(request, context, result_budget)
+                        .await
                 }
             }
         };
@@ -2741,11 +2641,24 @@ impl rmcp::ServerHandler for LocalMachine {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::AsyncSeekExt;
-
     use super::*;
 
     use crate::mcp::tools::test_support::access;
+
+    fn shared_call(
+        machine: &LocalMachine,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> CallToolResult {
+        crate::mcp::tools::shared_native::execute(
+            machine,
+            name,
+            arguments,
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("shared native projection")
+    }
 
     #[tokio::test]
     async fn inspection_and_runtime_advertise_the_same_policy_tool_surface() {
@@ -2939,20 +2852,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_targets_accept_regular_files_only() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let regular = root.join("regular");
-        let directory = root.join("directory");
-        let missing = root.join("missing");
-        std::fs::write(&regular, b"x").unwrap();
-        std::fs::create_dir(&directory).unwrap();
-
-        let machine = LocalMachine::new(MachineConfig {
+    async fn prepared_machine_cannot_rebudget_an_existing_job_session() {
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        let base = tempfile::tempdir_in(&temp_root).unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let jobs = crate::jobs::JobManager::new(std::time::Duration::from_secs(60)).unwrap();
+        let mut config = MachineConfig {
             access: AccessSpec {
-                base_dir: root.clone(),
-                read_roots: vec![root.clone()],
-                write_roots: vec![root],
+                base_dir: base,
+                read_roots: vec![temp_root.clone()],
+                write_roots: vec![temp_root],
                 deny_read_roots: Vec::new(),
                 deny_write_roots: Vec::new(),
                 unrestricted_fs: false,
@@ -2966,23 +2875,81 @@ mod tests {
             allow_shell: false,
             sandbox_shell: false,
             allow_network: false,
-            max_shell_timeout_secs: 5,
+            max_shell_timeout_secs: 60,
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
-
             task_result_budget: None,
-            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
-
+            job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
-        })
-        .await
-        .unwrap();
+        };
+        let prepared = LocalMachine::prepare_with_job_root(config.clone(), jobs.protected_path())
+            .await
+            .unwrap();
+        let expected = local_prepared_policy_fingerprint(prepared.authority_value()).unwrap();
+        assert!(LocalMachine::from_prepared(prepared, jobs.clone(), expected).is_ok());
 
-        assert!(machine.require_regular_file(&regular).await.is_ok());
-        assert!(machine.require_regular_file(&missing).await.is_err());
-        assert!(machine.require_regular_file(&directory).await.is_err());
+        config.job_spool_bytes = crate::limits::MIN_JOB_SPOOL_BYTES;
+        let prepared = LocalMachine::prepare_with_job_root(config, jobs.protected_path())
+            .await
+            .unwrap();
+        let expected = local_prepared_policy_fingerprint(prepared.authority_value()).unwrap();
+        let error = LocalMachine::from_prepared(prepared, jobs, expected)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("resource policy differs from job session"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_machine_rejects_a_different_bound_execution_policy() {
+        let temp_root = std::env::temp_dir().canonicalize().unwrap();
+        let base = tempfile::tempdir_in(&temp_root).unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let jobs = crate::jobs::JobManager::new(std::time::Duration::from_secs(60)).unwrap();
+        assert!(jobs.bind_policy([0xA5; 32]));
+        let config = MachineConfig {
+            access: AccessSpec {
+                base_dir: base,
+                read_roots: vec![temp_root.clone()],
+                write_roots: vec![temp_root],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+            task_result_budget: None,
+            job_retention_secs: 60,
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        };
+        let prepared = LocalMachine::prepare_with_job_root(config, jobs.protected_path())
+            .await
+            .unwrap();
+        let expected = local_prepared_policy_fingerprint(prepared.authority_value()).unwrap();
+        assert_ne!(expected, [0xA5; 32]);
+        let error = LocalMachine::from_prepared(prepared, jobs, expected)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("prepared execution authority differs from Job session"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -3027,13 +2994,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(machine.ensure_not_protected(&spool).is_err());
-        let error = machine
-            .resolve_existing(spool.to_str().unwrap(), AccessNeed::Read)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("protected by dotlink"), "{error}");
+        let result = shared_call(
+            &machine,
+            "read",
+            serde_json::json!({"path":spool.to_string_lossy(),"numbered":false}),
+        );
+        assert_eq!(result.is_error, Some(true), "{result:?}");
     }
 
     #[tokio::test]
@@ -3075,12 +3041,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            machine
-                .resolve_existing("runtime.key", AccessNeed::Read)
-                .await
-                .is_err()
+        let result = shared_call(
+            &machine,
+            "read",
+            serde_json::json!({"path":"runtime.key","numbered":false}),
         );
+        assert_eq!(result.is_error, Some(true), "{result:?}");
     }
 
     #[cfg(unix)]
@@ -3130,24 +3096,22 @@ mod tests {
 
         assert!(machine.config.protected_paths.contains(&alias));
         assert!(machine.config.protected_paths.contains(&target));
-        assert!(
-            machine
-                .resolve_for_create("credential-link", AccessNeed::Write)
-                .await
-                .is_err()
+        let denied = shared_call(
+            &machine,
+            "write",
+            serde_json::json!({"path":"credential-link","content":"replacement"}),
         );
+        assert_eq!(denied.is_error, Some(true), "{denied:?}");
 
-        // If the alias disappears after startup, an authorized native write
-        // still cannot install a replacement at its lexical name.
+        // If the alias disappears after startup, the exact lexical exclusion
+        // still prevents a replacement at that model-visible name.
         std::fs::remove_file(&alias).unwrap();
-        let result: Result<()> = async {
-            let path = machine
-                .resolve_for_create("credential-link", AccessNeed::Write)
-                .await?;
-            machine.write_file_atomic(&path, b"replacement").await
-        }
-        .await;
-        assert!(result.is_err());
+        let denied = shared_call(
+            &machine,
+            "write",
+            serde_json::json!({"path":"credential-link","content":"replacement"}),
+        );
+        assert_eq!(denied.is_error, Some(true), "{denied:?}");
         assert!(!alias.exists());
         assert_eq!(std::fs::read(&target).unwrap(), b"secret");
     }
@@ -3203,12 +3167,12 @@ mod tests {
 
         std::fs::create_dir(target.parent().unwrap()).unwrap();
         std::fs::write(&target, b"secret").unwrap();
-        assert!(
-            machine
-                .resolve_existing("future/runtime.key", AccessNeed::Read)
-                .await
-                .is_err()
+        let denied = shared_call(
+            &machine,
+            "read",
+            serde_json::json!({"path":"future/runtime.key","numbered":false}),
         );
+        assert_eq!(denied.is_error, Some(true), "{denied:?}");
     }
 
     #[cfg(unix)]
@@ -3255,36 +3219,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            machine
-                .resolve_for_create("config-link", AccessNeed::Write)
-                .await
-                .is_err()
+        let denied = shared_call(
+            &machine,
+            "write",
+            serde_json::json!({"path":"config-link","content":"replacement"}),
         );
-    }
-
-    #[tokio::test]
-    async fn bounded_read_enforces_real_io_limit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("growing.txt");
-        std::fs::write(&path, b"abcdefghij").unwrap();
-        let mut file = fs::File::open(&path).await.unwrap();
-        assert!(LocalMachine::read_bounded(&mut file, 4).await.is_err());
-        file.rewind().await.unwrap();
-        assert_eq!(
-            LocalMachine::read_bounded(&mut file, 10).await.unwrap(),
-            b"abcdefghij"
-        );
-        file.rewind().await.unwrap();
-        assert_eq!(
-            LocalMachine::read_bounded(&mut file, 11).await.unwrap(),
-            b"abcdefghij"
-        );
+        assert_eq!(denied.is_error, Some(true), "{denied:?}");
     }
 
     #[test]
     fn only_explicit_pure_reads_share_the_operation_gate() {
-        for name in ["ls", "read", "bread"] {
+        for name in ["ls", "find", "grep", "read", "bread"] {
             assert!(LocalMachine::is_concurrent_read_tool(name), "{name}");
         }
         for name in [
@@ -3293,6 +3238,7 @@ mod tests {
             "bwrite",
             "bedit",
             "bash",
+            "pwsh",
             "powershell",
             "future_tool",
         ] {
@@ -3310,7 +3256,24 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect();
-        assert_eq!(names, ["bread", "grep", "ls", "read"]);
+        assert_eq!(
+            names,
+            [
+                "batch",
+                "bread",
+                "find",
+                "grep",
+                "job_ack",
+                "job_cancel",
+                "job_get",
+                "job_list",
+                "job_output",
+                "job_restart",
+                "job_start",
+                "ls",
+                "read"
+            ]
+        );
     }
 
     #[test]
@@ -3328,7 +3291,27 @@ mod tests {
         assert_eq!(
             names,
             [
-                "bedit", "bread", "bwrite", "edit", "grep", "ls", "patch", "read", "write"
+                "batch",
+                "bedit",
+                "bread",
+                "bwrite",
+                "cp",
+                "edit",
+                "find",
+                "grep",
+                "job_ack",
+                "job_cancel",
+                "job_get",
+                "job_list",
+                "job_output",
+                "job_restart",
+                "job_start",
+                "ls",
+                "mv",
+                "patch",
+                "read",
+                "rm",
+                "write"
             ]
         );
     }
@@ -3343,7 +3326,23 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect();
-        assert_eq!(names, ["bwrite", "write"]);
+        assert_eq!(
+            names,
+            [
+                "batch",
+                "bwrite",
+                "job_ack",
+                "job_cancel",
+                "job_get",
+                "job_list",
+                "job_output",
+                "job_restart",
+                "job_start",
+                "mv",
+                "rm",
+                "write"
+            ]
+        );
     }
 
     #[test]
@@ -3357,7 +3356,65 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect();
-        assert_eq!(names, ["bread", "bwrite", "grep", "ls", "read", "write"]);
+        assert_eq!(
+            names,
+            [
+                "batch",
+                "bread",
+                "bwrite",
+                "cp",
+                "find",
+                "grep",
+                "job_ack",
+                "job_cancel",
+                "job_get",
+                "job_list",
+                "job_output",
+                "job_restart",
+                "job_start",
+                "ls",
+                "mv",
+                "read",
+                "rm",
+                "write"
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_schema_advertises_only_current_policy_node_tools() {
+        let names = |caps: Capabilities| {
+            let router = LocalMachine::tool_router_for_policy(caps);
+            let batch = router.get("batch").expect("batch route");
+            batch.input_schema["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let read = names(Capabilities {
+            read: true,
+            ..Default::default()
+        });
+        assert_eq!(read, ["find", "grep", "ls", "read"]);
+        let write = names(Capabilities {
+            write: true,
+            ..Default::default()
+        });
+        assert_eq!(write, ["bwrite", "mv", "rm", "write"]);
+        let shell = names(Capabilities {
+            read: true,
+            shell: true,
+            ..Default::default()
+        });
+        let platform_shell = platform_shell_node_tool().name();
+        assert!(shell.contains(&platform_shell.to_owned()));
+        assert!(!shell.contains(&if cfg!(windows) {
+            "bash".to_owned()
+        } else {
+            "powershell".to_owned()
+        }));
     }
 
     #[test]
@@ -3371,47 +3428,24 @@ mod tests {
         .into_iter()
         .map(|tool| tool.name.to_string())
         .collect();
-        if cfg!(windows) {
-            assert_eq!(
-                names,
-                [
-                    "bread",
-                    "grep",
-                    "job_ack",
-                    "job_cancel",
-                    "job_get",
-                    "job_list",
-                    "job_output",
-                    "job_start",
-                    "ls",
-                    "powershell",
-                    "read"
-                ]
-            );
-        } else {
-            assert_eq!(
-                names,
-                [
-                    "bash",
-                    "bread",
-                    "grep",
-                    "job_ack",
-                    "job_cancel",
-                    "job_get",
-                    "job_list",
-                    "job_output",
-                    "job_start",
-                    "ls",
-                    "read"
-                ]
-            );
+        let selected = platform_shell_node_tool().name();
+        assert!(names.contains(&selected.to_owned()), "{names:?}");
+        for other in ["bash", "pwsh", "powershell"] {
+            if other != selected {
+                assert!(!names.contains(&other.to_owned()), "{names:?}");
+            }
         }
     }
 
     #[test]
     fn tool_table_matches_the_advertised_router() {
         // One table drives visibility; prove it covers every route exactly once.
-        let all: Vec<String> = LocalMachine::all_tools()
+        let mut router = LocalMachine::all_tools();
+        tools::shared_native::canonicalize_router(
+            &mut router,
+            aw_tools::filesystem::schema::SchemaCaps::default(),
+        );
+        let all: Vec<String> = router
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
@@ -3431,6 +3465,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "ls",
+                "find",
                 "grep",
                 "read",
                 "bread",
@@ -3591,6 +3626,7 @@ mod tests {
             max_output_bytes: 4096,
             max_read_bytes: 4096,
             max_write_bytes: 4096,
+            shared_caps: tools::shared_native::caps(4096, 4096).unwrap(),
             task_result_budget: None,
             protected_paths: Vec::new(),
         };
@@ -3601,6 +3637,7 @@ mod tests {
         .unwrap();
         let first = PreparedLaunchers {
             shell: Some(tools::shell::PreparedExecutable::prepare(launcher.clone()).unwrap()),
+            shell_tool: Some(platform_shell_node_tool()),
             #[cfg(target_os = "linux")]
             bwrap: None,
         };
@@ -3613,6 +3650,7 @@ mod tests {
         std::fs::rename(replacement, &launcher).unwrap();
         let second = PreparedLaunchers {
             shell: Some(tools::shell::PreparedExecutable::prepare(launcher).unwrap()),
+            shell_tool: Some(platform_shell_node_tool()),
             #[cfg(target_os = "linux")]
             bwrap: None,
         };
@@ -3681,19 +3719,54 @@ mod tests {
     }
 
     #[test]
-    fn the_shell_predicate_is_derived_from_the_tool_table() {
-        // Exactly one advertised tool is the platform's shell: every other
-        // consumer (schema limits, delivery reserve, logging) asks this.
-        let platform_shell = match cfg!(windows) {
-            true => "powershell",
-            false => "bash",
+    fn exact_prepared_windows_shell_identity_controls_router_and_graph_schema() {
+        let caps = tools::shared_native::caps(4096, 4096).unwrap();
+        let capabilities = Capabilities {
+            read: true,
+            shell: true,
+            ..Default::default()
         };
+        for (prepared, present, absent) in [
+            (
+                aw_tools::filesystem::batch::NodeTool::Pwsh,
+                "pwsh",
+                "powershell",
+            ),
+            (
+                aw_tools::filesystem::batch::NodeTool::Powershell,
+                "powershell",
+                "pwsh",
+            ),
+        ] {
+            let router =
+                LocalMachine::tool_router_for_policy_with_caps(capabilities, caps, Some(prepared));
+            assert!(router.get(present).is_some(), "missing {present}");
+            assert!(router.get(absent).is_none(), "unexpected {absent}");
+            let batch = router.get("batch").expect("batch route");
+            let node_names =
+                batch.input_schema["properties"]["ops"]["items"]["prefixItems"][0]["enum"]
+                    .as_array()
+                    .expect("Graph tool enum")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>();
+            assert!(node_names.contains(&present), "{node_names:?}");
+            assert!(!node_names.contains(&absent), "{node_names:?}");
+        }
+    }
+
+    #[test]
+    fn shell_predicate_classifies_canonical_platform_interpreters() {
         let accepted = TOOL_SPECS
             .iter()
             .filter(|spec| is_shell_tool(spec.name))
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert_eq!(accepted, [platform_shell]);
+        if cfg!(windows) {
+            assert_eq!(accepted, ["pwsh", "powershell"]);
+        } else {
+            assert_eq!(accepted, ["bash"]);
+        }
         assert!(!is_shell_tool("read"));
         assert!(!is_shell_tool("future_tool"));
     }
@@ -3719,12 +3792,18 @@ mod tests {
             [
                 "write",
                 "bwrite",
+                "cp",
+                "mv",
+                "rm",
                 "edit",
                 "patch",
                 "bedit",
                 "bash",
+                "pwsh",
                 "powershell",
+                "batch",
                 "job_start",
+                "job_restart",
             ]
         );
         for spec in TOOL_SPECS {
@@ -3779,6 +3858,8 @@ mod tests {
         .unwrap();
 
         let error = machine
+            .config
+            .access
             .resolve_existing("secret", AccessNeed::Read)
             .await
             .unwrap_err()

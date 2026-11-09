@@ -2125,7 +2125,19 @@ pub(crate) fn atomic_write_private(
     contents: &[u8],
     harden_parent: bool,
 ) -> Result<()> {
-    atomic_write_private_with_sync(path, contents, harden_parent, sync_parent_directory)
+    atomic_write_private_with_sync(path, contents, harden_parent, sync_parent_directory, false)
+}
+
+/// Correctness-state writer: a successful return proves the private file's
+/// commit reached the platform durability boundary. Callers must tolerate an
+/// error after rename leaving the new file present; they must not publish the
+/// external effect that depends on this record until this returns `Ok(())`.
+pub(crate) fn atomic_write_private_durable(
+    path: &Path,
+    contents: &[u8],
+    harden_parent: bool,
+) -> Result<()> {
+    atomic_write_private_with_sync(path, contents, harden_parent, sync_parent_directory, true)
 }
 
 fn atomic_write_private_with_sync(
@@ -2133,6 +2145,7 @@ fn atomic_write_private_with_sync(
     contents: &[u8],
     harden_parent: bool,
     sync: impl FnOnce(&Path) -> Result<()>,
+    require_sync: bool,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -2170,10 +2183,20 @@ fn atomic_write_private_with_sync(
         file.sync_all()?;
         drop(file);
 
-        // Rename is the commit boundary. No error returned afterward may
-        // trigger a rollback of a credential paired with this configuration.
+        // Rename is the file commit boundary. Ordinary profile writes preserve
+        // their existing no-rollback semantics after this point. Correctness
+        // records use require_sync=true and may report durability uncertainty;
+        // their caller has not yet published the dependent external effect.
         atomic_replace_file(&temp, path)?;
         if let Err(error) = sync(path) {
+            if require_sync {
+                return Err(error).with_context(|| {
+                    format!(
+                        "private file {} committed but durability is unconfirmed",
+                        path.display()
+                    )
+                });
+            }
             tracing::warn!(%error, path = %path.display(),
                 "private file committed, but directory durability is unconfirmed");
         }
@@ -2287,10 +2310,10 @@ fn save_config_locked(
     if let Some((key_path, bytes)) = runtime_key {
         // A never-before-referenced file. On a failed or interrupted write it
         // can be discarded without affecting the currently selected key.
-        atomic_write_private(&key_path, &bytes, true)?;
-        // Make the key's directory entry durable *before* the config points
-        // to it. Unlike the final rename, this is still a pre-commit error.
-        sync_parent_directory(&key_path)?;
+        // The credential generation must be durably reachable before the
+        // profile can select it. Unlike the later profile commit, directory
+        // durability uncertainty is still a pre-selection error here.
+        crate::private_state::write_durable(&key_path, &bytes)?;
     }
     atomic_write_private(&path, &profile_bytes, config_parent_is_dotlink_owned())?;
 
@@ -2552,7 +2575,7 @@ fn protected_paths_for_config(
         dotlink_config_dir()?,
         config_parent_is_dotlink_owned(),
     )?;
-    protected.push(oauth::state_dir()?);
+    protected.push(crate::private_state::state_dir()?);
     // Lexical env paths are masked even while dormant, without opening them.
     protected.extend(credentials::protected_paths());
     if let Some(source) = runtime_source {
@@ -3536,10 +3559,33 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("config.jsonc");
         std::fs::write(&target, b"old").unwrap();
-        let result = atomic_write_private_with_sync(&target, b"new", false, |_| {
-            anyhow::bail!("injected post-commit fsync failure")
-        });
+        let result = atomic_write_private_with_sync(
+            &target,
+            b"new",
+            false,
+            |_| anyhow::bail!("injected post-commit fsync failure"),
+            false,
+        );
         assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn durable_private_write_reports_failed_directory_sync_after_committed_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("record.json");
+        std::fs::write(&target, b"old").unwrap();
+        let result = atomic_write_private_with_sync(
+            &target,
+            b"new",
+            false,
+            |_| anyhow::bail!("injected post-commit fsync failure"),
+            true,
+        );
+        assert!(result.is_err(), "{result:?}");
+        // The record may have reached the namespace even though durability is
+        // uncertain. A correctness caller must fail before its dependent effect;
+        // later reconciliation can retire this harmless orphan.
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 

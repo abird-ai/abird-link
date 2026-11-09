@@ -33,7 +33,7 @@ use tokio::{
     process::Command,
     time::{Instant, sleep_until, timeout_at},
 };
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::{sync::CancellationToken as DrainStop, task::AbortOnDropHandle};
 
 use super::{LocalMachine, dot, resolve_capped, tool_error};
 #[cfg(target_os = "linux")]
@@ -43,7 +43,7 @@ use crate::mcp::{
 use crate::{
     jobs::{
         JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobStatus, JobWait,
-        SpoolWriterGuard, StreamSummary,
+        SharedShellWriters, SpoolWriterGuard, StreamSummary,
     },
     mcp::RuntimeConfig,
 };
@@ -86,6 +86,11 @@ pub(crate) struct ShellArgs {
     /// Output byte limit per stream. Defaults to the profile ceiling (max_output_bytes); clamped to it.
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
+
+    /// Advisory expected write scopes for scheduling. Omitted means unknown;
+    /// [] means the caller expects no writes. Never filesystem authority.
+    #[serde(default)]
+    pub(crate) writes: Option<Vec<String>>,
 }
 
 /// Shell progress is a bare heartbeat: the caller cannot know how much of an
@@ -196,24 +201,115 @@ pub(crate) fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usiz
 /// Drain a long-running job stream directly into its private spool file. The
 /// stored prefix is bounded independently of response paging, while the pipe is
 /// always fully drained so a noisy child can never deadlock on a full pipe.
-type SpoolTask = AbortOnDropHandle<std::io::Result<StreamSummary>>;
-
-async fn abort_and_quiesce_spool_tasks(job: &JobHandle, stdout: &SpoolTask, stderr: &SpoolTask) {
-    // Seal registration before requesting cancellation. This makes the transition
-    // one-way even if a future drain implementation grows detached helper tasks.
+async fn stop_and_quiesce_spool_tasks(job: &JobHandle, stop: &DrainStop) {
+    // Seal registration first, then wake both drain loops. Dropping a read future
+    // because the process tree was intentionally stopped is not a spool I/O
+    // failure: the retained prefix remains trustworthy but incomplete.
     job.seal_spool_writers();
-    stdout.abort();
-    stderr.abort();
-    // A collection timeout may already have consumed one JoinHandle result while
-    // waiting for the other, so task handles are not a reusable completion barrier.
-    // Writer lifetime is registered before spawn and remains authoritative even
-    // after a JoinHandle result was consumed or its owner was dropped.
+    stop.cancel();
     job.wait_spool_writers_idle().await;
 }
 
+struct SharedDrainWriter {
+    writer: aw_tools::filesystem::job_manager::OutputWriter,
+    _lifetime: SpoolWriterGuard,
+    finished: bool,
+}
+
+impl SharedDrainWriter {
+    fn new(
+        writer: aw_tools::filesystem::job_manager::OutputWriter,
+        lifetime: SpoolWriterGuard,
+    ) -> Self {
+        Self {
+            writer,
+            _lifetime: lifetime,
+            finished: false,
+        }
+    }
+
+    fn fail(&mut self) {
+        let _ = self.writer.mark_failed();
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        let result = self.writer.finish().map_err(|error| {
+            std::io::Error::other(format!("shared output finish failed: {error:?}"))
+        });
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for SharedDrainWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.writer.mark_failed();
+            let _ = self.writer.finish();
+            self.finished = true;
+        }
+    }
+}
+
+async fn spool_shared_job_output<R>(
+    mut reader: R,
+    writer: aw_tools::filesystem::job_manager::OutputWriter,
+    writer_guard: SpoolWriterGuard,
+    stop: DrainStop,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut sink = SharedDrainWriter::new(writer, writer_guard);
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut failed: Option<std::io::Error> = None;
+    loop {
+        let read = tokio::select! {
+            biased;
+            _ = stop.cancelled() => {
+                let finish = sink.finish();
+                if let Some(error) = failed {
+                    return Err(error);
+                }
+                return finish;
+            }
+            read = reader.read(&mut buffer) => match read {
+                Ok(read) => read,
+                Err(error) => {
+                    sink.fail();
+                    let _ = sink.finish();
+                    return Err(error);
+                }
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        if failed.is_some() {
+            let observed = u64::try_from(read).unwrap_or(u64::MAX);
+            let _ = sink.writer.observe_after_failure(observed);
+            continue;
+        }
+        if let Err(error) = crate::blocking::run(|| sink.writer.append(&buffer[..read])) {
+            sink.fail();
+            failed = Some(std::io::Error::other(format!(
+                "shared output append failed: {error:?}"
+            )));
+        }
+    }
+    let finish = sink.finish();
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    finish
+}
+
+#[cfg(test)]
+#[cfg(test)]
 async fn spool_job_output<R>(
     mut reader: R,
     path: PathBuf,
+    job: JobHandle,
     writer_guard: SpoolWriterGuard,
 ) -> std::io::Result<StreamSummary>
 where
@@ -248,7 +344,7 @@ where
         }
         let remaining = cap.saturating_sub(stored);
         let wanted = remaining.min(read as u64);
-        let reserved = writer_guard.reserve(wanted);
+        let reserved = job.reserve_spool(wanted);
         let keep = usize::try_from(reserved).unwrap_or(read);
         if keep > 0 {
             let (written, error) = crate::blocking::run(|| {
@@ -273,7 +369,7 @@ where
             if let Some(error) = error {
                 // Successful prefix writes remain charged; release only the
                 // reservation that never reached the spool file.
-                writer_guard.release(reserved.saturating_sub(written as u64));
+                job.release_spool(reserved.saturating_sub(written as u64));
                 return Err(error);
             }
             stored = stored.saturating_add(written as u64);
@@ -289,15 +385,6 @@ where
     };
     drop(writer_guard);
     Ok(summary)
-}
-
-fn stream_summary_from_file(path: &Path, truncated: bool) -> StreamSummary {
-    let stored = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-    StreamSummary {
-        total_bytes: stored,
-        stored_bytes: stored,
-        truncated,
-    }
 }
 
 #[cfg(unix)]
@@ -1514,7 +1601,7 @@ fn shell_guard_generation(guards: &ShellGuards) -> [u8; 32] {
 }
 
 #[derive(Clone, Debug)]
-struct ShellRuntime {
+pub(crate) struct ShellRuntime {
     config: RuntimeConfig,
     launchers: crate::mcp::PreparedLaunchers,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1522,7 +1609,7 @@ struct ShellRuntime {
 }
 
 impl ShellRuntime {
-    async fn prepare_shell_command(
+    pub(crate) async fn prepare_shell_command(
         &self,
         args: &ShellArgs,
         powershell: bool,
@@ -1540,6 +1627,8 @@ impl ShellRuntime {
         if !fs::metadata(&working_dir).await?.is_dir() {
             anyhow::bail!("dir is not a directory");
         }
+        aw_tools::filesystem::write_hint::normalize(&working_dir, args.writes.as_deref())
+            .map_err(|_| anyhow::anyhow!("invalid shell writes scheduling hint"))?;
         let shell_launcher = self
             .launchers
             .shell
@@ -1578,8 +1667,21 @@ impl ShellRuntime {
         resolve_shell_guards(&self.config)
     }
 
-    fn output_limit(&self, requested: Option<usize>) -> usize {
+    pub(crate) fn output_limit(&self, requested: Option<usize>) -> usize {
         resolve_capped(requested, self.config.max_output_bytes)
+    }
+
+    pub(crate) fn job_result_context(
+        &self,
+        working_dir: &Path,
+        timeout_secs: u64,
+    ) -> JobResultContext {
+        JobResultContext {
+            dir: self.config.access.relative_display(working_dir),
+            sandboxed: self.config.sandbox_shell,
+            network: self.config.allow_network,
+            timeout_secs,
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1884,7 +1986,7 @@ async fn resolve_existing_runtime(config: &RuntimeConfig, raw: &str) -> Result<P
 }
 
 impl LocalMachine {
-    fn shell_runtime(&self) -> ShellRuntime {
+    pub(crate) fn shell_runtime(&self) -> ShellRuntime {
         ShellRuntime {
             config: self.config.clone(),
             launchers: self.launchers.clone(),
@@ -1908,10 +2010,10 @@ impl LocalMachine {
     async fn run_shell_to_completion(
         &self,
         args: ShellArgs,
-        powershell: bool,
+        shell_tool: aw_tools::filesystem::batch::NodeTool,
         heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<CallToolResult, McpError> {
-        let started = match self.start_shell_job(args, powershell, None) {
+        let started = match self.start_shell_job(args, shell_tool, None) {
             Ok(started) => started,
             Err(error) => return Ok(tool_error(error)),
         };
@@ -1953,7 +2055,12 @@ impl LocalMachine {
         powershell: bool,
         heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<CallToolResult, McpError> {
-        self.run_shell_to_completion(args, powershell, heartbeat)
+        let shell_tool = if powershell {
+            aw_tools::filesystem::batch::NodeTool::Powershell
+        } else {
+            aw_tools::filesystem::batch::NodeTool::Bash
+        };
+        self.run_shell_to_completion(args, shell_tool, heartbeat)
             .await
     }
 
@@ -2110,36 +2217,17 @@ impl LocalMachine {
         heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<Option<CallToolResponse>, McpError> {
         let name = request.name.as_ref();
-        let explicit_background = name == "job_start";
-        if !explicit_background && !crate::mcp::is_shell_tool(name) {
+        if !crate::mcp::is_shell_tool(name) {
             return Ok(None);
         }
         if !self.has_tool_for_policy(name) {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
-        let args = if explicit_background {
-            super::jobs::decode_job_start(arguments)
-        } else {
-            serde_json::from_value::<ShellArgs>(Value::Object(arguments))
-        }
-        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let powershell = if explicit_background {
-            cfg!(windows)
-        } else {
-            name == "powershell"
-        };
-
-        if explicit_background {
-            let started = self
-                .start_shell_job(args, powershell, request_key)
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let receipt = self
-                .jobs
-                .expose_compatibility(&started.id)
-                .map_err(crate::jobs::JobError::into_mcp)?;
-            return Ok(Some(CallToolResponse::Complete(receipt)));
-        }
+        let args = serde_json::from_value::<ShellArgs>(Value::Object(arguments))
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let shell_tool = crate::mcp::shell_node_tool(name)
+            .ok_or_else(|| McpError::invalid_params("unknown shell tool", None))?;
 
         // Every ordinary shell call starts exactly one durable execution. The
         // transport decides only how long to wait for that handle. A fast
@@ -2147,7 +2235,7 @@ impl LocalMachine {
         // its requested timeout is long; a slow command keeps running after the
         // synchronous response window closes.
         let started = self
-            .start_shell_job(args, powershell, request_key)
+            .start_shell_job(args, shell_tool, request_key)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
         if !started.is_new
@@ -2223,7 +2311,7 @@ impl LocalMachine {
     pub(crate) fn start_shell_job(
         &self,
         args: ShellArgs,
-        powershell: bool,
+        shell_tool: aw_tools::filesystem::batch::NodeTool,
         request_key: Option<String>,
     ) -> Result<crate::jobs::JobStart> {
         if args.command.trim().is_empty() {
@@ -2234,6 +2322,23 @@ impl LocalMachine {
         let runtime = self.shell_runtime();
         let operation_gate = (self.serialize || cfg!(windows)).then(|| self.operation_gate.clone());
         let output_limit = runtime.output_limit(args.max_output_bytes);
+        if !shell_tool.is_shell() || self.launchers.shell_tool != Some(shell_tool) {
+            anyhow::bail!("shell interpreter is not the exact prepared runtime tool");
+        }
+        let powershell = matches!(
+            shell_tool,
+            aw_tools::filesystem::batch::NodeTool::Pwsh
+                | aw_tools::filesystem::batch::NodeTool::Powershell
+        );
+        let shared_tool = shell_tool;
+        let shared_arguments = serde_json::json!({
+            "command": args.command.clone(),
+            "dir": args.dir.clone(),
+            "stdin": args.stdin.clone(),
+            "timeout_secs": timeout_secs,
+            "max_output_bytes": output_limit,
+            "writes": args.writes.clone(),
+        });
         crate::blocking::run(|| {
             self.jobs.spawn(
                 timeout_secs,
@@ -2278,6 +2383,29 @@ impl LocalMachine {
                             StreamSummary::default(),
                         );
                     }
+                    let Some(deadline) =
+                        Instant::now().checked_add(Duration::from_secs(timeout_secs))
+                    else {
+                        let message =
+                            format!("timeout_secs {timeout_secs} is too large to schedule");
+                        return JobCompletion::failed(message);
+                    };
+                    let shared_writers = match job.claim_prepared_shell(
+                        shared_tool,
+                        shared_arguments,
+                        shell_guard_generation,
+                        output_limit,
+                        crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM,
+                    ) {
+                        Ok(writers) => writers,
+                        Err(error) => {
+                            return JobCompletion::internal_failed(
+                                format!("shared shell lifecycle admission failed: {error}"),
+                                StreamSummary::default(),
+                                StreamSummary::default(),
+                            );
+                        }
+                    };
                     crate::shell_process::configure(&mut command);
                     crate::credentials::hide_from_child(&mut command)
                         .stdin(if args.stdin.is_some() {
@@ -2288,19 +2416,6 @@ impl LocalMachine {
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .kill_on_drop(true);
-                    if !job.mark_running(shell_guard_generation) {
-                        return JobCompletion::cancelled(
-                            StreamSummary::default(),
-                            StreamSummary::default(),
-                        );
-                    }
-                    let Some(deadline) =
-                        Instant::now().checked_add(Duration::from_secs(timeout_secs))
-                    else {
-                        let message =
-                            format!("timeout_secs {timeout_secs} is too large to schedule");
-                        return JobCompletion::failed(message);
-                    };
                     let result_context = JobResultContext {
                         dir: runtime.config.access.relative_display(&working_dir),
                         sandboxed: runtime.config.sandbox_shell,
@@ -2312,6 +2427,8 @@ impl LocalMachine {
                         args.stdin,
                         deadline,
                         job,
+                        1,
+                        shared_writers,
                         result_context,
                     )
                     .await;
@@ -2322,21 +2439,76 @@ impl LocalMachine {
         })
     }
 
-    async fn run_shell_job(
+    fn tree_stop_proven(
+        sandboxed: bool,
+        containment_terminated: bool,
+        direct_child_stopped: bool,
+    ) -> bool {
+        if !direct_child_stopped || !containment_terminated {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Bubblewrap uses --unshare-pid, so once the containing launcher is
+            // stopped the PID namespace cannot retain escaped descendants.
+            sandboxed
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let _ = sandboxed;
+            false
+        }
+    }
+
+    pub(crate) async fn run_shell_job(
         mut command: Command,
         stdin_text: Option<String>,
         deadline: Instant,
         job: JobHandle,
+        coordinate: usize,
+        shared_writers: SharedShellWriters,
         result_context: JobResultContext,
     ) -> JobCompletion {
+        if job.cancel.is_cancelled() {
+            job.settle_node_unlaunched(coordinate);
+            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_context(result_context);
+        }
         if Instant::now() >= deadline {
+            job.settle_node_unlaunched(coordinate);
+            return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
+                .with_context(result_context);
+        }
+        if let Err(error) = job.mark_node_launched(coordinate) {
+            return JobCompletion::internal_failed(
+                format!("shared shell start checkpoint failed before process launch: {error}"),
+                StreamSummary::default(),
+                StreamSummary::default(),
+            )
+            .with_context(result_context);
+        }
+        if job.cancel.is_cancelled() {
+            let _ = shared_writers.stdout.finish();
+            let _ = shared_writers.stderr.finish();
+            return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_context(result_context);
+        }
+        if Instant::now() >= deadline {
+            let _ = shared_writers.stdout.finish();
+            let _ = shared_writers.stderr.finish();
             return JobCompletion::timed_out(StreamSummary::default(), StreamSummary::default())
                 .with_context(result_context);
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return JobCompletion::failed(error.to_string()).with_context(result_context);
+                let _ = shared_writers.stdout.finish();
+                let _ = shared_writers.stderr.finish();
+                return JobCompletion::spawn_failed(error.to_string()).with_context(result_context);
             }
         };
         let mut process_tree = match crate::shell_process::Guard::attach(&child) {
@@ -2350,7 +2522,7 @@ impl LocalMachine {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                process_tree.terminate();
+                let _ = process_tree.terminate();
                 Self::terminate_child(&mut child).await;
                 return JobCompletion::failed("failed to capture child stdout")
                     .with_context(result_context);
@@ -2359,27 +2531,31 @@ impl LocalMachine {
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                process_tree.terminate();
+                let _ = process_tree.terminate();
                 Self::terminate_child(&mut child).await;
                 return JobCompletion::failed("failed to capture child stderr")
                     .with_context(result_context);
             }
         };
         let Some([stdout_writer, stderr_writer]) = job.begin_spool_writers() else {
-            process_tree.terminate();
+            let _ = process_tree.terminate();
             Self::terminate_child(&mut child).await;
             return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
+                .with_incomplete_output()
                 .with_context(result_context);
         };
-        let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
+        let drain_stop = DrainStop::new();
+        let mut stdout_task = AbortOnDropHandle::new(tokio::spawn(spool_shared_job_output(
             stdout,
-            job.stdout_path.clone(),
+            shared_writers.stdout,
             stdout_writer,
+            drain_stop.clone(),
         )));
-        let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_job_output(
+        let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_shared_job_output(
             stderr,
-            job.stderr_path.clone(),
+            shared_writers.stderr,
             stderr_writer,
+            drain_stop.clone(),
         )));
 
         let (mut stdin_task, mut stdin_rx) = match stdin_text {
@@ -2393,9 +2569,9 @@ impl LocalMachine {
                     (Some(task), Some(rx))
                 }
                 None => {
-                    process_tree.terminate();
+                    let _ = process_tree.terminate();
                     Self::terminate_child(&mut child).await;
-                    abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
+                    stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
                     return JobCompletion::failed("failed to capture child stdin")
                         .with_context(result_context);
                 }
@@ -2448,28 +2624,39 @@ impl LocalMachine {
         let mut exit_status = None;
         let mut terminal = JobStatus::Completed;
         let mut terminal_error = None;
+        let mut stop_proven = true;
         match outcome {
             WaitOutcome::Child(Ok(status)) => exit_status = Some(status),
             WaitOutcome::Child(Err(error)) => {
                 terminal = JobStatus::Failed;
                 terminal_error = Some(error.to_string());
-                process_tree.terminate();
+                let _ = process_tree.terminate();
                 Self::terminate_child(&mut child).await;
             }
             WaitOutcome::Timeout => {
                 terminal = JobStatus::TimedOut;
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let containment_terminated = process_tree.terminate().is_ok();
+                let direct_child_stopped = Self::terminate_child(&mut child).await;
+                stop_proven = Self::tree_stop_proven(
+                    result_context.sandboxed,
+                    containment_terminated,
+                    direct_child_stopped,
+                );
             }
             WaitOutcome::Cancelled => {
                 terminal = JobStatus::Cancelled;
-                process_tree.terminate();
-                Self::terminate_child(&mut child).await;
+                let containment_terminated = process_tree.terminate().is_ok();
+                let direct_child_stopped = Self::terminate_child(&mut child).await;
+                stop_proven = Self::tree_stop_proven(
+                    result_context.sandboxed,
+                    containment_terminated,
+                    direct_child_stopped,
+                );
             }
             WaitOutcome::StdinFailure(message) => {
                 terminal = JobStatus::Failed;
                 terminal_error = Some(message);
-                process_tree.terminate();
+                let _ = process_tree.terminate();
                 Self::terminate_child(&mut child).await;
             }
         }
@@ -2488,75 +2675,136 @@ impl LocalMachine {
             (stdout, stderr)
         })
         .await;
-        let (stdout, stderr) = match collected {
+        let (stdout, stderr, output_complete) = match collected {
             Ok((stdout_result, stderr_result)) => {
-                let stdout = match stdout_result {
-                    Ok(Ok(summary)) => summary,
+                match stdout_result {
+                    Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        process_tree.terminate();
+                        let _ = process_tree.terminate();
                         return JobCompletion::internal_failed(
                             format!("failed spooling stdout: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stdout,
+                                true,
+                            ),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stderr,
+                                true,
+                            ),
                         )
                         .with_context(result_context);
                     }
                     Err(error) => {
-                        process_tree.terminate();
+                        let _ = process_tree.terminate();
                         return JobCompletion::internal_failed(
                             format!("stdout spool task failed: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stdout,
+                                true,
+                            ),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stderr,
+                                true,
+                            ),
                         )
                         .with_context(result_context);
                     }
-                };
-                let stderr = match stderr_result {
-                    Ok(Ok(summary)) => summary,
+                }
+                match stderr_result {
+                    Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        process_tree.terminate();
+                        let _ = process_tree.terminate();
                         return JobCompletion::internal_failed(
                             format!("failed spooling stderr: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stdout,
+                                true,
+                            ),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stderr,
+                                true,
+                            ),
                         )
                         .with_context(result_context);
                     }
                     Err(error) => {
-                        process_tree.terminate();
+                        let _ = process_tree.terminate();
                         return JobCompletion::internal_failed(
                             format!("stderr spool task failed: {error}"),
-                            stream_summary_from_file(&job.stdout_path, true),
-                            stream_summary_from_file(&job.stderr_path, true),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stdout,
+                                true,
+                            ),
+                            job.shared_node_stream_summary(
+                                coordinate,
+                                crate::jobs::JobStream::Stderr,
+                                true,
+                            ),
                         )
                         .with_context(result_context);
                     }
-                };
-                (stdout, stderr)
+                }
+                (
+                    job.shared_node_stream_summary(
+                        coordinate,
+                        crate::jobs::JobStream::Stdout,
+                        false,
+                    ),
+                    job.shared_node_stream_summary(
+                        coordinate,
+                        crate::jobs::JobStream::Stderr,
+                        false,
+                    ),
+                    true,
+                )
             }
             Err(_) if terminal == JobStatus::Completed => {
-                abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
-                process_tree.terminate();
+                stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
+                let _ = process_tree.terminate();
                 return JobCompletion::internal_failed(
                     format!(
                         "collecting command output timed out after {} seconds",
                         result_context.timeout_secs
                     ),
-                    stream_summary_from_file(&job.stdout_path, true),
-                    stream_summary_from_file(&job.stderr_path, true),
+                    job.shared_node_stream_summary(
+                        coordinate,
+                        crate::jobs::JobStream::Stdout,
+                        true,
+                    ),
+                    job.shared_node_stream_summary(
+                        coordinate,
+                        crate::jobs::JobStream::Stderr,
+                        true,
+                    ),
                 )
                 .with_context(result_context);
             }
             Err(_) => {
-                abort_and_quiesce_spool_tasks(&job, &stdout_task, &stderr_task).await;
+                stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
                 (
-                    stream_summary_from_file(&job.stdout_path, true),
-                    stream_summary_from_file(&job.stderr_path, true),
+                    job.shared_node_stream_summary(
+                        coordinate,
+                        crate::jobs::JobStream::Stdout,
+                        true,
+                    ),
+                    job.shared_node_stream_summary(
+                        coordinate,
+                        crate::jobs::JobStream::Stderr,
+                        true,
+                    ),
+                    false,
                 )
             }
         };
 
-        match terminal {
+        let completion = match terminal {
             JobStatus::Completed => {
                 let status = exit_status.expect("completed job has an exit status");
                 // A normal exit may intentionally launch independent background
@@ -2567,10 +2815,22 @@ impl LocalMachine {
                     .with_context(result_context)
             }
             JobStatus::TimedOut => {
-                JobCompletion::timed_out(stdout, stderr).with_context(result_context)
+                let completion =
+                    JobCompletion::timed_out(stdout, stderr).with_context(result_context);
+                if stop_proven {
+                    completion
+                } else {
+                    completion.with_unproven_stop()
+                }
             }
             JobStatus::Cancelled => {
-                JobCompletion::cancelled(stdout, stderr).with_context(result_context)
+                let completion =
+                    JobCompletion::cancelled(stdout, stderr).with_context(result_context);
+                if stop_proven {
+                    completion
+                } else {
+                    completion.with_unproven_stop()
+                }
             }
             JobStatus::Failed => JobCompletion::failed_with_output(
                 terminal_error.unwrap_or_else(|| "shell job failed".to_owned()),
@@ -2578,13 +2838,27 @@ impl LocalMachine {
                 stderr,
             )
             .with_context(result_context),
+            JobStatus::Unknown => JobCompletion::unknown_with_output(
+                terminal_error.unwrap_or_else(|| {
+                    "shell terminal outcome is uncertain; inspect effects before retrying"
+                        .to_owned()
+                }),
+                stdout,
+                stderr,
+            )
+            .with_context(result_context),
             JobStatus::Working => unreachable!(),
+        };
+        if output_complete {
+            completion
+        } else {
+            completion.with_incomplete_output()
         }
     }
 
-    async fn terminate_child(child: &mut tokio::process::Child) {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    async fn terminate_child(child: &mut tokio::process::Child) -> bool {
+        let _ = child.start_kill();
+        child.wait().await.is_ok()
     }
 }
 
@@ -2708,8 +2982,35 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_shell_to_completion(args, false, ProgressHeartbeat::for_request(&context))
-            .await
+        self.run_shell_to_completion(
+            args,
+            aw_tools::filesystem::batch::NodeTool::Bash,
+            ProgressHeartbeat::for_request(&context),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Run a PowerShell Core (pwsh) command.",
+        annotations(
+            title = "Run pwsh command",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn pwsh(
+        &self,
+        Parameters(args): Parameters<ShellArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        self.run_shell_to_completion(
+            args,
+            aw_tools::filesystem::batch::NodeTool::Pwsh,
+            ProgressHeartbeat::for_request(&context),
+        )
+        .await
     }
 
     #[tool(
@@ -2727,13 +3028,30 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_shell_to_completion(args, true, ProgressHeartbeat::for_request(&context))
-            .await
+        self.run_shell_to_completion(
+            args,
+            aw_tools::filesystem::batch::NodeTool::Powershell,
+            ProgressHeartbeat::for_request(&context),
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_proof_requires_platform_containment_and_direct_settlement() {
+        assert!(!LocalMachine::tree_stop_proven(false, true, true));
+        assert!(!LocalMachine::tree_stop_proven(true, false, true));
+        assert!(!LocalMachine::tree_stop_proven(true, true, false));
+        #[cfg(target_os = "linux")]
+        assert!(LocalMachine::tree_stop_proven(true, true, true));
+        #[cfg(windows)]
+        assert!(LocalMachine::tree_stop_proven(false, true, true));
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert!(!LocalMachine::tree_stop_proven(true, true, true));
+    }
+
     use super::*;
     use tokio::sync::RwLock;
 
@@ -2764,6 +3082,7 @@ mod tests {
             .unwrap(),
         );
         LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(&root).unwrap(),
             config: RuntimeConfig {
                 access,
                 cache_mounts: Vec::new(),
@@ -2778,7 +3097,7 @@ mod tests {
                 max_output_bytes: max_bytes,
                 max_read_bytes: max_bytes,
                 max_write_bytes: max_bytes,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(max_bytes, max_bytes).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -2795,6 +3114,8 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs,
         }
+        .bind_test_execution_policy()
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2830,51 +3151,47 @@ mod tests {
         let manager =
             crate::jobs::JobManager::with_spool_limit(std::time::Duration::from_secs(60), 8)
                 .unwrap();
-        let (path_tx, path_rx) = tokio::sync::oneshot::channel();
-        let started = manager
-            .spawn(30, 4096, None, move |job| async move {
-                let _ = path_tx.send(job.stdout_path.clone());
-                // Four bytes model retained state owned by another stream/job.
-                assert_eq!(job.reserve_spool(4), 4);
-                let summary = spool_job_output(
-                    ReleasingReader {
-                        step: 0,
-                        job: job.clone(),
-                    },
-                    job.stdout_path.clone(),
-                    job.begin_spool_writer()
-                        .expect("test spool writer registration is open"),
-                )
-                .await
-                .unwrap();
-                assert_eq!(summary.total_bytes, 12);
-                assert_eq!(summary.stored_bytes, 4);
-                assert!(summary.truncated);
-                crate::jobs::JobCompletion::completed(
-                    Some(0),
-                    true,
-                    summary,
-                    crate::jobs::StreamSummary::default(),
-                )
-            })
-            .unwrap();
-        let id = started.id.clone();
-        let path = path_rx.await.unwrap();
-        assert!(matches!(
-            manager.wait_until(&id, None).await.unwrap(),
-            crate::jobs::JobWait::Terminal
-        ));
+        // This specifically exercises the retired local byte-accounting path;
+        // production `spawn()` jobs use shared JobManager output accounting only.
+        let job = manager.create_for_test(30).unwrap();
+        let path = job.stdout_path.clone();
+        // Four bytes model retained state owned by another legacy stream/job.
+        assert_eq!(job.reserve_spool(4), 4);
+        let summary = spool_job_output(
+            ReleasingReader {
+                step: 0,
+                job: job.clone(),
+            },
+            job.stdout_path.clone(),
+            job.clone(),
+            job.begin_spool_writer()
+                .expect("test spool writer registration is open"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.total_bytes, 12);
+        assert_eq!(summary.stored_bytes, 4);
+        assert!(summary.truncated);
+        manager.finish(
+            &job.id,
+            crate::jobs::JobCompletion::completed(
+                Some(0),
+                true,
+                summary,
+                crate::jobs::StreamSummary::default(),
+            ),
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"AAAA",
             "retained output must stay a contiguous prefix after the first dropped byte"
         );
-        drop(started);
+        drop(job);
         manager.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn aborting_spool_tasks_uses_writer_lifetime_after_one_join_result_was_consumed() {
+    async fn controlled_spool_stop_uses_writer_lifetime_after_one_join_result_was_consumed() {
         let manager = crate::jobs::JobManager::new(Duration::from_secs(60)).unwrap();
         let job = manager.create_for_test(30).unwrap();
         let [stdout_writer, stderr_writer] = job
@@ -2884,7 +3201,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut stdout = AbortOnDropHandle::new(tokio::spawn(async move {
             drop(stdout_writer);
-            Ok(StreamSummary::default())
+            Ok::<StreamSummary, std::io::Error>(StreamSummary::default())
         }));
         let stderr = AbortOnDropHandle::new(tokio::spawn(async move {
             let _writer = stderr_writer;
@@ -2892,7 +3209,7 @@ mod tests {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             });
-            Ok(StreamSummary::default())
+            Ok::<StreamSummary, std::io::Error>(StreamSummary::default())
         }));
         (&mut stdout)
             .await
@@ -2901,13 +3218,14 @@ mod tests {
         crate::blocking::run(|| entered_rx.recv_timeout(Duration::from_secs(2))).unwrap();
 
         {
-            let quiesce = abort_and_quiesce_spool_tasks(&job, &stdout, &stderr);
+            let stop = DrainStop::new();
+            let quiesce = stop_and_quiesce_spool_tasks(&job, &stop);
             tokio::pin!(quiesce);
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), &mut quiesce)
                     .await
                     .is_err(),
-                "abort must not report quiescence while blocking spool I/O is still running"
+                "stop must not report quiescence while blocking spool I/O is still running"
             );
             release_tx.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(2), &mut quiesce)
@@ -3349,8 +3667,9 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: None,
+                    writes: None,
                 },
-                false,
+                aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
             )
             .unwrap()
@@ -3389,8 +3708,9 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: None,
+                    writes: None,
                 },
-                false,
+                aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
             )
             .unwrap();
@@ -3425,8 +3745,9 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(2),
                     max_output_bytes: None,
+                    writes: None,
                 },
-                false,
+                aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
             )
             .unwrap()
@@ -3451,8 +3772,9 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: None,
+                    writes: None,
                 },
-                false,
+                aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
             )
             .unwrap()
@@ -3507,6 +3829,7 @@ mod tests {
                     stdin: Some("x".repeat(160 * 1024)),
                     timeout_secs: Some(3),
                     max_output_bytes: Some(256 * 1024),
+                    writes: None,
                 },
                 false,
                 None,
@@ -3537,6 +3860,7 @@ mod tests {
                     stdin: Some("x".repeat(160 * 1024)),
                     timeout_secs: Some(3),
                     max_output_bytes: Some(16 * 1024),
+                    writes: None,
                 },
                 false,
                 None,
@@ -3570,11 +3894,12 @@ mod tests {
         assert!(timeout.contains("42"), "{timeout}");
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
         assert!(output.contains("2048"), "{output}");
-        // Non-shell tools keep their static schemas.
-        let read = LocalMachine::all_tools().get("read").cloned().unwrap();
+        // Non-shell product routes keep their static schemas. Canonical
+        // filesystem routes are merged separately from aw-tools.
+        let job_get = LocalMachine::all_tools().get("job_get").cloned().unwrap();
         assert_eq!(
-            with_profile_limits(read.clone(), 42, 2048).input_schema,
-            read.input_schema
+            with_profile_limits(job_get.clone(), 42, 2048).input_schema,
+            job_get.input_schema
         );
     }
 
@@ -3812,6 +4137,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: None,
+                    writes: None,
                 },
                 false,
                 None,
@@ -3951,6 +4277,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: Some(4),
+                    writes: None,
                 },
                 false,
                 None,
@@ -4135,18 +4462,19 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("unknown field"), "{error:?}");
 
-        let job_start = CallToolRequestParams::new("job_start").with_arguments(
-            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
-                "command": "true",
-                "max_output_bytes": 4096
-            }))
-            .unwrap(),
+        let error = match crate::mcp::tools::graph::prepare(
+            &machine,
+            vec![serde_json::json!(["bash", {"command":"true","unknown":true}])],
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid Graph shell arguments unexpectedly prepared"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("invalid canonical Graph"),
+            "{error:?}"
         );
-        let error = machine
-            .handle_shell_call_with(&job_start, Some(1_000), true, None, None, None)
-            .await
-            .unwrap_err();
-        assert!(error.message.contains("unknown field"), "{error:?}");
     }
 
     #[cfg(unix)]
@@ -4167,8 +4495,9 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: Some(4096),
+                    writes: None,
                 },
-                false,
+                aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
             )
             .unwrap()
@@ -4181,7 +4510,8 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_eq!(status["status"], "failed", "{status}");
+        assert_eq!(status["status"], "unknown", "{status}");
+        assert_eq!(status["observed_status"], "failed", "{status}");
         assert!(
             status["error"]
                 .as_str()
@@ -4451,6 +4781,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn sandbox_machine(root: &Path, deny_write: Vec<PathBuf>) -> LocalMachine {
         LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(root).unwrap(),
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.to_path_buf(),
@@ -4472,7 +4803,7 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -4565,7 +4896,7 @@ mod tests {
             machine.jobs.status(&id).is_err(),
             "revoked hidden synchronous output must be discarded, not promoted to compatibility"
         );
-        let listed: serde_json::Value = serde_json::from_str(&machine.jobs.list(64)).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&machine.jobs.list(0, 64)).unwrap();
         assert!(
             listed["jobs"].as_array().unwrap().is_empty(),
             "revoked hidden output must never become discoverable through job_list"
@@ -5175,6 +5506,8 @@ mod tests {
 
         assert!(
             machine
+                .config
+                .access
                 .resolve_existing(cache_root.to_str().unwrap(), AccessNeed::Read)
                 .await
                 .is_err(),
@@ -5268,6 +5601,7 @@ mod tests {
         std::fs::create_dir(&read_write).unwrap();
 
         let machine = LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(&root).unwrap(),
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
@@ -5301,7 +5635,7 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -5356,6 +5690,7 @@ mod tests {
         std::fs::create_dir(&allowed).unwrap();
 
         let machine = LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(&root).unwrap(),
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
@@ -5378,7 +5713,7 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -5475,6 +5810,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let machine = LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(&root).unwrap(),
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
@@ -5497,7 +5833,7 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -5513,7 +5849,9 @@ mod tests {
             serialize: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
-        };
+        }
+        .bind_test_execution_policy()
+        .unwrap();
 
         let started = Instant::now();
         let result = machine
@@ -5527,6 +5865,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: Some(4096),
+                    writes: None,
                 },
                 false,
                 None,
@@ -5552,6 +5891,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let machine = LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(&root).unwrap(),
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
@@ -5574,7 +5914,7 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -5590,7 +5930,9 @@ mod tests {
             serialize: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             secure_fs: Arc::new(crate::secure_fs::SecureFs::new(&[], &[]).unwrap()),
-        };
+        }
+        .bind_test_execution_policy()
+        .unwrap();
 
         let result = machine
             .execute_shell(
@@ -5600,6 +5942,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: Some(4096),
+                    writes: None,
                 },
                 false,
                 None,
@@ -5611,14 +5954,14 @@ mod tests {
         let serialized = serde_json::to_value(&result).unwrap();
         let text = serialized["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["status"], "unknown");
+        assert!(payload["job_id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(payload["observed_status"], "timed_out");
         assert_eq!(payload["timed_out"], Value::Bool(true));
         assert_eq!(payload["success"], Value::Bool(false));
         assert_eq!(payload["exit_code"], Value::Null);
         assert!(
-            payload["error"]
-                .as_str()
-                .unwrap()
-                .contains("timed out after 1 seconds"),
+            payload["error"].as_str().unwrap().contains("uncertain"),
             "{payload}"
         );
         assert!(
@@ -5721,6 +6064,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
+                    writes: None,
                 },
                 false, None)
             .await
@@ -5904,6 +6248,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(8),
                     max_output_bytes: None,
+                    writes: None,
                 },
                 false,
                 None,
@@ -5916,6 +6261,8 @@ mod tests {
         // Host config sources were never native filesystem grants.
         assert!(
             machine
+                .config
+                .access
                 .resolve_existing(&nix_config.to_string_lossy(), AccessNeed::Read)
                 .await
                 .is_err()
@@ -5967,7 +6314,6 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
                 task_result_budget: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
@@ -5993,6 +6339,7 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(8),
                         max_output_bytes: None,
+                        writes: None,
                     },
                     false, None)
                 .await
@@ -6120,7 +6467,6 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
                 task_result_budget: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
@@ -6256,7 +6602,7 @@ mod tests {
                 git.display(), git.display(), git.display(),
             ),
             dir: ".".into(), stdin: None,
-            timeout_secs: Some(15), max_output_bytes: None,
+            timeout_secs: Some(15), max_output_bytes: None, writes: None,
         }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -6353,7 +6699,7 @@ mod tests {
                 "done; echo isolated"
             ).into(),
             dir: "/".into(), stdin: None,
-            timeout_secs: Some(8), max_output_bytes: None,
+            timeout_secs: Some(8), max_output_bytes: None, writes: None,
         }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -6504,6 +6850,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(12),
                     max_output_bytes: None,
+                    writes: None,
                 },
                 false,
                 None,
@@ -6583,7 +6930,6 @@ mod tests {
                 max_output_bytes: 4096,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
                 task_result_budget: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
@@ -6605,6 +6951,7 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(10),
                         max_output_bytes: None,
+                        writes: None,
                     },
                     false,
                     None,
@@ -6694,6 +7041,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(8),
                     max_output_bytes: None,
+                    writes: None,
                 },
                 false,
                 None,
@@ -6733,6 +7081,7 @@ mod tests {
         std::fs::write(denied.join("secret.txt"), b"secret").unwrap();
 
         let machine = LocalMachine {
+            shared_fs: crate::mcp::shared_fs::prepare_root_for_test(&root).unwrap(),
             config: RuntimeConfig {
                 access: AccessPolicy::from_spec(AccessSpec {
                     base_dir: root.clone(),
@@ -6757,7 +7106,7 @@ mod tests {
                 max_output_bytes: 16 * 1024,
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
-
+                shared_caps: crate::mcp::tools::shared_native::caps(4096, 4096).unwrap(),
                 task_result_budget: None,
                 protected_paths: Vec::new(),
             },
@@ -6779,7 +7128,9 @@ mod tests {
                 )
                 .unwrap(),
             ),
-        };
+        }
+        .bind_test_execution_policy()
+        .unwrap();
 
         let result = machine
             .execute_shell(
@@ -6798,6 +7149,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
+                    writes: None,
                 },
                 false, None)
             .await
@@ -6820,6 +7172,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
+                    writes: None,
                 },
                 false,
                 None,
