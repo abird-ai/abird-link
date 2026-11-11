@@ -8,6 +8,8 @@
 - [!] P2 DL-130 — @agent — Runtime/OAuth fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-live-credentials-2026-10-26/README.md)
 - [!] P2 DL-140 — @agent — Four review fixes committed; native platform smoke tests remain gated — [details](dotlink-postreview-2026-10-26/README.md)
 
+- [~] P2 nixos-runtime-config — @agent — Stage declarative config outside shell runtime mounts — [details](nixos-runtime-config/README.md)
+
 ## Icebox
 
 - [ ] P2 DL-150 — AI-native, token-efficient tool core; v1 + v2 canonical Job/Graph/runtime design fully sealed after a second correctness/security/edge-case review, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)

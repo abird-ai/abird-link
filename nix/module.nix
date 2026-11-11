@@ -72,7 +72,8 @@
       description = ''
         Optional declarative profile JSON (excluding secrets). Null reuses the
         user's existing dotlink config. Mutually exclusive with configFile.
-        Declarative settings are placed read-only in the Nix store.
+        Declarative settings are public in the Nix store and copied into a
+        private per-service runtime directory at each service start.
       '';
     };
     configFile = mkOption {
@@ -294,15 +295,17 @@
     # DOTLINK_CONFIG is a *base* path. With --profile NAME, the loader
     # selects its sibling config.NAME.jsonc, which keeps credentials and
     # OAuth state independent for named declarative instances too.
+    configName =
+      if profile == null
+      then "config.jsonc"
+      else "config.${profile}.jsonc";
+    settingsFile =
+      pkgs.writeText "dotlink-${name}.jsonc"
+      (builtins.toJSON (instance.settings // {version = 10;}));
+    runtimeDirectory = named name;
     configPath =
       if instance.settings != null
-      then "${pkgs.writeTextDir
-        (
-          if profile == null
-          then "config.jsonc"
-          else "config.${profile}.jsonc"
-        )
-        (builtins.toJSON (instance.settings // {version = 10;}))}/config.jsonc"
+      then "%t/${runtimeDirectory}/config.jsonc"
       else instance.configFile;
     hostEnabled =
       instance.hostAccess.nixDaemon
@@ -387,6 +390,13 @@
         StandardOutput = "journal";
         StandardError = "journal";
         UMask = "0077";
+      }
+      // lib.optionalAttrs (instance.settings != null) {
+        # A store-backed protected config overlaps the shell's /nix/store
+        # runtime bind. Copy it, never symlink it or relax the sandbox guard.
+        RuntimeDirectory = runtimeDirectory;
+        RuntimeDirectoryMode = "0700";
+        ExecStartPre = "${pkgs.coreutils}/bin/install -m 0400 ${settingsFile} %t/${runtimeDirectory}/${configName}";
       }
       // lib.optionalAttrs (instance.group != null) {Group = instance.group;}
       // lib.optionalAttrs (instance.hostAccess.kvm || instance.hostAccess.gpu != []) {

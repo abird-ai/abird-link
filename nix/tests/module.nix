@@ -67,6 +67,15 @@
     };
   };
 
+  external = eval {
+    services.dotlink = {
+      enable = true;
+      workingDirectory = "/var/lib/dotlink/work";
+      configFile = "/etc/dotlink/config.jsonc";
+      instances.other.configFile = "/etc/dotlink-other/config.jsonc";
+    };
+  };
+
   disabled = eval {
     services.dotlink = {
       enable = false;
@@ -169,6 +178,8 @@
     (normal.config.systemd.services.dotlink.serviceConfig.WorkingDirectory == "/home/alice/projects")
     (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG))
     (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_API_KEY_FILE))
+    (!(normal.config.systemd.services.dotlink.serviceConfig ? RuntimeDirectory))
+    (!(normal.config.systemd.services.dotlink.serviceConfig ? ExecStartPre))
     (lib.hasInfix "--no-stdio --color=never" normal.config.systemd.services.dotlink.serviceConfig.ExecStart)
     (!lib.hasInfix "--serialize" normal.config.systemd.services.dotlink.serviceConfig.ExecStart)
     (hasSupervisionPolicy normal.config.systemd.services.dotlink)
@@ -189,8 +200,19 @@
     (valid systemd258)
     (dotlinkWarnings systemd258 == [])
 
+    (valid external)
+    (external.config.systemd.services.dotlink.environment.DOTLINK_CONFIG == "/etc/dotlink/config.jsonc")
+    (!(external.config.systemd.services.dotlink.serviceConfig ? RuntimeDirectory))
+    (!(external.config.systemd.services.dotlink.serviceConfig ? ExecStartPre))
+    (external.config.systemd.services.dotlink-other.environment.DOTLINK_CONFIG == "/etc/dotlink-other/config.jsonc")
+    (!(external.config.systemd.services.dotlink-other.serviceConfig ? RuntimeDirectory))
+
     (valid managed)
-    (managed.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG)
+    (managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG == "%t/dotlink/config.jsonc")
+    (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
+    (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectoryMode == "0700")
+    (lib.hasInfix "/bin/install -m 0400 /nix/store/" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
+    (lib.hasSuffix " %t/dotlink/config.jsonc" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
     (managed.config.systemd.services.dotlink.environment.DOTLINK_API_KEY_FILE == "%d/dotlink-api-key")
     (managed.config.systemd.services.dotlink.environment.NGROK_AUTHTOKEN_FILE == "%d/ngrok-authtoken")
     (managed.config.systemd.services.dotlink.serviceConfig.LoadCredential
@@ -228,7 +250,10 @@
     (!(managed.config.systemd.services.dotlink-work.environment ? DOTLINK_CONFIG))
     (hasSupervisionPolicy managed.config.systemd.services.dotlink-work)
     (lib.hasInfix "--profile=test" managed.config.systemd.services.dotlink-test.serviceConfig.ExecStart)
-    (managed.config.systemd.services.dotlink-test.environment ? DOTLINK_CONFIG)
+    (managed.config.systemd.services.dotlink-test.environment.DOTLINK_CONFIG == "%t/dotlink-test/config.jsonc")
+    (managed.config.systemd.services.dotlink-test.serviceConfig.RuntimeDirectory == "dotlink-test")
+    (lib.hasSuffix " %t/dotlink-test/config.test.jsonc" managed.config.systemd.services.dotlink-test.serviceConfig.ExecStartPre)
+    (!(managed.config.systemd.services.dotlink-work.serviceConfig ? RuntimeDirectory))
     (!(disabled.config.systemd.services ? dotlink))
     (!(disabled.config.systemd.services ? dotlink-work))
     (valid dedicated)

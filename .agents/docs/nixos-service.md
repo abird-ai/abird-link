@@ -81,8 +81,12 @@ services.dotlink = {
 ```
 
 A read-only JSON document with schema version 10 is generated in the Nix store
-and passed to dotlink through `DOTLINK_CONFIG`. This *only* overrides the
-profile JSON; unless explicitly overridden, dotlink still loads the selected
+and copied at each service start into a private systemd `RuntimeDirectory`
+(`/run/dotlink` or `/run/dotlink-<instance>`). `DOTLINK_CONFIG` points to the
+runtime copy, not a symlink into the store: the shell needs `/nix/store` as a
+runtime mount, which must not overlap the protected active config. The directory
+has mode `0700` and the copy `0400`; systemd removes it on stop and refreshes it
+on restart. This *only* overrides the profile JSON; unless explicitly overridden, dotlink still loads the selected
 user's own saved `runtime.key` and OAuth state. The schema is dotlink's
 existing JSONC schema, not a second independently maintained config format.
 Never include keys, passwords, or tokens inside `settings`, as Nix store
@@ -94,8 +98,10 @@ external **base** JSONC file without generating a file in the Nix store.
 combined with an explicit `profile`, because named-profile selection changes
 the JSONC filename. For a named instance, dotlink selects the sibling
 `config.<instance>.jsonc` file from that base path. Generated `settings`
-automatically create the correctly named sibling in the Nix store, so each
-instance retains independent saved keys and OAuth state.
+automatically copy the correctly named sibling into each service's runtime
+directory, so each instance retains independent saved keys and OAuth state.
+`configFile` paths are used unchanged; a store-backed external `configFile`
+can still conflict with shell runtime mounts.
 
 ## Optional credential overrides
 
@@ -395,3 +401,7 @@ nix eval .#nixosModules.default --apply builtins.typeOf
 The flake exports a `nixos-module` check for Linux which evaluates real
 NixOS configurations for user-profile fallback, declarative config,
 credentials, named services, enable/disable, and option validation.
+
+The `nixos-service` VM check starts default and named declarative services,
+calls real MCP shell/file tools, checks config/credential protection, and verifies
+restart refresh and stop cleanup.
