@@ -4,6 +4,20 @@ Base: `84cd9b7`
 
 Status: **model-facing design sealed; shared-engine cutover complete, with platform release gates still open**. Native filesystem and Graph/Job execution use the shared implementation in production, all three shared crates pin reviewed remote AW `4a23e92a8f516971bb232b98e4fc000554bcc4ba`, and the remote-pinned offline/locked gate is green. Remaining blockers are the explicitly documented native Bubblewrap and Windows/macOS platform checks.
 
+## Current status override — 2026-11-09
+
+The current source/checkpoints supersede unchecked implementation boxes in older historical Phase 7–9 and validation subsections below. Those boxes document the original roadmap and are **not instructions to reimplement completed Graph/Job/shared-engine work**. The canonical current handoff is [FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md](FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md).
+
+Current reviewed state:
+
+- [x] AW canonical shared runtime is remotely reachable at exact revision `4a23e92a8f516971bb232b98e4fc000554bcc4ba`.
+- [x] dotlink cutover is committed at `b31683c79a8ffd7c5540ac9388e607d8af6c7ffa`; all shared crates use the exact remote Git pin and no sibling/path substitute remains.
+- [x] Production `batch`, Graph-shaped `job_start`, `job_restart`, native nodes and ShellNodes use the shared `aw-tools::JobManager`; duplicate native filesystem engines are retired.
+- [x] Remote-pinned Linux/conformance/integration/check/Clippy/format gates recorded in this plan are green.
+- [!] dotlink `b31683c` is still one commit ahead of configured `origin/main`; pushing requires explicit user authorization.
+- [!] Native Windows/macOS and successful Bubblewrap execution remain platform/environment acceptance gates.
+- [ ] Native Windows UNC/network-share execution remains to be verified on a real Windows runner.
+
 ## Committed
 
 ### `c6f0e1c` — initial AI-native filesystem specification

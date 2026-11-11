@@ -8,6 +8,8 @@ Owner: @pvl
 
 Status: **model-facing design sealed; shared implementation cutover complete, with platform release gates still open**. The shared AW implementation and secured backends are live, dotlink production native filesystem/Graph dispatch uses them, and all three shared crates are pinned to reviewed remote AW revision `4a23e92a8f516971bb232b98e4fc000554bcc4ba`. Remaining release gates are the explicitly documented native Bubblewrap and Windows/macOS platform checks, not shared-engine or dependency-pin convergence.
 
+Current cross-repo continuation handoff: [FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md](FULL-COMPREHENSIVE-HANDOFF-2026-11-09.md). New agents should read that first for chronology/current checkpoints, then return here for the sealed model-facing semantics.
+
 Implementation should follow this specification as written. A model-facing surface or
 semantic change discovered during implementation must explicitly reopen/update DL-150
 rather than silently drifting from the sealed design.
