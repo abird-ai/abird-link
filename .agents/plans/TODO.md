@@ -8,13 +8,13 @@
 - [!] P2 DL-130 — @agent — Runtime/OAuth fixes committed; native Windows/macOS and Bubblewrap smoke gated — [details](dotlink-live-credentials-2026-10-26/README.md)
 - [!] P2 DL-140 — @agent — Four review fixes committed; native platform smoke tests remain gated — [details](dotlink-postreview-2026-10-26/README.md)
 
-- [~] P2 nixos-runtime-config — @agent — Stage declarative config outside shell runtime mounts — [details](nixos-runtime-config/README.md)
-
 ## Icebox
 
 - [ ] P2 DL-150 — AI-native, token-efficient tool core; v1 + v2 canonical Job/Graph/runtime design fully sealed after a second correctness/security/edge-case review, implementation not started — [details](dotlink-ai-native-filesystem-2026-10-31/README.md)
 
 ## Closed
+
+- [x] nixos-runtime-config — `1bbbe57` — 2026-11-11 — Stage declarative config outside shell runtime mounts — [details](nixos-runtime-config/README.md)
 
 - [x] DL-100 — `716ad06` + follow-ups through `dc7f59b` — 2026-10-26 — MCP modularization, safe writes, transport hardening, and regression coverage — [details](dotlink-tool-review-2026-10-26/README.md)
 - [x] DL-090 — `00e45db` — 2026-10-25 — Tunnel tuning: one validated `TunnelTuning`, concurrency `8 -> 16`, poll batch `25 -> 32` — [details](dotlink-tunnel-tuning-2026-10-25/README.md)

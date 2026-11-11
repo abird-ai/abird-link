@@ -2,7 +2,9 @@
 
 Base: `c34ea5ab115e2841384de349eda5ca9cea661b48`
 
-## Uncommitted
+## Committed
+
+### `1bbbe57` — Stage declarative config outside shell runtime mounts
 
 - [x] Reproduce store-backed config startup failure with shell enabled: exit 78,
   runtime `/nix/store` mount overlaps protected config.
@@ -12,12 +14,15 @@ Base: `c34ea5ab115e2841384de349eda5ca9cea661b48`
   restart refresh, and stop cleanup.
 - [x] Document lifecycle and remaining explicit `configFile` behavior.
 
+## Uncommitted
+
+None.
+
 ## Tests and verification
 
-- [x] Baseline `nix flake check -L` on the base revision.
-- [ ] Final `nix flake check -L` (build, tests, clippy, formatting, Markdown,
-  module evaluation, and the new VM check).
-- [x] `DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features`: 781 passed.
-- [x] `git diff --check`.
-- [x] NixOS VM service regression using locally available QEMU 11.0.1;
-  the exact flake QEMU 11.1.1 check remains pending its binary-cache download.
+- [x] Baseline `nix flake check -L` — `c34ea5a`.
+- [x] `nix flake check -L` on x86_64-linux — `1bbbe57`: build, Rust tests,
+  clippy, formatting, Markdown, module evaluation, and pinned-QEMU VM regression.
+- [x] `DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features` — `1bbbe57`:
+  781 passed.
+- [x] `git diff --check` — `1bbbe57`.
