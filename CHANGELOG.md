@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-11-12
+
+### Fixed
+
+- Long shell calls no longer spend the caller's whole hosted response window. The synchronous wait is capped by `OPENAI_TUNNEL_SYNC_HOLD` (90 s) instead of `window - delivery_reserve` (114.5 s), so a still-running command returns its stable job handle while the caller's own request window is still open. Execution, shell timeouts and durable job state are unchanged; only the moment of handoff moves.
+
 ## [0.14.3] - 2026-10-31
 
 ### Changed
@@ -501,6 +507,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.14.4]: https://github.com/abird-ai/dotlink/compare/v0.14.3...v0.14.4
 [0.14.0]: https://github.com/abird-ai/dotlink/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/abird-ai/dotlink/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/abird-ai/dotlink/compare/v0.12.0...v0.13.0
