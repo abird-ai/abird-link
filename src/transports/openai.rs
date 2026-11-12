@@ -3152,14 +3152,11 @@ fn parse_response_timeout(value: Option<&Value>) -> Option<Duration> {
 /// backpressure rather than an accidental stall.
 const OUTSTANDING_BATCHES: usize = 3;
 
-fn shell_timeout_within(window: Duration, reserve: Duration) -> u64 {
-    window.saturating_sub(reserve).as_secs()
-}
-
 /// Tell the local MCP server how long this response may wait and which durable
 /// request it represents. Execution deadlines are never rewritten: every shell
-/// call starts one durable execution and waits only until this response window;
-/// a still-running command is then exposed through that same stable job/task id.
+/// call starts one durable execution and waits only until
+/// [`crate::limits::OPENAI_TUNNEL_SYNC_HOLD`], after which a still-running
+/// command is exposed through that same stable job/task id.
 fn annotate_response_context(
     jsonrpc: &mut Value,
     window: Duration,
@@ -3213,13 +3210,15 @@ fn annotate_response_context(
     if !shell {
         return Ok(None);
     }
-    let budget = window.saturating_sub(reserve);
+    let budget = window
+        .saturating_sub(reserve)
+        .min(crate::limits::OPENAI_TUNNEL_SYNC_HOLD);
     let millis = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
     meta.insert(
         crate::mcp::SYNC_BUDGET_META_KEY.to_owned(),
         Value::from(millis),
     );
-    Ok(Some(shell_timeout_within(window, reserve)))
+    Ok(Some(budget.as_secs()))
 }
 
 fn tool_call_name(jsonrpc: &Value) -> Option<&str> {
@@ -7443,8 +7442,6 @@ name"
         let window = Duration::from_secs(120);
         let reserve = TunnelTuning::default().delivery_reserve;
         assert_eq!(reserve, crate::limits::OPENAI_TUNNEL_DELIVERY_RESERVE);
-        assert_eq!(shell_timeout_within(window, reserve), 115);
-        assert_eq!(shell_timeout_within(Duration::from_secs(3), reserve), 0);
         let mut subsecond = json!({
             "jsonrpc":"2.0","id":9,"method":"tools/call",
             "params":{"name":crate::mcp::shell_tool_name(),"arguments":{"command":"true","timeout_secs":1}}
@@ -7476,9 +7473,26 @@ name"
                 .map(str::to_owned)
         };
 
+        // A client that grants less than the hold keeps the reserve-only budget:
+        // the clamp narrows an oversized window, it never lengthens a short one.
+        let mut short = shell(json!({"command":"cargo build --release"}));
+        assert_eq!(
+            annotate_response_context(
+                &mut short,
+                Duration::from_secs(60),
+                reserve,
+                "request",
+                "token",
+            ),
+            Ok(Some(55))
+        );
+        assert_eq!(sync_meta(&short), Some(55_000));
+
         // Omitted execution timeout stays omitted: the durable runner uses the
         // profile ceiling. The transport budget controls only how long this
-        // request waits before returning the same durable job/task handle.
+        // request waits before returning the same durable job/task handle, and
+        // it never spends the whole caller window: the inbound queue hop is not
+        // observable, so only `OPENAI_TUNNEL_SYNC_HOLD` is safe to consume.
         let mut call = shell(json!({"command":"cargo build --release"}));
         call["params"]["_meta"] = json!({
             "io.abird.dotlink/futureField": "attacker",
@@ -7487,10 +7501,10 @@ name"
         });
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(115))
+            Ok(Some(90))
         );
         assert_eq!(call.pointer("/params/arguments/timeout_secs"), None);
-        assert_eq!(sync_meta(&call), Some(115_000));
+        assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
         let meta = call["params"]["_meta"].as_object().unwrap();
         assert!(!meta.contains_key("io.abird.dotlink/futureField"));
@@ -7515,13 +7529,13 @@ name"
             let mut call = shell(json!({"command":"true","timeout_secs":value}));
             assert_eq!(
                 annotate_response_context(&mut call, window, reserve, "request", "token"),
-                Ok(Some(115))
+                Ok(Some(90))
             );
             assert_eq!(
                 call.pointer("/params/arguments/timeout_secs"),
                 Some(&json!(value))
             );
-            assert_eq!(sync_meta(&call), Some(115_000));
+            assert_eq!(sync_meta(&call), Some(90_000));
         }
 
         // Invalid argument types are also left untouched for schema validation;
@@ -7529,13 +7543,13 @@ name"
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(115))
+            Ok(Some(90))
         );
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!("600"))
         );
-        assert_eq!(sync_meta(&call), Some(115_000));
+        assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
 
         // Explicit background jobs carry request identity but no synchronous
