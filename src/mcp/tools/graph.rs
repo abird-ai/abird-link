@@ -340,70 +340,47 @@ fn next_sequence(manager: &SharedJobManager, id: &str) -> Result<u64> {
         .map_err(|error| anyhow!("cannot advance Graph sequence: {error}"))
 }
 
-fn settle_claimed(
-    manager: &SharedJobManager,
-    id: &str,
-    coordinate: usize,
-    claimed_sequence: u64,
-    status: Status,
-) -> Result<()> {
-    manager
-        .settle(
-            id,
-            coordinate,
-            NodeState::Claimed {
-                sequence: claimed_sequence,
-            },
-            status,
-            next_sequence(manager, id)?,
-            |_, _| Ok::<_, JournalError>(()),
-        )
-        .map_err(|error| anyhow!("cannot settle claimed Graph node: {error:?}"))
-}
-
-fn settle_unlaunched(
-    manager: &SharedJobManager,
-    id: &str,
-    coordinate: usize,
-    claimed_sequence: u64,
-) -> Result<()> {
-    manager
-        .settle_unlaunched(
-            id,
-            coordinate,
-            claimed_sequence,
-            next_sequence(manager, id)?,
-            |_, sequence| {
-                if sequence == claimed_sequence {
-                    Ok(())
-                } else {
-                    Err(aw_tools::filesystem::job::Error::StaleGeneration)
-                }
-            },
-            |_, _| Ok::<_, JournalError>(()),
-        )
-        .map_err(|error| anyhow!("cannot settle unlaunched Graph node: {error:?}"))
+fn settle_unlaunched(job: &JobHandle, coordinate: usize, claimed_sequence: u64) -> Result<()> {
+    job.with_shared_transition(|manager| {
+        manager
+            .settle_unlaunched(
+                &job.id,
+                coordinate,
+                claimed_sequence,
+                next_sequence(manager, &job.id)?,
+                |_, sequence| {
+                    if sequence == claimed_sequence {
+                        Ok(())
+                    } else {
+                        Err(aw_tools::filesystem::job::Error::StaleGeneration)
+                    }
+                },
+                |_, _| Ok::<_, JournalError>(()),
+            )
+            .map_err(|error| anyhow!("cannot settle unlaunched Graph node: {error:?}"))
+    })
 }
 
 fn settle_running(
-    manager: &SharedJobManager,
-    id: &str,
+    job: &JobHandle,
     coordinate: usize,
     running_sequence: u64,
     status: Status,
 ) -> Result<()> {
-    manager
-        .settle(
-            id,
-            coordinate,
-            NodeState::Running {
-                sequence: running_sequence,
-            },
-            status,
-            next_sequence(manager, id)?,
-            |_, _| Ok::<_, JournalError>(()),
-        )
-        .map_err(|error| anyhow!("cannot settle running Graph node: {error:?}"))
+    job.with_shared_transition(|manager| {
+        manager
+            .settle(
+                &job.id,
+                coordinate,
+                NodeState::Running {
+                    sequence: running_sequence,
+                },
+                status,
+                next_sequence(manager, &job.id)?,
+                |_, _| Ok::<_, JournalError>(()),
+            )
+            .map_err(|error| anyhow!("cannot settle running Graph node: {error:?}"))
+    })
 }
 
 fn finish_if_present(
@@ -417,11 +394,12 @@ fn finish_if_present(
 
 fn settle_prelaunch_failure(
     manager: &SharedJobManager,
-    id: &str,
+    job: &JobHandle,
     coordinate: usize,
     claimed_sequence: u64,
     message: &str,
 ) -> Result<()> {
+    let id = &job.id;
     let result_ready = match manager.output_writer(id, coordinate, OutputStream::Result) {
         Ok(_) => true,
         Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
@@ -451,30 +429,27 @@ fn settle_prelaunch_failure(
     // No Start checkpoint has been committed, so this node is positively
     // known to be unlaunched. Keep the diagnostic output, but preserve the
     // canonical state-machine proof as Skip rather than inventing Fail/Unknown.
-    settle_unlaunched(manager, id, coordinate, claimed_sequence)
+    settle_unlaunched(job, coordinate, claimed_sequence)
 }
 
-fn start_native(
-    manager: &SharedJobManager,
-    id: &str,
-    coordinate: usize,
-    claimed_sequence: u64,
-) -> Result<u64> {
-    let running_sequence = next_sequence(manager, id)?;
-    manager
-        .start(
-            id,
-            StartRequest {
-                coordinate,
-                claimed_sequence,
-                source_live: true,
-                launch_authorized: true,
-                sequence: running_sequence,
-            },
-            |_, _| Ok::<_, JournalError>(()),
-        )
-        .map_err(|error| anyhow!("cannot start Graph node: {error:?}"))?;
-    Ok(running_sequence)
+fn start_native(job: &JobHandle, coordinate: usize, claimed_sequence: u64) -> Result<u64> {
+    job.with_shared_transition(|manager| {
+        let running_sequence = next_sequence(manager, &job.id)?;
+        manager
+            .start(
+                &job.id,
+                StartRequest {
+                    coordinate,
+                    claimed_sequence,
+                    source_live: true,
+                    launch_authorized: true,
+                    sequence: running_sequence,
+                },
+                |_, _| Ok::<_, JournalError>(()),
+            )
+            .map_err(|error| anyhow!("cannot start Graph node: {error:?}"))?;
+        Ok(running_sequence)
+    })
 }
 
 async fn execute_native(
@@ -497,7 +472,7 @@ async fn execute_native(
     ) {
         return settle_prelaunch_failure(
             &manager,
-            &id,
+            &job,
             coordinate,
             claimed_sequence,
             &format!("fail result capacity unavailable: {error:?}"),
@@ -505,26 +480,25 @@ async fn execute_native(
     }
     if job.cancel.is_cancelled() {
         finish_if_present(&manager, &id, coordinate, OutputStream::Result);
-        return settle_unlaunched(&manager, &id, coordinate, claimed_sequence);
+        return settle_unlaunched(&job, coordinate, claimed_sequence);
     }
     if !node.footprint_is_current() {
         return settle_prelaunch_failure(
             &manager,
-            &id,
+            &job,
             coordinate,
             claimed_sequence,
             "fail filesystem topology changed after Graph preflight; restart the Graph",
         );
     }
-    let running_sequence = start_native(&manager, &id, coordinate, claimed_sequence)?;
+    let running_sequence = start_native(&job, coordinate, claimed_sequence)?;
     let cancellation = job.cancel.clone();
     let outcome = crate::blocking::run(|| node.execute_graph(&cancellation));
     if outcome.text.len() > node.result_bytes() {
         let _ = manager.mark_output_failed(&id, coordinate, OutputStream::Result, 0);
         finish_if_present(&manager, &id, coordinate, OutputStream::Result);
         return settle_running(
-            &manager,
-            &id,
+            &job,
             coordinate,
             running_sequence,
             Status {
@@ -547,8 +521,7 @@ async fn execute_native(
         .map_err(|error| anyhow!("cannot seal native Graph result: {error:?}"))?;
     if retained != outcome.text.len() {
         return settle_running(
-            &manager,
-            &id,
+            &job,
             coordinate,
             running_sequence,
             Status {
@@ -558,7 +531,7 @@ async fn execute_native(
             },
         );
     }
-    settle_running(&manager, &id, coordinate, running_sequence, outcome.status)
+    settle_running(&job, coordinate, running_sequence, outcome.status)
 }
 
 async fn execute_shell(
@@ -584,7 +557,7 @@ async fn execute_shell(
         Err(error) => {
             return settle_prelaunch_failure(
                 &manager,
-                &id,
+                &job,
                 coordinate,
                 claimed_sequence,
                 &format!("fail shell output capacity unavailable: {error:?}"),
@@ -602,7 +575,7 @@ async fn execute_shell(
             finish_if_present(&manager, &id, coordinate, OutputStream::Stderr);
             return settle_prelaunch_failure(
                 &manager,
-                &id,
+                &job,
                 coordinate,
                 claimed_sequence,
                 &format!("fail shell preparation changed: {error}"),
@@ -614,7 +587,7 @@ async fn execute_shell(
         finish_if_present(&manager, &id, coordinate, OutputStream::Stderr);
         return settle_prelaunch_failure(
             &manager,
-            &id,
+            &job,
             coordinate,
             claimed_sequence,
             "fail shell authority changed after Graph preflight",
@@ -635,7 +608,7 @@ async fn execute_shell(
         finish_if_present(&manager, &id, coordinate, OutputStream::Stderr);
         return settle_prelaunch_failure(
             &manager,
-            &id,
+            &job,
             coordinate,
             claimed_sequence,
             "fail shell timeout is unschedulable",
@@ -648,7 +621,7 @@ async fn execute_shell(
         command,
         node.args.stdin,
         deadline,
-        job,
+        job.clone(),
         coordinate,
         SharedShellWriters { stdout, stderr },
         context,
@@ -677,38 +650,50 @@ async fn execute_shell(
     finish_if_present(&manager, &id, coordinate, OutputStream::Stdout);
     finish_if_present(&manager, &id, coordinate, OutputStream::Stderr);
 
-    match manager.node_state(&id, coordinate) {
+    job.with_shared_transition(|shared| match shared.node_state(&id, coordinate) {
         Ok(NodeState::Running { sequence }) => match terminal {
-            Some(terminal) => manager
+            Some(terminal) => shared
                 .settle_process(
                     &id,
                     coordinate,
                     NodeState::Running { sequence },
                     terminal,
-                    next_sequence(&manager, &id)?,
+                    next_sequence(shared, &id)?,
                     |_, _| Ok::<_, JournalError>(()),
                 )
                 .map(|_| ())
                 .map_err(|error| anyhow!("cannot settle ShellNode: {error:?}")),
-            None => settle_running(&manager, &id, coordinate, sequence, status),
+            None => shared
+                .settle(
+                    &id,
+                    coordinate,
+                    NodeState::Running { sequence },
+                    status,
+                    next_sequence(shared, &id)?,
+                    |_, _| Ok::<_, JournalError>(()),
+                )
+                .map_err(|error| anyhow!("cannot settle running ShellNode: {error:?}")),
         },
-        Ok(NodeState::Claimed { sequence }) => settle_claimed(
-            &manager,
-            &id,
-            coordinate,
-            sequence,
-            Status {
-                primary: Primary::Unknown,
-                more: false,
-                incomplete: false,
-            },
-        ),
+        Ok(NodeState::Claimed { sequence }) => shared
+            .settle(
+                &id,
+                coordinate,
+                NodeState::Claimed { sequence },
+                Status {
+                    primary: Primary::Unknown,
+                    more: false,
+                    incomplete: false,
+                },
+                next_sequence(shared, &id)?,
+                |_, _| Ok::<_, JournalError>(()),
+            )
+            .map_err(|error| anyhow!("cannot settle claimed ShellNode: {error:?}")),
         Ok(NodeState::Terminal { .. }) => Ok(()),
         Ok(NodeState::Pending) => bail!("ShellNode returned to pending after launch attempt"),
         Err(error) => Err(anyhow!(
             "ShellNode disappeared during settlement: {error:?}"
         )),
-    }
+    })
 }
 
 async fn execute_claimed(
@@ -785,7 +770,7 @@ fn graph_output_streams_for_abort() -> [OutputStream; 3] {
     ]
 }
 
-fn settle_abort(manager: &SharedJobManager, id: &str) -> Result<()> {
+fn settle_abort_inner(manager: &SharedJobManager, id: &str) -> Result<()> {
     if manager
         .runtime_snapshot(id)
         .map_err(|error| anyhow!("Graph abort status unavailable: {error:?}"))?
@@ -822,24 +807,44 @@ fn settle_abort(manager: &SharedJobManager, id: &str) -> Result<()> {
                     // Claimed is still pre-effect: no Start checkpoint means the
                     // node is provably unlaunched even when the runner itself
                     // aborts. Preserve that proof as skip, not unknown.
-                    settle_unlaunched(manager, id, coordinate, sequence)?;
+                    manager
+                        .settle_unlaunched(
+                            id,
+                            coordinate,
+                            sequence,
+                            next_sequence(manager, id)?,
+                            |_, observed| {
+                                if observed == sequence {
+                                    Ok(())
+                                } else {
+                                    Err(aw_tools::filesystem::job::Error::StaleGeneration)
+                                }
+                            },
+                            |_, _| Ok::<_, JournalError>(()),
+                        )
+                        .map_err(|error| {
+                            anyhow!("Graph abort no-launch settle failed: {error:?}")
+                        })?;
                     progressed = true;
                 }
                 NodeState::Running { sequence } => {
                     for stream in graph_output_streams_for_abort() {
                         finish_if_present(manager, id, coordinate, stream);
                     }
-                    settle_running(
-                        manager,
-                        id,
-                        coordinate,
-                        sequence,
-                        Status {
-                            primary: Primary::Unknown,
-                            more: false,
-                            incomplete: false,
-                        },
-                    )?;
+                    manager
+                        .settle(
+                            id,
+                            coordinate,
+                            NodeState::Running { sequence },
+                            Status {
+                                primary: Primary::Unknown,
+                                more: false,
+                                incomplete: false,
+                            },
+                            next_sequence(manager, id)?,
+                            |_, _| Ok::<_, JournalError>(()),
+                        )
+                        .map_err(|error| anyhow!("Graph abort running settle failed: {error:?}"))?;
                     progressed = true;
                 }
                 NodeState::Pending | NodeState::Terminal { .. } => {}
@@ -859,6 +864,10 @@ fn settle_abort(manager: &SharedJobManager, id: &str) -> Result<()> {
     }
 }
 
+fn settle_abort(job: &JobHandle) -> Result<()> {
+    job.with_shared_transition(|manager| settle_abort_inner(manager, &job.id))
+}
+
 async fn run_inner(
     runtime: GraphRuntime,
     job: JobHandle,
@@ -872,22 +881,27 @@ async fn run_inner(
             return Ok(snapshot);
         }
         if job.cancel.is_cancelled() && snapshot.lifecycle == Lifecycle::Running {
-            let _ = manager.cancel(&job.id, next_sequence(&manager, &job.id)?, |_, _| {
-                Ok::<_, JournalError>(())
-            });
+            job.with_shared_transition(|shared| {
+                let _ = shared.cancel(&job.id, next_sequence(shared, &job.id)?, |_, _| {
+                    Ok::<_, JournalError>(())
+                });
+                Ok(())
+            })?;
         }
         for coordinate in manager
             .skippable(&job.id)
             .map_err(|error| anyhow!("Graph skip projection failed: {error:?}"))?
         {
-            manager
-                .skip(
-                    &job.id,
-                    coordinate,
-                    next_sequence(&manager, &job.id)?,
-                    |_, _| Ok::<_, JournalError>(()),
-                )
-                .map_err(|error| anyhow!("Graph conditional skip failed: {error:?}"))?;
+            job.with_shared_transition(|shared| {
+                shared
+                    .skip(
+                        &job.id,
+                        coordinate,
+                        next_sequence(shared, &job.id)?,
+                        |_, _| Ok::<_, JournalError>(()),
+                    )
+                    .map_err(|error| anyhow!("Graph conditional skip failed: {error:?}"))
+            })?;
         }
         let snapshot = manager
             .runtime_snapshot(&job.id)
@@ -904,30 +918,34 @@ async fn run_inner(
         }
         let mut wave = FuturesUnordered::new();
         for coordinate in runnable {
-            let claimed_sequence = next_sequence(&manager, &job.id)?;
-            match manager.claim(&job.id, coordinate, true, claimed_sequence, |_, _| {
-                Ok::<_, JournalError>(())
-            }) {
-                Ok(_) => {
-                    let node_runtime = runtime.clone();
-                    let node_manager = manager.clone();
-                    let node_id = job.id.clone();
-                    let node_job = job.clone();
-                    wave.push(async move {
-                        execute_claimed(
-                            node_runtime,
-                            node_manager,
-                            node_id,
-                            coordinate,
-                            claimed_sequence,
-                            node_job,
-                        )
-                        .await
-                    });
+            let claimed_sequence = job.with_shared_transition(|shared| {
+                let sequence = next_sequence(shared, &job.id)?;
+                match shared.claim(&job.id, coordinate, true, sequence, |_, _| {
+                    Ok::<_, JournalError>(())
+                }) {
+                    Ok(_) => Ok(Some(sequence)),
+                    Err(aw_tools::filesystem::job_manager::Error::Busy) => Ok(None),
+                    Err(error) => Err(anyhow!("Graph node claim failed: {error:?}")),
                 }
-                Err(aw_tools::filesystem::job_manager::Error::Busy) => break,
-                Err(error) => return Err(anyhow!("Graph node claim failed: {error:?}")),
-            }
+            })?;
+            let Some(claimed_sequence) = claimed_sequence else {
+                break;
+            };
+            let node_runtime = runtime.clone();
+            let node_manager = manager.clone();
+            let node_id = job.id.clone();
+            let node_job = job.clone();
+            wave.push(async move {
+                execute_claimed(
+                    node_runtime,
+                    node_manager,
+                    node_id,
+                    coordinate,
+                    claimed_sequence,
+                    node_job,
+                )
+                .await
+            });
         }
         if wave.is_empty() {
             tokio::task::yield_now().await;
@@ -948,14 +966,17 @@ async fn run_inner(
                     .runtime_snapshot(&job.id)
                     .map_err(|error| anyhow!("Graph status unavailable during abort: {error:?}"))?;
                 if snapshot.lifecycle == Lifecycle::Running {
-                    let _ = manager.cancel(&job.id, next_sequence(&manager, &job.id)?, |_, _| {
-                        Ok::<_, JournalError>(())
-                    });
+                    job.with_shared_transition(|shared| {
+                        let _ = shared.cancel(&job.id, next_sequence(shared, &job.id)?, |_, _| {
+                            Ok::<_, JournalError>(())
+                        });
+                        Ok(())
+                    })?;
                 }
             }
         }
         if let Some(error) = fatal {
-            settle_abort(&manager, &job.id)?;
+            settle_abort(&job)?;
             return Err(error);
         }
     }
@@ -1015,11 +1036,12 @@ pub(crate) async fn start(
                 }
             }
             if go_rx.await.is_err() {
-                if let Ok(manager) = job.shared_manager()
-                    && let Ok(sequence) = next_sequence(&manager, &job.id)
-                {
-                    let _ = manager.cancel(&job.id, sequence, |_, _| Ok::<_, JournalError>(()));
-                }
+                let _ = job.with_shared_transition(|manager| {
+                    let sequence = next_sequence(manager, &job.id)?;
+                    let _ =
+                        manager.cancel(&job.id, sequence, |_, _| Ok::<_, JournalError>(()));
+                    Ok(())
+                });
                 return JobCompletion::cancelled(Default::default(), Default::default());
             }
             match AssertUnwindSafe(run(runtime, job.clone()))
@@ -1027,15 +1049,18 @@ pub(crate) async fn start(
                 .await
             {
                 Ok(Ok(snapshot)) => JobCompletion::from_shared_graph(&snapshot),
-                Ok(Err(error)) => JobCompletion::internal_failed(
-                    format!("Graph runner failed: {error}"),
-                    Default::default(),
-                    Default::default(),
-                ),
+                Ok(Err(error)) => {
+                    let settlement = settle_abort(&job);
+                    let message = match settlement {
+                        Ok(()) => format!("Graph runner failed and shared state was settled: {error}"),
+                        Err(settle_error) => format!(
+                            "Graph runner failed: {error}; shared settlement also failed: {settle_error}"
+                        ),
+                    };
+                    JobCompletion::internal_failed(message, Default::default(), Default::default())
+                }
                 Err(_) => {
-                    let settlement = job
-                        .shared_manager()
-                        .and_then(|manager| settle_abort(&manager, &job.id));
+                    let settlement = settle_abort(&job);
                     let message = match settlement {
                         Ok(()) => "Graph runner panicked; shared state settled unknown".to_owned(),
                         Err(error) => {
@@ -1159,14 +1184,34 @@ mod tests {
             .unwrap();
         stdout.finish().unwrap();
         stderr.finish().unwrap();
-        settle_prelaunch_failure(
-            &manager,
-            "shell-prelaunch-fail",
-            1,
-            claimed,
-            "fail shell authority changed after Graph preflight",
-        )
-        .unwrap();
+        let message = "fail shell authority changed after Graph preflight";
+        manager
+            .append_output(
+                "shell-prelaunch-fail",
+                1,
+                OutputStream::Result,
+                message.as_bytes(),
+            )
+            .unwrap();
+        manager
+            .finish_output("shell-prelaunch-fail", 1, OutputStream::Result)
+            .unwrap();
+        manager
+            .settle_unlaunched(
+                "shell-prelaunch-fail",
+                1,
+                claimed,
+                next_sequence(&manager, "shell-prelaunch-fail").unwrap(),
+                |_, observed| {
+                    if observed == claimed {
+                        Ok(())
+                    } else {
+                        Err(aw_tools::filesystem::job::Error::StaleGeneration)
+                    }
+                },
+                |_, _| Ok::<_, JournalError>(()),
+            )
+            .unwrap();
         let (result, finished) = manager
             .output_summary("shell-prelaunch-fail", 1, OutputStream::Result)
             .unwrap();
@@ -1249,7 +1294,22 @@ mod tests {
                 Ok::<_, JournalError>(())
             })
             .unwrap();
-        settle_unlaunched(&manager, "cancel-before-effect", 1, claimed).unwrap();
+        manager
+            .settle_unlaunched(
+                "cancel-before-effect",
+                1,
+                claimed,
+                next_sequence(&manager, "cancel-before-effect").unwrap(),
+                |_, observed| {
+                    if observed == claimed {
+                        Ok(())
+                    } else {
+                        Err(aw_tools::filesystem::job::Error::StaleGeneration)
+                    }
+                },
+                |_, _| Ok::<_, JournalError>(()),
+            )
+            .unwrap();
         assert!(matches!(
             manager.node_state("cancel-before-effect", 1).unwrap(),
             NodeState::Terminal {
@@ -1614,7 +1674,7 @@ mod tests {
                 Ok::<_, JournalError>(())
             })
             .unwrap();
-        settle_abort(&manager, "abort").unwrap();
+        settle_abort_inner(&manager, "abort").unwrap();
         let snapshot = manager.runtime_snapshot("abort").unwrap();
         assert_eq!(snapshot.lifecycle, Lifecycle::Terminal);
         assert!(matches!(

@@ -73,6 +73,8 @@ const JOB_POLL_INTERVAL_MS: u64 = 1_000;
 const JOB_OUTPUT_RESPONSE_RESERVE: usize = 2 * 1024;
 const SESSION_PREFIX: &str = "session-";
 const SESSION_LOCK_FILE: &str = ".session.lock";
+// A failed shutdown must not be treated as a safe-to-reap crash orphan.
+const SESSION_UNRESOLVED_MARKER: &str = ".unresolved-output";
 const SESSION_COORDINATION_LOCK: &str = ".sessions.lock";
 const SESSION_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_JOB_ERROR_BYTES: usize = 16 * 1024;
@@ -521,6 +523,10 @@ struct JobEntry {
     shell_guard_generation: Option<[u8; 32]>,
     /// RAII owner of the canonical shared lifecycle projection.
     shared_job: Option<SharedJobLease>,
+    /// Serializes only sequence allocation + canonical shared lifecycle
+    /// transitions for this Job. Effects, output I/O and unrelated Jobs remain
+    /// fully concurrent.
+    shared_transition_gate: Arc<Mutex<()>>,
     /// Multi-node/native Graph runner already owns every shared node transition.
     /// The legacy local finisher must not settle node 1 again.
     shared_graph_authoritative: bool,
@@ -811,12 +817,46 @@ fn remove_session_directory(root: &Path) -> std::io::Result<()> {
     unreachable!("session removal loop always returns")
 }
 
+fn mark_session_unresolved(root: &Path) -> std::io::Result<()> {
+    let marker = root.join(SESSION_UNRESOLVED_MARKER);
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&marker)?;
+            if !metadata.file_type().is_file() {
+                return Err(std::io::Error::other(
+                    "unresolved Job marker is not a regular file",
+                ));
+            }
+            OpenOptions::new().read(true).write(true).open(&marker)?
+        }
+        Err(error) => return Err(error),
+    };
+    // An existing marker may be the residue of an earlier failed sync. Existence
+    // alone is not durability evidence: harden and flush it again before the
+    // session lock can be released.
+    crate::setup::set_private_file_permissions(&marker).map_err(std::io::Error::other)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    File::open(root)?.sync_all()?;
+    Ok(())
+}
+
 impl Drop for JobManagerInner {
     fn drop(&mut self) {
         if let Some(handle) = self.sweeper.lock().ok().and_then(|mut value| value.take()) {
             handle.abort();
         }
-        if let Ok(mut state) = self.state.lock() {
+        // Drop cannot await runners or prove shared-owned output was released.
+        // A failed explicit shutdown deliberately retains its evidence; never
+        // undo that decision from this last-resort destructor.
+        let safe_to_remove = if let Ok(mut state) = self.state.lock() {
+            let safe = state.jobs.is_empty() && state.request_jobs.is_empty();
             state.closed = true;
             for entry in state.jobs.values_mut() {
                 entry.drain_writers.seal();
@@ -827,9 +867,22 @@ impl Drop for JobManagerInner {
             }
             state.jobs.clear();
             state.request_jobs.clear();
+            safe
+        } else {
+            false
+        };
+        if !safe_to_remove && let Err(error) = mark_session_unresolved(&self.root) {
+            tracing::error!(%error, path = %self.root.display(), "could not mark unresolved Job evidence for retention");
         }
         if let Ok(mut lock) = self.session_lock.lock() {
             lock.take();
+        }
+        if !safe_to_remove {
+            tracing::warn!(
+                path = %self.root.display(),
+                "retaining job spool session on drop: Job/output cleanup was not proven safe"
+            );
+            return;
         }
         let root = self.root.clone();
         if root.exists() {
@@ -869,6 +922,7 @@ pub(crate) struct JobHandle {
     stdout_file: Arc<File>,
     stderr_file: Arc<File>,
     drain_writers: Arc<DrainWriters>,
+    shared_transition_gate: Arc<Mutex<()>>,
     #[cfg(test)]
     legacy_spool: Option<Arc<LegacySpoolAccount>>,
     inner: Weak<JobManagerInner>,
@@ -887,7 +941,14 @@ fn shared_task_output_owner(id: &str) -> Result<SharedOutputOwner> {
         .map_err(|error| anyhow!("invalid shared native-task output owner: {error:?}"))
 }
 
-fn rollback_shared_claim(inner: &JobManagerInner, id: &str) {
+fn rollback_shared_claim(inner: &JobManagerInner, id: &str, transition_gate: &Arc<Mutex<()>>) {
+    let _transition = match transition_gate.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::warn!(%id, "shared Job transition gate poisoned during rollback");
+            return;
+        }
+    };
     let claimed = match inner.shared_jobs.node_state(id, 1) {
         Ok(SharedNodeState::Claimed { sequence }) => sequence,
         Ok(SharedNodeState::Terminal { .. })
@@ -934,6 +995,7 @@ fn rollback_shared_claim(inner: &JobManagerInner, id: &str) {
 fn rollback_shared_process_attachment(
     inner: &JobManagerInner,
     id: &str,
+    transition_gate: &Arc<Mutex<()>>,
     owners: &[SharedOutputOwner],
     stdout: &SharedOutputWriter,
     stderr: &SharedOutputWriter,
@@ -947,7 +1009,7 @@ fn rollback_shared_process_attachment(
                 .acknowledge_output(id, 1, stream, *owner, 0);
         }
     }
-    rollback_shared_claim(inner, id);
+    rollback_shared_claim(inner, id, transition_gate);
 }
 
 fn reconcile_prelaunch_shared_exposure(
@@ -987,6 +1049,10 @@ impl JobHandle {
             .map_err(|_| anyhow!("job intent fingerprint lock poisoned"))?
             .unwrap_or(inner.session_fingerprint);
         let runtime_session = hex::encode(runtime_session);
+        let _transition = self
+            .shared_transition_gate
+            .lock()
+            .map_err(|_| anyhow!("shared Job transition gate poisoned"))?;
         inner
             .shared_jobs
             .admit_runtime(
@@ -1061,6 +1127,10 @@ impl JobHandle {
             .map_err(|_| anyhow!("job intent fingerprint lock poisoned"))?
             .unwrap_or(inner.session_fingerprint);
         let runtime_session = hex::encode(runtime_session);
+        let _transition = self
+            .shared_transition_gate
+            .lock()
+            .map_err(|_| anyhow!("shared Job transition gate poisoned"))?;
         inner
             .shared_jobs
             .restart_runtime(
@@ -1168,9 +1238,15 @@ impl JobHandle {
         })
         .map_err(|error| anyhow!("cannot plan shared shell Job: {error:?}"))?;
         self.admit_prepared_graph(graph, plans, 1, shell_guard_generation, false)?;
-        let claim = inner
-            .shared_jobs
-            .claim(&self.id, 1, true, 2, |_, _| Ok::<_, SharedJournalError>(()));
+        let claim = {
+            let _transition = self
+                .shared_transition_gate
+                .lock()
+                .map_err(|_| anyhow!("shared Job transition gate poisoned"))?;
+            inner
+                .shared_jobs
+                .claim(&self.id, 1, true, 2, |_, _| Ok::<_, SharedJournalError>(()))
+        };
         if let Err(error) = claim {
             let _ = inner.shared_jobs.discard_unstarted(&self.id);
             return Err(anyhow!("shared shell Job claim failed: {error:?}"));
@@ -1188,7 +1264,7 @@ impl JobHandle {
         let stderr_file = match self.stderr_file.try_clone() {
             Ok(file) => file,
             Err(error) => {
-                rollback_shared_claim(&inner, &self.id);
+                rollback_shared_claim(&inner, &self.id, &self.shared_transition_gate);
                 return Err(error).context("cannot clone exact stderr spool capability");
             }
         };
@@ -1204,7 +1280,7 @@ impl JobHandle {
         ) {
             Ok(writers) => writers,
             Err(error) => {
-                rollback_shared_claim(&inner, &self.id);
+                rollback_shared_claim(&inner, &self.id, &self.shared_transition_gate);
                 return Err(anyhow!(
                     "shared process output attachment failed: {error:?}"
                 ));
@@ -1213,12 +1289,26 @@ impl JobHandle {
         let state = inner.state.lock().expect("job manager lock");
         let Some(entry) = state.jobs.get(&self.id) else {
             drop(state);
-            rollback_shared_process_attachment(&inner, &self.id, &owners, &stdout, &stderr);
+            rollback_shared_process_attachment(
+                &inner,
+                &self.id,
+                &self.shared_transition_gate,
+                &owners,
+                &stdout,
+                &stderr,
+            );
             bail!("job disappeared during shared shell claim");
         };
         if entry.completion.is_some() || entry.shared_job.is_none() {
             drop(state);
-            rollback_shared_process_attachment(&inner, &self.id, &owners, &stdout, &stderr);
+            rollback_shared_process_attachment(
+                &inner,
+                &self.id,
+                &self.shared_transition_gate,
+                &owners,
+                &stdout,
+                &stderr,
+            );
             bail!("job is no longer eligible for shared shell claim");
         }
         drop(state);
@@ -1230,6 +1320,21 @@ impl JobHandle {
             .upgrade()
             .map(|inner| inner.shared_jobs.clone())
             .ok_or_else(|| anyhow!("job session disappeared"))
+    }
+
+    pub(crate) fn with_shared_transition<T>(
+        &self,
+        transition: impl FnOnce(&SharedJobManager) -> Result<T>,
+    ) -> Result<T> {
+        let _gate = self
+            .shared_transition_gate
+            .lock()
+            .map_err(|_| anyhow!("shared Job transition gate poisoned"))?;
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("job session disappeared"))?;
+        transition(&inner.shared_jobs)
     }
 
     #[cfg(test)]
@@ -1245,29 +1350,30 @@ impl JobHandle {
             .inner
             .upgrade()
             .ok_or_else(|| anyhow!("job session disappeared before process launch"))?;
-        let claimed_sequence = match inner.shared_jobs.node_state(&self.id, coordinate) {
-            Ok(SharedNodeState::Claimed { sequence }) => sequence,
-            Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
-                bail!("shared shell Job is missing before process launch")
-            }
-            Ok(state) => bail!("shared shell Job has invalid pre-launch state: {state:?}"),
-            Err(error) => bail!("cannot inspect shared shell Job before start: {error:?}"),
-        };
-        let sequence = next_shared_sequence(&inner.shared_jobs, &self.id)?;
-        inner
-            .shared_jobs
-            .start(
-                &self.id,
-                SharedStartRequest {
-                    coordinate,
-                    claimed_sequence,
-                    source_live: true,
-                    launch_authorized: true,
-                    sequence,
-                },
-                |_, _| Ok::<_, SharedJournalError>(()),
-            )
-            .map_err(|error| anyhow!("shared shell start checkpoint failed: {error:?}"))?;
+        self.with_shared_transition(|shared| {
+            let claimed_sequence = match shared.node_state(&self.id, coordinate) {
+                Ok(SharedNodeState::Claimed { sequence }) => sequence,
+                Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+                    bail!("shared shell Job is missing before process launch")
+                }
+                Ok(state) => bail!("shared shell Job has invalid pre-launch state: {state:?}"),
+                Err(error) => bail!("cannot inspect shared shell Job before start: {error:?}"),
+            };
+            let sequence = next_shared_sequence(shared, &self.id)?;
+            shared
+                .start(
+                    &self.id,
+                    SharedStartRequest {
+                        coordinate,
+                        claimed_sequence,
+                        source_live: true,
+                        launch_authorized: true,
+                        sequence,
+                    },
+                    |_, _| Ok::<_, SharedJournalError>(()),
+                )
+                .map_err(|error| anyhow!("shared shell start checkpoint failed: {error:?}"))
+        })?;
 
         let mut state = inner.state.lock().expect("job manager lock");
         if state.closed {
@@ -1294,18 +1400,6 @@ impl JobHandle {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let Ok(SharedNodeState::Claimed { sequence: claimed }) =
-            inner.shared_jobs.node_state(&self.id, coordinate)
-        else {
-            return;
-        };
-        let sequence = match next_shared_sequence(&inner.shared_jobs, &self.id) {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                tracing::warn!(id = %self.id, %error, "could not advance unlaunched shared shell sequence");
-                return;
-            }
-        };
         for stream in [SharedOutputStream::Stdout, SharedOutputStream::Stderr] {
             if let Err(error) = inner
                 .shared_jobs
@@ -1314,14 +1408,25 @@ impl JobHandle {
                 tracing::warn!(id = %self.id, ?error, ?stream, "could not finish unlaunched shared shell output");
             }
         }
-        if let Err(error) = inner.shared_jobs.settle_unlaunched(
-            &self.id,
-            coordinate,
-            claimed,
-            sequence,
-            |_, _| Ok(()),
-            |_, _| Ok::<_, SharedJournalError>(()),
-        ) {
+        if let Err(error) = self.with_shared_transition(|shared| {
+            let SharedNodeState::Claimed { sequence: claimed } = shared
+                .node_state(&self.id, coordinate)
+                .map_err(|error| anyhow!("cannot inspect shared no-launch state: {error:?}"))?
+            else {
+                return Ok(());
+            };
+            let sequence = next_shared_sequence(shared, &self.id)?;
+            shared
+                .settle_unlaunched(
+                    &self.id,
+                    coordinate,
+                    claimed,
+                    sequence,
+                    |_, _| Ok(()),
+                    |_, _| Ok::<_, SharedJournalError>(()),
+                )
+                .map_err(|error| anyhow!("shared no-launch settlement failed: {error:?}"))
+        }) {
             tracing::warn!(id = %self.id, ?error, "could not settle shared shell Job as unlaunched");
         }
     }
@@ -1865,6 +1970,7 @@ impl JobManager {
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         let drain_writers = DrainWriters::new();
+        let shared_transition_gate = Arc::new(Mutex::new(()));
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
             id.clone(),
@@ -1900,6 +2006,7 @@ impl JobManager {
                 request_key: request_key.clone(),
                 shell_guard_generation: None,
                 shared_job: None,
+                shared_transition_gate: shared_transition_gate.clone(),
                 shared_graph_authoritative: false,
                 retention_anchor: None,
                 notify,
@@ -1916,6 +2023,7 @@ impl JobManager {
             stdout_file,
             stderr_file,
             drain_writers,
+            shared_transition_gate,
             #[cfg(test)]
             legacy_spool: None,
             inner: Arc::downgrade(&self.inner),
@@ -1996,6 +2104,7 @@ impl JobManager {
         let [stdout_file, stderr_file] = files.handles();
         let cancel = CancellationToken::new();
         let drain_writers = DrainWriters::new();
+        let shared_transition_gate = Arc::new(Mutex::new(()));
         let legacy_spool = LegacySpoolAccount::new(&self.inner);
         let now = chrono::Utc::now().to_rfc3339();
         state.jobs.insert(
@@ -2032,6 +2141,7 @@ impl JobManager {
                 request_key: None,
                 shell_guard_generation: None,
                 shared_job: None,
+                shared_transition_gate: shared_transition_gate.clone(),
                 shared_graph_authoritative: false,
                 retention_anchor: None,
                 notify: Arc::new(Notify::new()),
@@ -2046,6 +2156,7 @@ impl JobManager {
             stdout_file,
             stderr_file,
             drain_writers,
+            shared_transition_gate,
             legacy_spool: Some(legacy_spool),
             inner: Arc::downgrade(&self.inner),
         })
@@ -2250,6 +2361,9 @@ impl JobManager {
             cleanup_ok
         };
         if !cleanup_ok {
+            if let Err(error) = mark_session_unresolved(&self.inner.root) {
+                tracing::error!(%error, path = %self.inner.root.display(), "could not durably mark unresolved Job evidence");
+            }
             return Err(anyhow!(
                 "job shutdown could not safely release all shared/output state; host metadata and spool session retained for inspection"
             ));
@@ -2275,14 +2389,29 @@ impl JobManager {
 
     pub(crate) fn cancel(&self, id: &str) -> JobResult<String> {
         sweep_expired(&self.inner);
-        let (should_cancel, shared_owned) = {
+        let (should_cancel, transition_gate) = {
             let state = self.inner.state.lock().expect("job manager lock");
             let entry = state
                 .available(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-            (!entry.status().terminal(), entry.shared_job.is_some())
+            (
+                !entry.status().terminal(),
+                entry.shared_transition_gate.clone(),
+            )
         };
         if should_cancel {
+            let _transition = transition_gate
+                .lock()
+                .map_err(|_| JobError::Internal(anyhow!("shared Job transition gate poisoned")))?;
+            let shared_owned = self
+                .inner
+                .state
+                .lock()
+                .expect("job manager lock")
+                .available(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
+                .shared_job
+                .is_some();
             match self.inner.shared_jobs.runtime_snapshot(id) {
                 Ok(snapshot)
                     if snapshot.lifecycle != aw_tools::filesystem::job::Lifecycle::Terminal =>
@@ -4323,112 +4452,123 @@ fn settle_shared_completion(
     completion: &JobCompletion,
     shared_owned: bool,
 ) -> SharedSettlement {
-    let terminal = (!completion.spawn_failed).then(|| shared_process_terminal(completion));
-    // A concurrent cancel/revoke may advance the shared sequence between the
-    // projection and checkpoint. Re-read a bounded number of times; this only
-    // records the already-observed process outcome and never relaunches work.
-    for _ in 0..4 {
-        let state = match inner.shared_jobs.node_state(id, 1) {
-            Ok(state) => state,
-            Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
-                return if shared_owned {
-                    tracing::warn!(%id, "shared-owned shell Job disappeared during settlement");
-                    SharedSettlement::Uncertain
-                } else {
-                    SharedSettlement::LegacyOnly
-                };
-            }
-            Err(error) => {
-                tracing::warn!(%id, ?error, "cannot inspect shared shell Job during settlement");
-                return SharedSettlement::Uncertain;
-            }
+    let transition_gate = {
+        let state = inner.state.lock().expect("job manager lock");
+        let Some(entry) = state.jobs.get(id) else {
+            return if shared_owned {
+                tracing::warn!(%id, "shared-owned shell Job disappeared before settlement");
+                SharedSettlement::Uncertain
+            } else {
+                SharedSettlement::LegacyOnly
+            };
         };
-        if let Some(settlement) = shared_terminal_settlement(state) {
-            return settlement;
+        entry.shared_transition_gate.clone()
+    };
+    let _transition = match transition_gate.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::warn!(%id, "shared Job transition gate poisoned during settlement");
+            return SharedSettlement::Uncertain;
         }
-        match state {
-            SharedNodeState::Pending => {
-                tracing::warn!(%id, "shared shell Job remained pending at host completion");
+    };
+    let terminal = (!completion.spawn_failed).then(|| shared_process_terminal(completion));
+    let state = match inner.shared_jobs.node_state(id, 1) {
+        Ok(state) => state,
+        Err(aw_tools::filesystem::job_manager::Error::NotFound) => {
+            return if shared_owned {
+                tracing::warn!(%id, "shared-owned shell Job disappeared during settlement");
+                SharedSettlement::Uncertain
+            } else {
+                SharedSettlement::LegacyOnly
+            };
+        }
+        Err(error) => {
+            tracing::warn!(%id, ?error, "cannot inspect shared shell Job during settlement");
+            return SharedSettlement::Uncertain;
+        }
+    };
+    if let Some(settlement) = shared_terminal_settlement(state) {
+        return settlement;
+    }
+    match state {
+        SharedNodeState::Pending => {
+            tracing::warn!(%id, "shared shell Job remained pending at host completion");
+            SharedSettlement::Uncertain
+        }
+        SharedNodeState::Claimed { sequence: claimed } => {
+            // Host completion without a canonical Start checkpoint is an
+            // invariant violation. Fail closed: never project it as a
+            // successful shell or infer no-effect from host state alone.
+            let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
                 return SharedSettlement::Uncertain;
-            }
-            SharedNodeState::Claimed { sequence: claimed } => {
-                // Host completion without a canonical Start checkpoint is an
-                // invariant violation. Fail closed: never project it as a
-                // successful shell or infer no-effect from host state alone.
-                let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
-                    return SharedSettlement::Uncertain;
-                };
-                let status = SharedStatus {
-                    primary: SharedPrimary::Unknown,
-                    more: false,
-                    incomplete: false,
-                };
-                match inner.shared_jobs.settle(
-                    id,
-                    1,
-                    SharedNodeState::Claimed { sequence: claimed },
-                    status,
-                    sequence,
-                    |_, _| Ok::<_, SharedJournalError>(()),
-                ) {
-                    Ok(()) => return SharedSettlement::Uncertain,
-                    Err(error) => {
-                        tracing::debug!(%id, ?error, "shared claimed settlement raced another transition; revalidating");
-                    }
+            };
+            let status = SharedStatus {
+                primary: SharedPrimary::Unknown,
+                more: false,
+                incomplete: false,
+            };
+            match inner.shared_jobs.settle(
+                id,
+                1,
+                SharedNodeState::Claimed { sequence: claimed },
+                status,
+                sequence,
+                |_, _| Ok::<_, SharedJournalError>(()),
+            ) {
+                Ok(()) => SharedSettlement::Uncertain,
+                Err(error) => {
+                    tracing::warn!(%id, ?error, "shared claimed settlement failed under the Job transition gate");
+                    SharedSettlement::Uncertain
                 }
             }
-            SharedNodeState::Running { sequence: running } => {
-                let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
-                    return SharedSettlement::Uncertain;
-                };
-                let settled = if completion.spawn_failed {
-                    inner
-                        .shared_jobs
-                        .settle(
-                            id,
-                            1,
-                            SharedNodeState::Running { sequence: running },
-                            SharedStatus {
-                                primary: SharedPrimary::Fail,
-                                more: false,
-                                incomplete: false,
-                            },
-                            sequence,
-                            |_, _| Ok::<_, SharedJournalError>(()),
-                        )
-                        .map(|()| SharedStatus {
-                            primary: SharedPrimary::Fail,
-                            more: false,
-                            incomplete: false,
-                        })
-                } else {
-                    inner.shared_jobs.settle_process(
+        }
+        SharedNodeState::Running { sequence: running } => {
+            let Ok(sequence) = next_shared_sequence(&inner.shared_jobs, id) else {
+                return SharedSettlement::Uncertain;
+            };
+            let settled = if completion.spawn_failed {
+                inner
+                    .shared_jobs
+                    .settle(
                         id,
                         1,
                         SharedNodeState::Running { sequence: running },
-                        terminal.expect("non-spawn-failure process terminal"),
+                        SharedStatus {
+                            primary: SharedPrimary::Fail,
+                            more: false,
+                            incomplete: false,
+                        },
                         sequence,
                         |_, _| Ok::<_, SharedJournalError>(()),
                     )
-                };
-                match settled {
-                    Ok(status) => {
-                        return if status.primary == SharedPrimary::Unknown {
-                            SharedSettlement::Uncertain
-                        } else {
-                            SharedSettlement::Terminal
-                        };
-                    }
-                    Err(error) => {
-                        tracing::debug!(%id, ?error, "shared process settlement raced another transition; revalidating");
-                    }
+                    .map(|()| SharedStatus {
+                        primary: SharedPrimary::Fail,
+                        more: false,
+                        incomplete: false,
+                    })
+            } else {
+                inner.shared_jobs.settle_process(
+                    id,
+                    1,
+                    SharedNodeState::Running { sequence: running },
+                    terminal.expect("non-spawn-failure process terminal"),
+                    sequence,
+                    |_, _| Ok::<_, SharedJournalError>(()),
+                )
+            };
+            match settled {
+                Ok(status) if status.primary == SharedPrimary::Unknown => {
+                    SharedSettlement::Uncertain
+                }
+                Ok(_) => SharedSettlement::Terminal,
+                Err(error) => {
+                    tracing::warn!(%id, ?error, "shared process settlement failed under the Job transition gate");
+                    SharedSettlement::Uncertain
                 }
             }
-            SharedNodeState::Terminal { .. } => unreachable!("handled above"),
         }
+        SharedNodeState::Terminal { .. } => unreachable!("handled above"),
     }
-    tracing::warn!(%id, "shared shell Job could not reach a consistent terminal checkpoint");
-    SharedSettlement::Uncertain
 }
 
 fn fail_closed_shared_completion(mut completion: JobCompletion) -> JobCompletion {
@@ -5018,23 +5158,38 @@ fn cleanup_stale_sessions(parent: &Path, current: &Path) {
             continue;
         }
         let lock_path = path.join(SESSION_LOCK_FILE);
-        let stale = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        let session_lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(lock) => match lock.try_lock() {
-                Ok(()) => true,
-                Err(fs::TryLockError::WouldBlock) => false,
+                Ok(()) => Some(lock),
+                Err(fs::TryLockError::WouldBlock) => continue,
                 Err(fs::TryLockError::Error(error)) => {
                     tracing::warn!(%error, path = %lock_path.display(), "could not inspect job session lock");
-                    false
+                    continue;
                 }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 tracing::warn!(%error, path = %lock_path.display(), "could not open job session lock");
-                false
+                continue;
             }
         };
-        if stale
-            && let Err(error) = fs::remove_dir_all(&path)
+        // Inspect retention only after the prior owner has released the lock:
+        // it creates this marker before releasing that lock on failed shutdown.
+        match fs::symlink_metadata(path.join(SESSION_UNRESOLVED_MARKER)) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "cannot inspect unresolved session marker");
+                continue;
+            }
+        }
+        // Windows cannot delete an open session lock file. There cannot be a
+        // new writer for this unique session ID once its owner has exited.
+        #[cfg(windows)]
+        drop(session_lock);
+        #[cfg(not(windows))]
+        let _session_lock = session_lock;
+        if let Err(error) = fs::remove_dir_all(&path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(%error, path = %path.display(), "could not remove stale job session");
@@ -5563,6 +5718,15 @@ mod tests {
         create_private_file(&stale_lock).unwrap();
         fs::write(stale.join("orphan.stdout"), b"orphan").unwrap();
 
+        let retained = parent.join(format!(
+            "{SESSION_PREFIX}retained-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        crate::private_state::prepare_owned_dir(&retained).unwrap();
+        create_private_file(&retained.join(SESSION_LOCK_FILE)).unwrap();
+        mark_session_unresolved(&retained).unwrap();
+        fs::write(retained.join("uncertain.stdout"), b"evidence").unwrap();
+
         let second = JobManager::new(Duration::from_secs(60)).unwrap();
         let second_job = second.create_for_test(30).unwrap();
         assert!(
@@ -5573,12 +5737,17 @@ mod tests {
             !stale.exists(),
             "an unlocked crash-leftover session must be reaped on next use"
         );
+        assert!(
+            retained.join("uncertain.stdout").exists(),
+            "explicitly retained unresolved evidence must survive the stale-session sweep"
+        );
         assert!(second.protected_path().exists());
 
         first.cancel(&first_job.id).unwrap();
         second.cancel(&second_job.id).unwrap();
         first.shutdown().await.unwrap();
         second.shutdown().await.unwrap();
+        remove_session_directory(&retained).unwrap();
     }
 
     #[tokio::test]
@@ -8416,6 +8585,56 @@ mod tests {
         assert!(entry.shared_job.is_some());
         assert!(entry.stdout_path.exists());
         assert!(entry.stderr_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_unresolved_marker_is_rehardened_and_resynced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("session-marker-resync");
+        crate::private_state::prepare_owned_dir(&root).unwrap();
+        mark_session_unresolved(&root).unwrap();
+        let marker = root.join(SESSION_UNRESOLVED_MARKER);
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+
+        mark_session_unresolved(&root).unwrap();
+
+        assert_eq!(
+            fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_shutdown_does_not_erase_evidence_on_manager_drop() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let root = manager.protected_path().to_path_buf();
+        let job = manager.create_for_test(30).unwrap();
+        claim_shared_shell(&manager, &job);
+        job.settle_unlaunched();
+        manager.inner.shared_jobs.expire_terminal(&job.id).unwrap();
+        let stdout = job.stdout_path.clone();
+        let stderr = job.stderr_path.clone();
+        drop(job);
+
+        assert!(manager.shutdown().await.is_err());
+        assert!(root.join(SESSION_UNRESOLVED_MARKER).exists());
+        drop(manager);
+        assert!(root.exists(), "failed shutdown must retain the session");
+        assert!(
+            stdout.exists(),
+            "failed shutdown must retain stdout evidence"
+        );
+        assert!(
+            stderr.exists(),
+            "failed shutdown must retain stderr evidence"
+        );
+
+        // The test intentionally injects inconsistent shared-owned state.
+        // Remove its isolated fixture only after verifying retention.
+        remove_session_directory(&root).unwrap();
     }
 
     #[tokio::test]
