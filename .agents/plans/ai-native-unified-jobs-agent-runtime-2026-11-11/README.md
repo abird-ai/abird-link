@@ -4,7 +4,7 @@ Author: Prasanna Loganathar
 Co-authors: ChatGPT GPT-5.6 Sol
 Owner: @pvl
 
-Status: **implementation-ready thin integration plan** (2026-11-12). AW owns the semantic design; dotlink `TODO.md` is checkpointed into standalone cutover, authenticated bridge, and final integration gates so unchanged native/sandbox primitives are not repeatedly requalified.
+Status: **thin integration design under review** (2026-11-12). AW owns proposed semantics; dotlink `TODO.md` separates standalone finite-Job cutover (after AW A/B contracts), authenticated bridge (after AW E), and final gates. Parallel implementation does not freeze evolving public/API contracts; unchanged native/sandbox primitives are not repeatedly requalified.
 
 Full semantic design lives in AW:
 
@@ -52,7 +52,12 @@ Model-facing Graph reuses the same flat leaf names as direct tools:
 
     ["read", {...}]
     ["bash", {...}]
-    ["agent", {...}]       # AW-host only
+    ["agent", {...}]       # AW Agent-owner Graph only; not dotlink standalone
+
+Initial vNext: **no nested `batch` as a Graph leaf on any surface**, including typed
+AW SDK/host Graphs. AW `agent` nodes are explicitly allowed with real owned Turn/child
+settlement; those Agents may create further authorized Agents under finite depth/cost/
+causal budgets. Standalone dotlink exposes no `agent` node and never creates AW Agent state.
 
 Graph admission maps the flat name through the same below-wire semantic resolver (read -> fs.read, etc.) before policy/preparation/journaling.
 
@@ -91,7 +96,7 @@ The **shared aw-tools primitives** must permit both Local and delegated executio
 
 AW host policy defaults to Local with zero auxiliary inference; advanced configuration may choose one delegated operation, DelegateAgent(Graph), or activation-time DelegateAgent(Node), with optional one-shot whole-Graph guardian. Shared preflight captures all permitted candidate routes plus conservative union footprints before roots; dynamic Node route input is restricted by AW's deterministic dependency-closed GraphActivationContext and can only narrow that envelope. AW owns model/guardian/delegate policy and coordinator/Turn state; dotlink owns only concrete Process/native Job/Graph work.
 
-**Standalone/provider-facing dotlink Graph remains on the conservative reviewed DL-150 leaf surface.** Shared `aw-tools` may support advanced registered nested `batch`/`jobs.*` leaves for typed AW host/SDK builders, but that capability never auto-expands dotlink's advertised model Graph. Any advanced bridged leaf needs an exact owner adapter, bounded depth/work, mechanical self/ancestor control-cycle rejection and original Job/Process/Graph result custody.
+**Standalone/provider-facing dotlink Graph remains on the reviewed DL-150 native/shell leaf surface.** An AW-hosted model Graph additionally admits `agent` only when AW owns its Agent/Turn/effect settlement. **Nested `batch` is rejected by every Graph entrypoint, including SDK/host; no generic registry activation may bypass this.** Advanced `jobs.*` Graph controls are typed AW SDK/host-only after an explicit owner/Control/result/cycle qualification, never implicitly model-exposed or implemented by standalone dotlink. Child Agent depth/cost/causal authority belongs to AW, not dotlink.
 
 dotlink does not own/copy:
 - AW principal/project/Agent namespace state;
@@ -107,7 +112,9 @@ AW resolves authenticated direct/team-role grant-path evidence from its existing
 
 At the original concrete native/Process/Graph/Job owner, dotlink must independently check its **current local profile/sandbox/launcher/source/site/resource/transport grants and deny precedence**. A remote AW authorization is a required upstream gate, **not sufficient local native authority**. The effective bridge permission is the intersection of both sides' applicable restrictions; unknown/expired domain membership, target owner or source version blocks a new effect. Local means original executor and may point to a remote dotlink host when site is granted; DelegateAgent means AW model coordination, not dotlink provider execution. The existing exact process/input/ACK/replay rules still apply after any policy or route choice.
 
-The dotlink registry/router may carry only exact resolved routing identity and minimum epoch/capability proof needed to reach its owner, never a shadow Agent state store or a second scoped policy database. All source-owner event registration/wake restrictions remain unchanged.
+**Cross-host Start boundary:** before every *new* remote effect/Process stdin delivery, AW's authoritative owner commits a single-use, replay-bound Start authorization after checking **current** original actor/grant/source/site/resource/membership/policy/writer epochs. This AW transaction serializes with revocation. Dotlink authenticates that exact attempt/proof, rechecks its **current** local launcher/sandbox authority and claims the attempt once before effects. Revocation committed before AW Start denies; revocation after accepted Start cannot retroactively undo a possibly launched operation. A stronger no-physical-launch-after-revocation guarantee requires fencing/draining accepted Starts before declaring revoke quiescent. AW disconnection/stale proof/unknown attempt blocks fresh effects without blind retries. This is a private owner protocol, not a second authority store, reusable offline token or extra standalone Local hop.
+
+The dotlink registry/router carries only exact routing identity and minimum signed/current Start provenance needed by its concrete owner, never shadow Agent state or a second scoped policy database. Source-owner event/wake restrictions remain unchanged.
 
 The generic wire/API must not grow node/turn/step fields. Shared handles use the same delimiter-safe canonical lexical grammar as AW. Execution suffixes are owner-typed; Graph nodes use directly derivable n:<1-based coordinate> segments (n:0/leading zeros invalid), and any n:<coordinate>/j:<handle> continuation exists only for genuinely independent durable child work. Agent t:<handle>/Step semantics remain AW-owned, and Step has no public path segment.
 
@@ -117,7 +124,7 @@ The generic wire/API must not grow node/turn/step fields. Shared handles use the
 
 The shared `aw-tools` core provides only small **host-neutral coordination extension points**—opaque original request/provenance, owner/writer admission epoch, typed accepted/unknown Job/Graph receipt and existing callbacks. `aw-tools-adapter` binds those to **AW's original authorized executor**; neither shared core nor dotlink implements user/team memberships, session-wide audience, shared-draft collaboration, per-participant Agent inbox, provider/payer selection or a new TeamAgent type.
 
-On a bridged call, AW resolves the real Step/request actor, current Session/branch membership/audience, exact writer fences, workspace/domain restrictions, original ToolPolicy/Envelope and payer/provider policy. The **exact original operation/request ID plus bounded authorized actor/source/resource/site/epoch envelope** flows to dotlink; no participant-rights union or Session-owner privilege is inferred downstream. Durable/multi-writer remote sites require real writer Epoch fences—`NotApplicable` is valid only where AW's authoritative backend truly has no corresponding fence. Dotlink independently checks current launcher/sandbox/source/site/Process/Graph authority and returns factual receipts. AW upstream permission is necessary but never sufficient.
+On a bridged call, AW resolves the real Step/request actor, current Session/branch membership/audience, exact writer fences, workspace/domain restrictions, original ToolPolicy/Envelope and payer/provider policy. The **exact original operation/request ID plus a fresh AW Start-authorized actor/source/resource/site/epoch proof** reaches dotlink for each new effect; a stale earlier envelope is not an execution grant. No participant-rights union or Session-owner privilege is inferred downstream. Durable/multi-writer remote sites require real writer Epoch fences—`NotApplicable` is valid only where AW's authoritative backend truly has no corresponding fence. Dotlink independently checks current launcher/sandbox/source/site/Process/Graph authority and returns factual receipts. AW upstream permission is necessary but never sufficient.
 
 Full Session sharing preserves the same AW coordinator and only currently authorized history. Approved-context sharing creates a new sanitized AW Session rather than treating a private Session branch as a disclosure boundary. Member revocation invalidates future commands/reads/inference/wake under current epochs and cannot cause a remote Process to be falsely declared stopped. A stale remote Workspace writer/follower cannot create a second AW Session coordinator or replay an already-effectful request. Moving a personally owned Session into a team workspace requires explicit AW ownership transfer/import with new target identities, not an automatic reaction to sharing.
 

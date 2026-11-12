@@ -8,8 +8,11 @@ Session, Agent, guardian or routing semantics here.
 
 ## Integration discipline
 
-- Start after AW has a reviewed implementation revision through Checkpoint E.
-- Pin/consume one exact shared AW revision; no sibling path/copy.
+- **D1 standalone finite Jobs** may start after AW **Checkpoints A/B** expose reviewed shared
+  ref/Job contracts. It does not depend on AW Session sharing or delegated Agents.
+- **D2 AW-authenticated bridge** waits for AW **Checkpoint E** and policy/Start admission
+  contract. D3 follows D2; AW final G validates the product together.
+- Pin/consume one exact reviewed shared AW revision at each integration boundary; no sibling path/copy.
 - Develop with targeted checks. Run the grouped dotlink checkpoint once per vertical slice,
   not after every edit.
 - Carry forward unchanged sandbox/native/replay results; re-run them only when their owner or
@@ -25,8 +28,10 @@ Session, Agent, guardian or routing semantics here.
 - [ ] Preserve Process natural stdout, Graph natural result/node coordinate reads, retention/ACK,
       same-Job handoff, stdin current-authority checks, cancellation/unknown settlement,
       replay/MCP Task ownership and protected-path/sandbox invariants.
-- [ ] Keep standalone/model Graph on the conservative DL-150 leaf surface; advanced host/SDK
-      leaves do not expand provider schema.
+- [ ] Keep standalone/model Graph on reviewed DL-150 native/shell leaves. AW-hosted model
+      Graphs additionally allow `agent` with original Agent/Turn/child-effect owner; dotlink
+      standalone never exposes it. **Nested `batch` is rejected on model/SDK/host Graphs**.
+      Qualified typed SDK/host `jobs.*` leaves do not expand the standalone provider schema.
 
 ### Dotlink checkpoint 1 — standalone
 - [ ] Run together: flat catalog, shell sync/handoff/background, Graph whole/node reads,
@@ -35,10 +40,15 @@ Session, Agent, guardian or routing semantics here.
 
 ## D2 — authenticated AW bridge
 
-- [ ] Accept only AW-resolved canonical refs/operations and bounded upstream actor/source/site/
-      epoch/grant/writer evidence. AW Policy/Session/team semantics remain opaque upstream facts.
-- [ ] Require both upstream AW authority and current local dotlink launcher/sandbox/source/site/
-      resource authority for every native effect.
+- [ ] Accept only AW-resolved canonical refs/operations and authenticated original replay ID,
+      actor/source/site/resource/grant/membership/writer provenance. AW Policy/Session/team
+      semantics remain opaque upstream facts.
+- [ ] Define one **per-attempt AW source-fenced Start authorization**: existing AW authority
+      owner atomically rechecks current epochs/grants and records Start against the original
+      invocation, serialized with revocation. dotlink checks a fresh exact single-use proof and
+      current local launcher/sandbox/source/site/resource authority before effects. Old
+      upstream envelopes cannot substitute for Start; AW offline/mismatched/unknown attempt
+      blocks new work; already committed/unknown effects remain truthful.
 - [ ] Preserve WriterFence requirements for durable/multi-writer remote ownership.
 - [ ] Keep Agent jobs/read/filter/history/parent state owned by AW. Standalone dotlink never stores it.
 - [ ] Reject constructor wake and later subscribe on dotlink-owned live Process/Graph sources until
@@ -47,7 +57,9 @@ Session, Agent, guardian or routing semantics here.
 ### Dotlink checkpoint 2 — bridge
 - [ ] Run together: AW→remote Process/Graph execution/control/read, stale writer/source/site denial,
       missing local sandbox grant despite upstream allow, revoked stdin before bytes, duplicate
-      request idempotence, no Agent state leakage, unsupported remote wake rejection.
+      request idempotence, no Agent state leakage, unsupported remote wake rejection. Race
+      AW revoke against remote Start: revoke-first denies; Start-first is one accepted/unknown
+      attempt; offline AW/stale proof cannot authorize another effect. No double launch.
 
 ## D3 — cutover cleanup + final integration gate
 
@@ -68,8 +80,8 @@ Session, Agent, guardian or routing semantics here.
 ## Completion
 
 dotlink integration is complete when the standalone surface is canonical, the AW bridge remains
-thin and authority-intersecting, no old route is reachable, no Agent/Session/Policy engine exists
-in dotlink, and all applicable grouped checkpoints pass.
+thin, current-authority-intersecting and source-fenced at remote Start, no old route is reachable,
+no Agent/Session/Policy engine exists in dotlink, and all applicable grouped checkpoints pass.
 
 ## Execution guard
 
