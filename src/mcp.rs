@@ -2618,7 +2618,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 .build(),
         )
         .with_server_info(Implementation::new("dotlink", env!("CARGO_PKG_VERSION")))
-        .with_instructions(format!("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. JSON results carry `ts` (UTC epoch seconds): keep the first `ts` of the current turn as your anchor and aim to checkpoint with a short summary around {} minutes.", crate::limits::TURN_CHECKPOINT_MINUTES).to_owned())
+        .with_instructions(format!("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. Shell and job results carry `ts` (UTC epoch seconds): keep the first `ts` of the current turn as your anchor and aim to checkpoint with a short summary around {} minutes. File-tool results are paged and carry no clock, so read it from the shell or job result surrounding them.", crate::limits::TURN_CHECKPOINT_MINUTES).to_owned())
     }
 
     async fn get_task(
