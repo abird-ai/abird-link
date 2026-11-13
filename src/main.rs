@@ -979,6 +979,17 @@ fn resolve_verbosity(
     }
 }
 
+/// Selected profile: explicit CLI flag, then `DOTLINK_PROFILE`, else the
+/// default profile. The module sets the environment form so a drop-in can
+/// switch profiles without touching `ExecStart`.
+fn selected_profile(args: &Args) -> Option<String> {
+    args.profile.clone().or_else(|| {
+        std::env::var("DOTLINK_PROFILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
 async fn run_main(supervisor: &Supervisor) -> Result<()> {
     let args = parse_args();
     let launch_dir = std::env::current_dir()?;
@@ -986,8 +997,14 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
     let verbosity_env = std::env::var(VERBOSITY_ENV).ok();
     let (verbose, quiet) = resolve_verbosity(args.verbose, args.quiet, verbosity_env.as_deref())
         .map_err(recovery::config_failure)?;
-    let log = LogConfig::new(verbose, quiet, args.color);
-    let setup_color = args.color.stdout_enabled();
+    // An explicit `--color` wins; otherwise the environment may choose one.
+    let color = if args.color == ColorMode::Auto {
+        ColorMode::from_env().unwrap_or(args.color)
+    } else {
+        args.color
+    };
+    let log = LogConfig::new(verbose, quiet, color);
+    let setup_color = color.stdout_enabled();
     let default_filter = "dotlink=warn";
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_filter))
@@ -1186,13 +1203,13 @@ fn oauth_profile_target(name: &str) -> Option<&str> {
 /// ordinary command failures.
 async fn run_one_shot(args: &Args, launch_dir: &Path, setup_color: bool) -> Result<()> {
     if args.setup {
-        load_or_setup(true, args.profile.as_deref(), setup_color).await?;
+        load_or_setup(true, selected_profile(args).as_deref(), setup_color).await?;
     } else if args.print_id {
-        let tunnel_id = setup::configured_tunnel_id(args.profile.as_deref())?
+        let tunnel_id = setup::configured_tunnel_id(selected_profile(args).as_deref())?
             .ok_or_else(|| anyhow::anyhow!("OpenAI transport is not configured"))?;
         println!("{tunnel_id}");
     } else {
-        let defaults = setup::inspection_permissions(args.profile.as_deref())?;
+        let defaults = setup::inspection_permissions(selected_profile(args).as_deref())?;
         let policy = Policy::from_args(args, launch_dir.to_path_buf(), &defaults)?;
         let descriptions = LocalMachine::inspect_tool_descriptions(
             AccessSpec {
@@ -1313,9 +1330,17 @@ async fn plan_runtime(
     setup_color: bool,
     openai_state: &transports::openai::ProcessState,
 ) -> Result<Option<RuntimePlan>> {
-    let Some(mut setup) = load_or_setup(false, args.profile.as_deref(), setup_color).await? else {
+    let Some(mut setup) =
+        load_or_setup(false, selected_profile(args).as_deref(), setup_color).await?
+    else {
         return Ok(None);
     };
+
+    // Nothing above the profile set a level: adopt the saved one. CLI flags and
+    // DOTLINK_VERBOSITY were already resolved into the logger.
+    if args.verbose == 0 && !args.quiet && std::env::var_os(VERBOSITY_ENV).is_none() {
+        log.set_verbosity(setup.config.logging.verbosity.as_verbose());
+    }
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
 
@@ -1353,7 +1378,7 @@ async fn plan_runtime(
 
     let http_auth = resolve_http_auth(args, &setup.config.oauth, &local_transports, http_bind)?;
     let oauth_runtime = if http_auth.local_oauth || http_auth.ngrok_oauth {
-        Some(oauth::Runtime::load(args.profile.as_deref())?)
+        Some(oauth::Runtime::load(selected_profile(args).as_deref())?)
     } else {
         None
     };
@@ -1432,7 +1457,12 @@ async fn prepare_runtime(
     hardware::add_to_shell(&mut host_shell, policy.allow_kvm, &policy.allow_gpu)?;
     if policy.allow_shell && policy.sandbox_shell {
         let mut caches = setup.config.caches.clone();
-        for override_cache in cache_grants_for_cli(&args.cache_flags.requested()).await? {
+        let mut requests = setup::env_cache_requests()?;
+        for (kind, mode) in args.cache_flags.requested() {
+            requests.retain(|(existing, _)| *existing != kind);
+            requests.push((kind, mode));
+        }
+        for override_cache in cache_grants_for_cli(&requests).await? {
             caches.retain(|saved| saved.kind != override_cache.kind);
             caches.push(override_cache);
         }
@@ -1468,7 +1498,7 @@ async fn prepare_runtime(
         #[cfg(target_os = "linux")]
         host_shell,
         log: log.clone(),
-        serialize: args.serialize,
+        serialize: args.serialize || setup.config.serialize,
         allow_shell: policy.allow_shell,
         sandbox_shell: policy.sandbox_shell,
         allow_network: policy.allow_network,
@@ -1600,7 +1630,7 @@ async fn run_runtime(
     print_banner(
         &active_transports,
         &machine,
-        args.profile.as_deref(),
+        selected_profile(args).as_deref(),
         log,
         args.allow_all,
         controls_available,
@@ -3284,11 +3314,11 @@ mod tests {
     fn profile_and_setup_can_be_combined() {
         let args = Args::try_parse_from(["dotlink", "--setup", "-p", "work"]).unwrap();
         assert!(args.setup);
-        assert_eq!(args.profile.as_deref(), Some("work"));
+        assert_eq!(selected_profile(&args).as_deref(), Some("work"));
 
         let args = Args::try_parse_from(["dotlink", "-S", "-p", "work"]).unwrap();
         assert!(args.setup);
-        assert_eq!(args.profile.as_deref(), Some("work"));
+        assert_eq!(selected_profile(&args).as_deref(), Some("work"));
     }
 
     #[test]

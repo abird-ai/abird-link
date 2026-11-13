@@ -199,7 +199,7 @@ SHA-256 precondition without retaining source plus output in memory.
 
 ## Profiles and persisted defaults
 
-The default config is `~/.config/abird/dotlink/config.jsonc`. Named profiles use `config.<profile>.jsonc` and are selected with `-p/--profile`. Setup can target the same profile with `-S/--setup -p <name>`. Schema v10 JSONC supports line/block comments and trailing commas. Compatible older schemas migrate forward in memory through explicit version-to-version migration steps (currently v9 → v10); newer schemas and older versions without a defined migration path are rejected. Migrated profiles are serialized as the current schema when they are next edited or saved.
+The default config is `~/.config/abird/dotlink/config.jsonc`. Named profiles use `config.<profile>.jsonc` and are selected with `-p/--profile`. Setup can target the same profile with `-S/--setup -p <name>`. Schema v11 JSONC supports line/block comments and trailing commas. Compatible older schemas migrate forward in memory through explicit version-to-version migration steps (currently v9 → v10); newer schemas and older versions without a defined migration path are rejected. Migrated profiles are serialized as the current schema when they are next edited or saved.
 
 Each profile persists transport behavior plus the local permission model:
 

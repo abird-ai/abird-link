@@ -168,7 +168,9 @@
       type = types.enum ["lifecycle" "tools" "requests"];
       default = verbosityDefault;
       description = ''
-        Lifecycle status only, tool activity, or MCP request diagnostics.
+        Lifecycle status only, tool activity, or MCP request diagnostics. Every
+        option here is passed as an environment variable so a systemd drop-in
+        can override it; the generated unit carries no command-line flags.
         Tool logging may contain paths and command fragments.
 
         Passed as `DOTLINK_VERBOSITY`, not as a command-line flag, so the
@@ -297,7 +299,7 @@
 
   makeService = name: instance: let
     profile = effectiveProfile name instance;
-    # DOTLINK_CONFIG is a *base* path. With --profile NAME, the loader
+    # DOTLINK_CONFIG is a *base* path. With DOTLINK_PROFILE set, the loader
     # selects its sibling config.NAME.jsonc, which keeps credentials and
     # OAuth state independent for named declarative instances too.
     configPath =
@@ -308,7 +310,7 @@
           then "config.jsonc"
           else "config.${profile}.jsonc"
         )
-        (builtins.toJSON (instance.settings // {version = 10;}))}/config.jsonc"
+        (builtins.toJSON (instance.settings // {version = 11;}))}/config.jsonc"
       else instance.configFile;
     hostEnabled =
       instance.hostAccess.nixDaemon
@@ -317,18 +319,6 @@
       || instance.hostAccess.gitConfig
       || instance.hostAccess.kvm
       || instance.hostAccess.gpu != [];
-    args =
-      ["--no-stdio" "--color=never"]
-      ++ lib.optionals (hostEnabled || instance.cacheAccess != {}) ["--allow-shell"]
-      ++ lib.optionals instance.hostAccess.nixDaemon ["--allow-nix-daemon"]
-      ++ lib.optionals instance.hostAccess.nixConfig ["--allow-nix-config"]
-      ++ lib.optionals instance.hostAccess.sshAgent ["--allow-ssh-agent"]
-      ++ lib.optionals instance.hostAccess.gitConfig ["--allow-git-config"]
-      ++ lib.optionals instance.hostAccess.kvm ["--allow-kvm"]
-      ++ map (vendor: "--allow-gpu=${vendor}") instance.hostAccess.gpu
-      ++ lib.mapAttrsToList (name: mode: "--allow-cache-${name}=${mode}") instance.cacheAccess
-      ++ lib.optionals instance.serialize ["--serialize"]
-      ++ lib.optionals (profile != null) ["--profile=${profile}"];
     credentials =
       lib.optionals (instance.credentials.runtimeApiKeyFile != null)
       ["dotlink-api-key:${instance.credentials.runtimeApiKeyFile}"]
@@ -337,6 +327,42 @@
     serviceEnv =
       instance.environment
       // {DOTLINK_SUPERVISOR = "systemd";}
+      // {
+        DOTLINK_STDIO = "0";
+        DOTLINK_COLOR = "never";
+      }
+      // lib.optionalAttrs (hostEnabled || instance.cacheAccess != {}) {
+        DOTLINK_ALLOW_SHELL = "1";
+      }
+      // lib.optionalAttrs instance.hostAccess.nixDaemon {
+        DOTLINK_ALLOW_NIX_DAEMON = "1";
+      }
+      // lib.optionalAttrs instance.hostAccess.nixConfig {
+        DOTLINK_ALLOW_NIX_CONFIG = "1";
+      }
+      // lib.optionalAttrs instance.hostAccess.sshAgent {
+        DOTLINK_ALLOW_SSH_AGENT = "1";
+      }
+      // lib.optionalAttrs instance.hostAccess.gitConfig {
+        DOTLINK_ALLOW_GIT_CONFIG = "1";
+      }
+      // lib.optionalAttrs instance.hostAccess.kvm {
+        DOTLINK_ALLOW_KVM = "1";
+      }
+      // lib.optionalAttrs (instance.hostAccess.gpu != []) {
+        DOTLINK_ALLOW_GPU = lib.concatStringsSep "," instance.hostAccess.gpu;
+      }
+      // lib.optionalAttrs (instance.cacheAccess != {}) {
+        DOTLINK_CACHES = lib.concatStringsSep "," (
+          lib.mapAttrsToList (name: mode: "${name}:${mode}") instance.cacheAccess
+        );
+      }
+      // lib.optionalAttrs instance.serialize {
+        DOTLINK_SERIALIZE = "1";
+      }
+      // lib.optionalAttrs (profile != null) {
+        DOTLINK_PROFILE = profile;
+      }
       // lib.optionalAttrs (instance.logging.verbosity != "lifecycle") {
         DOTLINK_VERBOSITY = instance.logging.verbosity;
       }
@@ -372,7 +398,7 @@
         User = instance.user;
         SetLoginEnvironment = true;
         WorkingDirectory = instance.workingDirectory;
-        ExecStart = "${lib.getExe instance.package} ${lib.concatStringsSep " " args}";
+        ExecStart = lib.getExe instance.package;
         # Exit 2 (usage) and 78 (CONFIG) need the operator. Exit 6
         # (NOTCONFIGURED) means first-run setup has not run yet: it is a clean
         # stop, so an unprovisioned host never fails its own switch.

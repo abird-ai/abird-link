@@ -271,7 +271,21 @@ Shell access requires at least one readable directory.
 
 ## Logging level
 
-`-q` silences activity logging, `-v` logs TOOL activity and `-vv` adds REQ diagnostics. Settings resolve in one order everywhere: CLI flag > `DOTLINK_*` environment > saved profile > built-in default. Verbosity has no profile field, so `-q`/`-v`/`-vv` sit above `DOTLINK_VERBOSITY`, which supplies `lifecycle`, `tools` or `requests` and sits above the default. A systemd drop-in can therefore set the level with `Environment=` instead of overriding `ExecStart`, which would pin the package store path and silently freeze upgrades. An unrecognized value is an operator configuration error that names the accepted values.
+`-q` silences activity logging, `-v` logs TOOL activity and `-vv` adds REQ diagnostics. Settings resolve in one order everywhere: CLI flag > `DOTLINK_*` environment > saved profile > built-in default.
+
+The environment layer covers every setting the NixOS module can express, so a deployed unit carries no command-line flags and a systemd drop-in can override any of them without replacing `ExecStart` (which would pin the package store path and silently freeze upgrades):
+
+- `DOTLINK_PROFILE` — named profile
+- `DOTLINK_VERBOSITY` — `lifecycle`, `tools` or `requests` (profile field `logging.verbosity`)
+- `DOTLINK_SERIALIZE` — boolean (profile field `serialize`)
+- `DOTLINK_STDIO` — boolean (profile field `transports.stdio`)
+- `DOTLINK_ALLOW_SHELL`, `DOTLINK_ALLOW_NETWORK` — boolean
+- `DOTLINK_ALLOW_NIX_DAEMON`, `DOTLINK_ALLOW_NIX_CONFIG`, `DOTLINK_ALLOW_SSH_AGENT`, `DOTLINK_ALLOW_GIT_CONFIG`, `DOTLINK_ALLOW_KVM` — boolean
+- `DOTLINK_ALLOW_GPU` — `amd,nvidia`
+- `DOTLINK_CACHES` — `cargo-registry:rw,go-mod:ro`
+- `DOTLINK_COLOR` — `auto`, `always` or `never` (used when no `--color` is given)
+
+Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value is an operator configuration error that names the accepted spellings for that variable. Environment grants merge exactly like their CLI counterparts: allows are additive, denies still win, so an override can add a grant but revocation stays a deny rule or a profile edit.
 
 ## Runtime terminal controls
 
@@ -308,7 +322,7 @@ fails startup; a stale inherited `SSH_AUTH_SOCK` may fall back to GCR. See
 ## Hardware acceleration
 
 Linux Bubblewrap supports `--allow-kvm` and repeatable
-`--allow-gpu=amd`/`--allow-gpu=nvidia`. Profile schema v10 has additive,
+`--allow-gpu=amd`/`--allow-gpu=nvidia`. Profile schema v11 has additive,
 default-disabled `permissions.allow_kvm: bool` and
 `permissions.allow_gpu: ["amd", "nvidia"]` fields. Persist with
 `dotlink profile enable/disable <name> kvm|gpu-amd|gpu-nvidia` or opt in

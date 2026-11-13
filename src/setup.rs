@@ -180,6 +180,45 @@ impl Default for PermissionConfig {
     }
 }
 
+/// Logging verbosity a saved profile may carry.
+///
+/// Uses the same three words as the CLI flags and the NixOS module:
+/// `lifecycle` (quiet), `tools` (-v) or `requests` (-vv).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogVerbosity {
+    #[default]
+    Lifecycle,
+    Tools,
+    Requests,
+}
+
+impl LogVerbosity {
+    /// CLI verbosity count this level maps to.
+    pub fn as_verbose(self) -> u8 {
+        match self {
+            Self::Lifecycle => 0,
+            Self::Tools => 1,
+            Self::Requests => 2,
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "lifecycle" => Some(Self::Lifecycle),
+            "tools" => Some(Self::Tools),
+            "requests" => Some(Self::Requests),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub verbosity: LogVerbosity,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheKind {
@@ -199,6 +238,27 @@ pub enum CacheKind {
 }
 
 impl CacheKind {
+    /// Parse the kebab/snake name used by `--allow-cache-<name>` and
+    /// `DOTLINK_CACHES`.
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value.trim().replace('_', "-").as_str() {
+            "cargo-registry" => Some(Self::CargoRegistry),
+            "cargo-git" => Some(Self::CargoGit),
+            "npm" => Some(Self::Npm),
+            "pnpm" => Some(Self::Pnpm),
+            "yarn" => Some(Self::Yarn),
+            "pip" => Some(Self::Pip),
+            "uv" => Some(Self::Uv),
+            "go-mod" => Some(Self::GoMod),
+            "go-build" => Some(Self::GoBuild),
+            "maven" => Some(Self::Maven),
+            "gradle" => Some(Self::Gradle),
+            "sccache" => Some(Self::Sccache),
+            "ccache" => Some(Self::Ccache),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub const ALL: [Self; 13] = [
         Self::CargoRegistry,
@@ -396,6 +456,12 @@ pub struct AppConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
 
+    /// Serialize MCP tool calls instead of running them concurrently.
+    #[serde(default)]
+    pub serialize: bool,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+
     #[serde(default = "default_shell_timeout")]
     pub max_shell_timeout_secs: u64,
     #[serde(default = "default_output_bytes")]
@@ -457,7 +523,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    10
+    11
 }
 
 fn default_true() -> bool {
@@ -534,6 +600,8 @@ fn default_app_config() -> AppConfig {
         owner_password_revision: None,
         organization_id: None,
         base_url: default_base_url(),
+        serialize: false,
+        logging: LoggingConfig::default(),
         max_shell_timeout_secs: default_shell_timeout(),
         max_output_bytes: default_output_bytes(),
         max_read_bytes: default_file_bytes(),
@@ -561,6 +629,9 @@ fn migrate_config(mut config: AppConfig) -> Result<AppConfig> {
             // retain the same meaning under v10 unless the new public-ingress
             // safety validation requires the user to configure OAuth explicitly.
             9 => config.version = 10,
+            // v11 adds two additive/defaulted fields: serialize (false) and
+            // logging.verbosity (lifecycle). Saved v10 values keep their meaning.
+            10 => config.version = 11,
             version => {
                 bail!(
                     "profile uses schema version {version}; no automatic migration path to version {current} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one"
@@ -809,6 +880,56 @@ fn config_from_env() -> Result<Option<(AppConfig, Option<credentials::Credential
     Ok(Some((config, runtime_source)))
 }
 
+/// Parse a boolean environment value. Accepts the same spellings an operator
+/// is likely to type in a systemd drop-in.
+fn parse_env_flag(name: &str, raw: &str) -> Result<Option<bool>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => bail!("{name} must be a boolean (1/0, true/false), not {other:?}"),
+    }
+}
+
+fn env_flag(name: &str) -> Result<Option<bool>> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(None);
+    };
+    parse_env_flag(name, &raw.to_string_lossy())
+}
+
+/// `DOTLINK_CACHES=cargo-registry:rw,go-mod:ro` as CLI-equivalent requests.
+///
+/// Returned in order so a caller can let a later layer override an earlier one
+/// for the same cache kind. Resolution to concrete paths is async and lives
+/// next to the `--allow-cache-*` resolver.
+pub fn env_cache_requests() -> Result<Vec<(CacheKind, CacheMode)>> {
+    let Some(raw) = env::var_os("DOTLINK_CACHES") else {
+        return Ok(Vec::new());
+    };
+    parse_cache_requests(&raw.to_string_lossy())
+}
+
+fn parse_cache_requests(raw: &str) -> Result<Vec<(CacheKind, CacheMode)>> {
+    let mut requests = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, mode) = match entry.split_once(':') {
+            Some((name, mode)) => (name, mode),
+            None => (entry, "ro"),
+        };
+        let kind = CacheKind::from_name(name)
+            .ok_or_else(|| anyhow!("DOTLINK_CACHES has unknown cache kind {name:?}"))?;
+        let mode = match mode.trim().to_ascii_lowercase().as_str() {
+            "ro" => CacheMode::ReadOnly,
+            "rw" => CacheMode::ReadWrite,
+            other => bail!("DOTLINK_CACHES mode must be ro or rw, not {other:?}"),
+        };
+        requests.retain(|(existing, _)| *existing != kind);
+        requests.push((kind, mode));
+    }
+    Ok(requests)
+}
+
 fn apply_env_overrides(
     config: &mut AppConfig,
     include_secret_connection: bool,
@@ -837,6 +958,61 @@ fn apply_env_overrides(
     // once by the caller and also carries the path that must be protected.
     if let Some(source) = runtime_source {
         config.runtime_api_key = source.secret().to_owned();
+    }
+
+    // Non-secret settings follow the same order as everything else: explicit
+    // CLI flags are applied later (and win), these environment values override
+    // the saved profile, and the profile overrides the built-in default.
+    if let Some(enabled) = env_flag("DOTLINK_SERIALIZE")? {
+        config.serialize = enabled;
+    }
+    if let Some(stdio) = env_flag("DOTLINK_STDIO")? {
+        config.transports.stdio = stdio;
+    }
+    if let Some(level) = env::var_os("DOTLINK_VERBOSITY") {
+        let raw = level.to_string_lossy();
+        if !raw.trim().is_empty() {
+            let parsed = LogVerbosity::parse(&raw).ok_or_else(|| {
+                anyhow!("DOTLINK_VERBOSITY must be lifecycle, tools or requests, not {raw:?}")
+            })?;
+            config.logging.verbosity = parsed;
+        }
+    }
+    for (name, apply) in [
+        ("DOTLINK_ALLOW_SHELL", 0usize),
+        ("DOTLINK_ALLOW_NETWORK", 1),
+        ("DOTLINK_ALLOW_NIX_DAEMON", 2),
+        ("DOTLINK_ALLOW_NIX_CONFIG", 3),
+        ("DOTLINK_ALLOW_SSH_AGENT", 4),
+        ("DOTLINK_ALLOW_GIT_CONFIG", 5),
+        ("DOTLINK_ALLOW_KVM", 6),
+    ] {
+        let Some(enabled) = env_flag(name)? else {
+            continue;
+        };
+        match apply {
+            0 => config.permissions.allow_shell = enabled,
+            1 => config.permissions.allow_network = enabled,
+            2 => config.permissions.allow_nix_daemon = enabled,
+            3 => config.permissions.allow_nix_config = enabled,
+            4 => config.permissions.allow_ssh_agent = enabled,
+            5 => config.permissions.allow_git_config = enabled,
+            _ => config.permissions.allow_kvm = enabled,
+        }
+    }
+    if let Some(vendors) = env_first(&["DOTLINK_ALLOW_GPU"]) {
+        let mut parsed = Vec::new();
+        for vendor in vendors.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let vendor = match vendor.trim() {
+                "amd" => GpuVendor::Amd,
+                "nvidia" => GpuVendor::Nvidia,
+                other => bail!("DOTLINK_ALLOW_GPU has unknown vendor {other:?}; use amd or nvidia"),
+            };
+            if !parsed.contains(&vendor) {
+                parsed.push(vendor);
+            }
+        }
+        config.permissions.allow_gpu = parsed;
     }
     Ok(())
 }
@@ -3343,6 +3519,8 @@ mod tests {
             oauth: OAuthConfig::default(),
             permissions: PermissionConfig::default(),
             caches: Vec::new(),
+            serialize: false,
+            logging: LoggingConfig::default(),
             tunnel_id: Some("tunnel_0123456789abcdef0123456789abcdef".to_owned()),
             runtime_api_key: "secret-runtime-key".to_owned(),
             runtime_key_revision: None,
@@ -3995,7 +4173,39 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_migrates_to_v10_with_additive_defaults() {
+    fn env_override_parsers_reject_typos_and_default_to_read_only() {
+        assert_eq!(parse_env_flag("X", "1").unwrap(), Some(true));
+        assert_eq!(parse_env_flag("X", " off ").unwrap(), Some(false));
+        assert_eq!(parse_env_flag("X", "").unwrap(), None);
+        let error = parse_env_flag("X", "maybe").unwrap_err().to_string();
+        assert!(error.contains("boolean"), "{error}");
+
+        assert_eq!(
+            LogVerbosity::parse("requests"),
+            Some(LogVerbosity::Requests)
+        );
+        assert_eq!(LogVerbosity::parse(" tools "), Some(LogVerbosity::Tools));
+        assert_eq!(LogVerbosity::parse("debug"), None);
+        assert_eq!(LogVerbosity::Requests.as_verbose(), 2);
+
+        let requests = parse_cache_requests("cargo-registry:rw, go_mod, ccache:RO").unwrap();
+        assert_eq!(
+            requests,
+            vec![
+                (CacheKind::CargoRegistry, CacheMode::ReadWrite),
+                (CacheKind::GoMod, CacheMode::ReadOnly),
+                (CacheKind::Ccache, CacheMode::ReadOnly),
+            ]
+        );
+        // A later entry for the same kind replaces the earlier one.
+        let deduped = parse_cache_requests("npm:rw,npm:ro").unwrap();
+        assert_eq!(deduped, vec![(CacheKind::Npm, CacheMode::ReadOnly)]);
+        assert!(parse_cache_requests("npm:bogus").is_err());
+        assert!(parse_cache_requests("not-a-cache").is_err());
+    }
+
+    #[test]
+    fn schema_v9_migrates_to_current_with_additive_defaults() {
         let v9 = r#"
         {
           "version": 9,
@@ -4020,8 +4230,11 @@ mod tests {
         assert!(parsed.oauth.public_url.is_none());
 
         let migrated = migrate_config(parsed).unwrap();
-        assert_eq!(migrated.version, 10);
+        assert_eq!(migrated.version, config_version());
         assert!(migrated.transports.stdio);
+        // v11 additive defaults keep a pre-v11 profile conservative.
+        assert!(!migrated.serialize);
+        assert_eq!(migrated.logging.verbosity, LogVerbosity::Lifecycle);
         assert!(migrated.transports.ngrok_domain.is_none());
         assert!(!migrated.oauth.enabled);
         assert_eq!(
@@ -4059,7 +4272,7 @@ mod tests {
         config.oauth = OAuthConfig::default();
 
         let mut migrated = migrate_config(config).unwrap();
-        assert_eq!(migrated.version, 10);
+        assert_eq!(migrated.version, config_version());
         let error = validate_config_structure(&migrated).unwrap_err();
         assert!(
             error
@@ -4080,9 +4293,9 @@ mod tests {
         let error = migrate_config(config.clone()).err().unwrap();
         assert!(error.to_string().contains("no automatic migration path"));
 
-        config.version = 11;
+        config.version = 12;
         let error = migrate_config(config).err().unwrap();
-        assert!(error.to_string().contains("newer schema version 11"));
+        assert!(error.to_string().contains("newer schema version 12"));
 
         let missing =
             parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);

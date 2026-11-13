@@ -22,6 +22,16 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
+    /// `DOTLINK_COLOR=auto|always|never`, for services and drop-ins.
+    pub fn from_env() -> Option<Self> {
+        match std::env::var("DOTLINK_COLOR").ok()?.trim() {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
     pub fn stdout_enabled(self) -> bool {
         match self {
             Self::Auto => io::stdout().is_terminal(),
@@ -115,6 +125,14 @@ impl LogConfig {
             }),
             color,
         }
+    }
+
+    /// Adopt a level resolved from the saved profile. Only called while no CLI
+    /// flag or environment value has set one, so it never overrides the caller.
+    pub fn set_verbosity(&self, verbose: u8) {
+        self.state
+            .verbosity
+            .store(verbose.min(2), Ordering::Relaxed);
     }
 
     pub fn color_enabled(&self) -> bool {

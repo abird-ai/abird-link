@@ -344,8 +344,8 @@ systemctl status dotlink-work
 journalctl -u dotlink-work -f
 ```
 
-`services.dotlink.serialize = true;` optionally passes `--serialize` to execute
-one MCP tool call at a time. The default is `false` on Linux, allowing
+`services.dotlink.serialize = true;` sets `DOTLINK_SERIALIZE` to execute one MCP
+tool call at a time. The default is `false` on Linux, allowing
 independent shell and file operations concurrently. Named instances can
 override the setting. See the README for the non-Linux fallback.
 
@@ -357,8 +357,10 @@ override the setting. See the README for the non-Linux fallback.
 | `"tools"` | Above + tool names, paths / command summaries, outcomes and timings |
 | `"requests"` | Above + MCP request diagnostics |
 
-These map to normal CLI output, `-v`, and `-vv`. `RUST_LOG` is separately
-configurable using `environment.RUST_LOG`. Logs may include filesystem paths,
+These map to normal CLI output, `-v`, and `-vv`, and are passed as
+`DOTLINK_VERBOSITY` so a drop-in can override the level without touching the
+unit's command line. `RUST_LOG` is separately configurable using
+`environment.RUST_LOG`. Logs may include filesystem paths,
 tunnel IDs, public MCP URLs and bounded request metadata. Bulk payloads such as
 file contents, patches, stdin and grep patterns are represented only by size.
 With `logging.verbosity = "tools"`, shell commands are recorded as an escaped
