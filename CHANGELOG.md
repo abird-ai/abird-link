@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-13
+
+### Added
+
+- Profile schema **v11**, additive over v10: `serialize` (default `false`) and `logging.verbosity` (`lifecycle` by default). Existing v10 profiles migrate in memory; older dotlink versions reject v11 profiles rather than guessing, so this is a minor release rather than a patch.
+- `DOTLINK_PROFILE`, `DOTLINK_SERIALIZE`, `DOTLINK_STDIO`, `DOTLINK_ALLOW_SHELL`, `DOTLINK_ALLOW_NETWORK`, `DOTLINK_ALLOW_NIX_DAEMON`, `DOTLINK_ALLOW_NIX_CONFIG`, `DOTLINK_ALLOW_SSH_AGENT`, `DOTLINK_ALLOW_GIT_CONFIG`, `DOTLINK_ALLOW_KVM`, `DOTLINK_ALLOW_GPU`, `DOTLINK_CACHES` and `DOTLINK_COLOR`. Every setting the NixOS module expresses now has an environment form, resolved in one order: CLI flag > `DOTLINK_*` environment > saved profile > built-in default.
+
+### Changed
+
+- The NixOS module passes **no command-line flags**. Settings that were flags (`--allow-shell`, the host-service grants, `--allow-gpu`, `--allow-cache-*`, `--serialize`, `--profile`, `--no-stdio`, `--color`) are emitted as environment variables, so a systemd drop-in can override any of them without replacing `ExecStart` — which restates the store path and silently freezes the package version across upgrades.
+- Environment grants merge exactly like their CLI counterparts: allows are additive and denies still win, so an override can add a grant while revocation stays a deny rule or a profile edit.
+
 ## [0.14.8] - 2026-11-13
 
 ### Changed
@@ -534,6 +546,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.15.0]: https://github.com/abird-ai/dotlink/compare/v0.14.8...v0.15.0
 [0.14.8]: https://github.com/abird-ai/dotlink/compare/v0.14.7...v0.14.8
 [0.14.7]: https://github.com/abird-ai/dotlink/compare/v0.14.6...v0.14.7
 [0.14.6]: https://github.com/abird-ai/dotlink/compare/v0.14.5...v0.14.6
