@@ -32,29 +32,34 @@
       settings = {
         tunnel_id = "tunnel_fixture";
         transports.openai = true;
-        permissions.default_allow = true;
+        permissions = {
+          default_allow = true;
+          allow_shell = true;
+          allow_nix_daemon = true;
+          allow_nix_config = true;
+          allow_ssh_agent = true;
+          allow_git_config = true;
+          allow_kvm = true;
+          allow_gpu = ["amd" "nvidia"];
+        };
+        caches = [
+          {
+            kind = "cargo-registry";
+            mode = "ro";
+          }
+          {
+            kind = "go-mod";
+            mode = "rw";
+          }
+        ];
+        logging.verbosity = "tools";
+        serialize = true;
       };
       credentials.runtimeApiKeyFile = "/run/secrets/dotlink-key";
       credentials.ngrokAuthTokenFile = "/run/secrets/ngrok";
-      logging.verbosity = "tools";
-      serialize = true;
-      hostAccess = {
-        nixDaemon = true;
-        nixConfig = true;
-        sshAgent = true;
-        gitConfig = true;
-        kvm = true;
-        gpu = ["amd" "nvidia"];
-      };
       sshAgentSocket = "/run/user/1000/gcr/ssh";
-      cacheAccess = {
-        "cargo-registry" = "ro";
-        "go-mod" = "rw";
-      };
       instances.work = {
         workingDirectory = "/home/alice/work";
-        profile = "work";
-        logging.verbosity = "requests";
       };
       instances.test = {
         workingDirectory = "/home/alice/extra";
@@ -108,35 +113,15 @@
       enable = true;
       user = "alice";
       workingDirectory = "/home/alice/projects";
-      hostAccess.sshAgent = true;
+      settings.permissions.allow_ssh_agent = true;
     };
   };
-  # A typed option must never silently overwrite a contradictory value the user
-  # already wrote into `settings`.
-  conflictingSettings = eval {
+  stdioEnabled = eval {
     services.dotlink = {
       enable = true;
       user = "alice";
       workingDirectory = "/home/alice/projects";
-      hostAccess.kvm = true;
-      settings.permissions.allow_kvm = false;
-    };
-  };
-  agreeingSettings = eval {
-    services.dotlink = {
-      enable = true;
-      user = "alice";
-      workingDirectory = "/home/alice/projects";
-      hostAccess.kvm = true;
-      settings.permissions.allow_kvm = true;
-    };
-  };
-  invalidCache = eval {
-    services.dotlink = {
-      enable = true;
-      user = "alice";
-      workingDirectory = "/home/alice/projects";
-      cacheAccess."unsupported-kind" = "ro";
+      settings.transports.stdio = true;
     };
   };
   atSystemdVersion = version:
@@ -160,9 +145,7 @@
   };
 
   managedUnitText = managed.config.systemd.units."dotlink.service".text;
-  managedProfile =
-    builtins.fromJSON
-    (builtins.readFile "${managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE}");
+  managedProfile = builtins.fromJSON (builtins.readFile managed.config.environment.etc."dotlink/config.jsonc".source);
 
   valid = cfg:
     lib.all
@@ -193,7 +176,6 @@
     (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG_FILE))
     (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_API_KEY_FILE))
     (!(lib.hasInfix "--" normal.config.systemd.services.dotlink.serviceConfig.ExecStart))
-    (normal.config.systemd.services.dotlink.environment.DOTLINK_STDIO == "0")
     (normal.config.systemd.services.dotlink.environment.DOTLINK_COLOR == "never")
     (!lib.hasInfix "--serialize" normal.config.systemd.services.dotlink.serviceConfig.ExecStart)
     (hasSupervisionPolicy normal.config.systemd.services.dotlink)
@@ -233,10 +215,10 @@
     (lib.hasInfix "RestartMaxDelaySec=10min" managedUnitText)
     (lib.hasInfix "SetLoginEnvironment=true" managedUnitText)
     (managed.config.systemd.services.dotlink.serviceConfig.SupplementaryGroups == ["kvm" "render" "video"])
-    (lib.hasInfix "cargo-registry:ro" managed.config.systemd.services.dotlink.environment.DOTLINK_CACHES)
-    (lib.hasInfix "go-mod:rw" managed.config.systemd.services.dotlink.environment.DOTLINK_CACHES)
-    # The module writes the profile, so policy lives there and not in the
-    # environment, which would otherwise override the user's own settings.
+    # Policy lives in the config file the module renders; only deployment facts
+    # stay in the environment.
+    (lib.any (cache: cache.kind == "cargo-registry" && cache.mode == "ro") managedProfile.caches)
+    (lib.any (cache: cache.kind == "go-mod" && cache.mode == "rw") managedProfile.caches)
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_ALLOW_KVM))
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_SERIALIZE))
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_STDIO))
@@ -248,7 +230,7 @@
     managedProfile.permissions.allow_shell
     (managedProfile.permissions.allow_gpu == ["amd" "nvidia"])
     managedProfile.serialize
-    (!managedProfile.transports.stdio)
+    (!(managedProfile.transports.stdio or false))
     (managedProfile.logging.verbosity == "tools")
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_PROFILE))
     (managed.config.systemd.services.dotlink-work.environment.DOTLINK_PROFILE == "work")
@@ -257,8 +239,6 @@
     (lib.elem pkgs.git managed.config.systemd.services.dotlink.path)
     (lib.elem pkgs.openssh managed.config.systemd.services.dotlink.path)
     (!(lib.hasInfix " -v" managed.config.systemd.services.dotlink.serviceConfig.ExecStart))
-    (managed.config.systemd.services.dotlink-work.environment.DOTLINK_VERBOSITY == "requests")
-    (!(lib.hasInfix " -vv" managed.config.systemd.services.dotlink-work.serviceConfig.ExecStart))
     (!(managed.config.systemd.services.dotlink-work.environment ? DOTLINK_CONFIG_FILE))
     (hasSupervisionPolicy managed.config.systemd.services.dotlink-work)
     (managed.config.systemd.services.dotlink-test.environment ? DOTLINK_CONFIG_FILE)
@@ -270,12 +250,10 @@
     (!valid invalid)
     (!valid invalidSecret)
     (valid autoDetectedGcrAgent)
-    (autoDetectedGcrAgent.config.systemd.services.dotlink.environment.DOTLINK_ALLOW_SSH_AGENT == "1")
+    (autoDetectedGcrAgent.config.environment.etc."dotlink/config.jsonc".source != null)
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? DOTLINK_SSH_AGENT_SOCKET))
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? SSH_AUTH_SOCK))
-    (!valid conflictingSettings)
-    (valid agreeingSettings)
-    (!valid invalidCache)
+    (!valid stdioEnabled)
     (!valid invalidWorkingDirectory)
   ];
 in

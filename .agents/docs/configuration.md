@@ -291,7 +291,7 @@ A profile is a named slot; its config file is `config.jsonc` or `config.<profile
 
 The NixOS module expresses each setting in exactly one layer: policy goes into the profile it renders when `settings` is set, and into the environment when it reuses a user-owned profile. That keeps the order meaningful — the module never overrides the profile it just wrote, while a drop-in can still override either mode from the environment.
 
-Typed module options (`hostAccess`, `logging`, `serialize`, `cacheAccess`) are ergonomic aliases for fields in that same config file, not a separate layer: `settings` remains the raw authoring path for fields with no typed option (`tunnel_id`, `transports`, `oauth`, limits). When both write the same field the module refuses to guess — writing `settings.permissions.allow_kvm = false` alongside `hostAccess.kvm = true` is an evaluation error naming the field, while redundant-but-equal values are accepted.
+`settings` is the *only* place config-file fields are authored; there are no typed siblings to reconcile. It is rendered verbatim (plus `version`) and published read-only at `/etc/dotlink/config.<profile>.jsonc`, with `DOTLINK_CONFIG_FILE` naming the base. Unknown fields are rejected at load, so a typo fails with the field named instead of being ignored.
 
 Environment assignments replace the saved value (`DOTLINK_ALLOW_KVM=0` clears a profile grant), whereas CLI grants are additive and cannot revoke. Revocation without the environment stays a deny rule or a profile edit. `DOTLINK_PROFILE` resolves `<stem>.<profile>.<ext>` beside `DOTLINK_CONFIG`, so a hand-written override must keep the base named `config.jsonc`.
 
@@ -330,14 +330,14 @@ fails startup; a stale inherited `SSH_AUTH_SOCK` may fall back to GCR. See
 ## Hardware acceleration
 
 Linux Bubblewrap supports `--allow-kvm` and repeatable
-`--allow-gpu=amd`/`--allow-gpu=nvidia`. Profile schema v11 has additive,
+`--allow-gpu=amd`/`--allow-gpu=nvidia`. Profile schema v12 has additive,
 default-disabled `permissions.allow_kvm: bool` and
 `permissions.allow_gpu: ["amd", "nvidia"]` fields. Persist with
 `dotlink profile enable/disable <name> kvm|gpu-amd|gpu-nvidia` or opt in
 during guided setup. Runtime discovery requires real matching character
 devices; DRM render/card nodes are matched by kernel PCI vendor ID before
-mounting. The corresponding NixOS options are `hostAccess.kvm` and
-`hostAccess.gpu`. Hardware device grants do not alter ordinary filesystem
+mounting. The corresponding settings are `permissions.allow_kvm` and
+`permissions.allow_gpu`. Hardware device grants do not alter ordinary filesystem
 permissions and do not implicitly enable shell networking. A request for
 missing hardware fails clearly.
 

@@ -21,11 +21,7 @@
     packageDefault,
     extraPackagesDefault,
     environmentDefault,
-    verbosityDefault,
-    serializeDefault,
-    hostAccessDefault,
     sshAgentSocketDefault,
-    cacheAccessDefault,
   }: {
     enable = mkOption {
       type = types.bool;
@@ -104,39 +100,6 @@
         '';
       };
     };
-    hostAccess = {
-      nixDaemon = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.nixDaemon;
-        description = "Expose the host Nix daemon socket to sandboxed shell tools.";
-      };
-      nixConfig = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.nixConfig;
-        description = "Share the user's Nix configuration read-only inside the shell sandbox.";
-      };
-      sshAgent = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.sshAgent;
-        description = "Expose the SSH agent socket, not private SSH keys, inside the shell sandbox.";
-      };
-      gitConfig = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.gitConfig;
-        description = "Share the user's Git global/XDG config read-only in the shell sandbox.";
-      };
-      kvm = mkOption {
-        type = types.bool;
-        default = hostAccessDefault.kvm;
-        description = "Grant the sandbox access to /dev/kvm for hardware-accelerated virtualization.";
-      };
-      gpu = mkOption {
-        type = types.listOf (types.enum ["amd" "nvidia"]);
-        default = hostAccessDefault.gpu;
-        example = ["amd" "nvidia"];
-        description = "GPU vendors whose character devices and read-only driver resources are exposed to sandboxed shell commands.";
-      };
-    };
     sshAgentSocket = mkOption {
       type = types.nullOr types.str;
       default = sshAgentSocketDefault;
@@ -148,36 +111,6 @@
         does not automatically inherit the interactive SSH_AUTH_SOCK. An
         explicitly configured but unavailable socket fails startup rather
         than silently selecting a different agent.
-      '';
-    };
-    cacheAccess = mkOption {
-      type = types.attrsOf (types.enum ["ro" "rw"]);
-      default = cacheAccessDefault;
-      example = {
-        "cargo-registry" = "rw";
-        "go-mod" = "ro";
-      };
-      description = "Detected shell-only developer caches by CLI flag suffix; ro or rw. A configured cache whose directory is absent on the host is skipped with a warning instead of failing service startup.";
-    };
-    serialize = mkOption {
-      type = types.bool;
-      default = serializeDefault;
-      description = "Run MCP tool calls sequentially instead of concurrently.";
-    };
-    logging.verbosity = mkOption {
-      type = types.enum ["lifecycle" "tools" "requests"];
-      default = verbosityDefault;
-      description = ''
-        Lifecycle status only, tool activity, or MCP request diagnostics. Every
-        option here is passed as an environment variable so a systemd drop-in
-        can override it; the generated unit carries no command-line flags.
-        Tool logging may contain paths and command fragments.
-
-        Passed as `DOTLINK_VERBOSITY`, not as a command-line flag, so the
-        deployment keeps the usual order: explicit CLI flag > `DOTLINK_*`
-        environment > saved profile > built-in default. A drop-in can therefore
-        override this without replacing `ExecStart`, and `lifecycle` emits
-        nothing so the built-in default applies.
       '';
     };
     extraPackages = mkOption {
@@ -205,18 +138,7 @@
     packageDefault = modulePackage;
     extraPackagesDefault = [];
     environmentDefault = {};
-    verbosityDefault = "lifecycle";
-    serializeDefault = false;
-    hostAccessDefault = {
-      nixDaemon = false;
-      nixConfig = false;
-      sshAgent = false;
-      gitConfig = false;
-      kvm = false;
-      gpu = [];
-    };
     sshAgentSocketDefault = null;
-    cacheAccessDefault = {};
   };
 
   optionsForInstance = commonOptions {
@@ -227,11 +149,7 @@
     packageDefault = cfg.package;
     extraPackagesDefault = cfg.extraPackages;
     environmentDefault = cfg.environment;
-    verbosityDefault = cfg.logging.verbosity;
-    serializeDefault = cfg.serialize;
-    hostAccessDefault = cfg.hostAccess;
     sshAgentSocketDefault = cfg.sshAgentSocket;
-    cacheAccessDefault = cfg.cacheAccess;
   };
 
   instances = {default = cfg;} // cfg.instances;
@@ -242,22 +160,6 @@
     else "dotlink-${name}";
   validName = name: builtins.match "[A-Za-z0-9_-]+" name != null;
   validProfile = profile: profile == null || validName profile;
-  cacheKeys = [
-    "cargo-registry"
-    "cargo-git"
-    "npm"
-    "pnpm"
-    "yarn"
-    "pip"
-    "uv"
-    "go-mod"
-    "go-build"
-    "maven"
-    "gradle"
-    "sccache"
-    "ccache"
-  ];
-
   hasConfig = instance: instance.settings != null || instance.configFile != null;
   # Nix store files are public: reject the common credential-shaped keys,
   # including nested keys. Users must provide secrets with LoadCredential.
@@ -285,61 +187,6 @@
     else if builtins.isList value
     then lib.any containsSecretKey value
     else false;
-  # Permissions the module itself declares for an instance.
-  moduleGrantedPermissions = instance: let
-    hostEnabled =
-      instance.hostAccess.nixDaemon
-      || instance.hostAccess.nixConfig
-      || instance.hostAccess.sshAgent
-      || instance.hostAccess.gitConfig
-      || instance.hostAccess.kvm
-      || instance.hostAccess.gpu != [];
-  in
-    lib.filterAttrs (_: enabled: enabled) {
-      allow_shell = hostEnabled || instance.cacheAccess != {};
-      allow_nix_daemon = instance.hostAccess.nixDaemon;
-      allow_nix_config = instance.hostAccess.nixConfig;
-      allow_ssh_agent = instance.hostAccess.sshAgent;
-      allow_git_config = instance.hostAccess.gitConfig;
-      allow_kvm = instance.hostAccess.kvm;
-    }
-    // lib.optionalAttrs (instance.hostAccess.gpu != []) {
-      allow_gpu = instance.hostAccess.gpu;
-    };
-
-  # Fields where a typed option would silently overwrite a contradictory value
-  # the user already wrote into `settings`. Redundant-but-equal values are fine;
-  # only real disagreement is an error.
-  settingsConflicts = instance: let
-    grants = moduleGrantedPermissions instance;
-    declaredPermissions =
-      lib.filterAttrs (field: _: instance.settings.permissions or {} ? ${field}) grants;
-    permissionConflicts = lib.concatMap (
-      field: let
-        written = instance.settings.permissions.${field};
-      in
-        lib.optional (written != grants.${field}) "permissions.${field}"
-    ) (lib.attrNames declaredPermissions);
-    serializeConflict =
-      lib.optional
-      (instance.serialize && (instance.settings.serialize or true) == false)
-      "serialize";
-    verbosityConflict =
-      lib.optional
-      (
-        instance.logging.verbosity
-        != "lifecycle"
-        && (instance.settings.logging.verbosity or instance.logging.verbosity)
-        != instance.logging.verbosity
-      )
-      "logging.verbosity";
-    stdioConflict =
-      lib.optional (instance.settings.transports.stdio or false) "transports.stdio";
-  in
-    if instance.settings == null
-    then []
-    else permissionConflicts ++ serializeConflict ++ verbosityConflict ++ stdioConflict;
-
   effectiveProfile = name: instance:
     if instance.profile != null
     then
@@ -354,53 +201,22 @@
 
   makeService = name: instance: let
     profile = effectiveProfile name instance;
-    # The config-file override is a *base* path. With DOTLINK_PROFILE set, the loader
-    # selects its sibling config.NAME.jsonc, which keeps credentials and
+    # The config-file override is a *base* path. With DOTLINK_PROFILE set, the
+    # loader selects its sibling config.NAME.jsonc, which keeps credentials and
     # OAuth state independent for named declarative instances too.
-    ownsSettings = instance.settings != null;
-    # Policy the module itself declares. Each value is expressed in exactly one
-    # layer: inside the profile when the module writes one, otherwise in the
-    # environment. That keeps the usual order (CLI > environment > profile >
-    # default) meaningful instead of letting the module silently override the
-    # profile it just wrote.
-    grantedPermissions = moduleGrantedPermissions instance;
-    # Only opt-in values are written: an option left at its default never
-    # overrides a profile the user set by hand.
-    declaredSettings =
-      instance.settings
-      // {
-        transports = (instance.settings.transports or {}) // {stdio = false;};
-      }
-      // lib.optionalAttrs (grantedPermissions != {}) {
-        permissions =
-          (instance.settings.permissions or {})
-          // grantedPermissions;
-      }
-      // lib.optionalAttrs instance.serialize {
-        serialize = true;
-      }
-      // lib.optionalAttrs (instance.logging.verbosity != "lifecycle") {
-        logging =
-          (instance.settings.logging or {})
-          // {verbosity = instance.logging.verbosity;};
-      };
+    # A config file the module renders is published at a stable /etc path (the
+    # store holds the immutable content, /etc names it), so DOTLINK_CONFIG_FILE
+    # in the unit, journal lines and docs all point somewhere durable.
     configPath =
-      if ownsSettings
-      then "${pkgs.writeTextDir
-        (
-          if profile == null
-          then "config.jsonc"
-          else "config.${profile}.jsonc"
-        )
-        (builtins.toJSON (declaredSettings // {version = 11;}))}/config.jsonc"
-      else instance.configFile;
+      if instance.settings == null
+      then instance.configFile
+      else "/etc/dotlink/config.jsonc";
+    permissions = instance.settings.permissions or {};
     hostEnabled =
-      instance.hostAccess.nixDaemon
-      || instance.hostAccess.nixConfig
-      || instance.hostAccess.sshAgent
-      || instance.hostAccess.gitConfig
-      || instance.hostAccess.kvm
-      || instance.hostAccess.gpu != [];
+      permissions.allow_nix_daemon or false
+      || permissions.allow_nix_config or false
+      || permissions.allow_ssh_agent or false
+      || permissions.allow_git_config or false;
     credentials =
       lib.optionals (instance.credentials.runtimeApiKeyFile != null)
       ["dotlink-api-key:${instance.credentials.runtimeApiKeyFile}"]
@@ -409,46 +225,10 @@
     serviceEnv =
       instance.environment
       // {DOTLINK_SUPERVISOR = "systemd";}
+      # A service has no terminal; the module never relies on TTY detection.
       // {DOTLINK_COLOR = "never";}
-      # Profile policy is already in the profile this unit writes; repeating it
-      # in the environment would override the user's own settings.
-      // lib.optionalAttrs (!ownsSettings) {
-        DOTLINK_STDIO = "0";
-      }
-      // lib.optionalAttrs (!ownsSettings && (hostEnabled || instance.cacheAccess != {})) {
-        DOTLINK_ALLOW_SHELL = "1";
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.nixDaemon) {
-        DOTLINK_ALLOW_NIX_DAEMON = "1";
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.nixConfig) {
-        DOTLINK_ALLOW_NIX_CONFIG = "1";
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.sshAgent) {
-        DOTLINK_ALLOW_SSH_AGENT = "1";
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.gitConfig) {
-        DOTLINK_ALLOW_GIT_CONFIG = "1";
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.kvm) {
-        DOTLINK_ALLOW_KVM = "1";
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.gpu != []) {
-        DOTLINK_ALLOW_GPU = lib.concatStringsSep "," instance.hostAccess.gpu;
-      }
-      // lib.optionalAttrs (instance.cacheAccess != {}) {
-        DOTLINK_CACHES = lib.concatStringsSep "," (
-          lib.mapAttrsToList (name: mode: "${name}:${mode}") instance.cacheAccess
-        );
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.serialize) {
-        DOTLINK_SERIALIZE = "1";
-      }
       // lib.optionalAttrs (profile != null) {
         DOTLINK_PROFILE = profile;
-      }
-      // lib.optionalAttrs (!ownsSettings && instance.logging.verbosity != "lifecycle") {
-        DOTLINK_VERBOSITY = instance.logging.verbosity;
       }
       // lib.optionalAttrs (instance.sshAgentSocket != null) {
         DOTLINK_SSH_AGENT_SOCKET = instance.sshAgentSocket;
@@ -472,9 +252,9 @@
     startLimitIntervalSec = 0;
     path =
       instance.extraPackages
-      ++ lib.optionals (instance.hostAccess.nixDaemon || instance.hostAccess.nixConfig) [pkgs.nix]
-      ++ lib.optionals (instance.hostAccess.gitConfig || instance.hostAccess.sshAgent) [pkgs.git]
-      ++ lib.optionals instance.hostAccess.sshAgent [pkgs.openssh];
+      ++ lib.optionals hostEnabled [pkgs.nix]
+      ++ lib.optionals (permissions.allow_git_config or false) [pkgs.git]
+      ++ lib.optionals (permissions.allow_ssh_agent or false) [pkgs.git pkgs.openssh];
     environment = serviceEnv;
     serviceConfig =
       {
@@ -506,10 +286,10 @@
         UMask = "0077";
       }
       // lib.optionalAttrs (instance.group != null) {Group = instance.group;}
-      // lib.optionalAttrs (instance.hostAccess.kvm || instance.hostAccess.gpu != []) {
+      // lib.optionalAttrs (permissions.allow_kvm or false || permissions.allow_gpu or [] != []) {
         SupplementaryGroups = lib.unique (
-          lib.optionals instance.hostAccess.kvm ["kvm"]
-          ++ lib.optionals (instance.hostAccess.gpu != []) ["render" "video"]
+          lib.optionals (permissions.allow_kvm or false) ["kvm"]
+          ++ lib.optionals (permissions.allow_gpu or [] != []) ["render" "video"]
         );
       }
       // lib.optionalAttrs (credentials != []) {LoadCredential = credentials;};
@@ -536,6 +316,31 @@ in {
     };
 
   config = lib.mkIf cfg.enable {
+    environment.etc =
+      lib.mapAttrs' (
+        name: instance: let
+          profile = effectiveProfile name instance;
+        in
+          lib.nameValuePair
+          (
+            if profile == null
+            then "dotlink/config.jsonc"
+            else "dotlink/config.${profile}.jsonc"
+          )
+          {
+            source =
+              pkgs.writeText
+              (
+                if profile == null
+                then "dotlink-config.jsonc"
+                else "dotlink-config.${profile}.jsonc"
+              )
+              (builtins.toJSON (instance.settings // {version = 12;}));
+            mode = "0444";
+          }
+      ) (
+        lib.filterAttrs (_: instance: instance.settings != null) active
+      );
     warnings =
       lib.optional (
         !lib.versionOlder systemdVersion "255"
@@ -573,8 +378,11 @@ in {
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
-          assertion = settingsConflicts instance == [];
-          message = "dotlink ${name}: settings and the typed options disagree for ${lib.concatStringsSep ", " (settingsConflicts instance)}. Remove one side; the module will not overwrite a value written into settings.";
+          assertion =
+            instance.settings
+            == null
+            || !(instance.settings.transports.stdio or false);
+          message = "dotlink ${name}: a systemd service has no stdin, so settings.transports.stdio must stay disabled.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
@@ -587,23 +395,13 @@ in {
             instance.settings
             == null
             || !(instance.settings ? version)
-            || instance.settings.version == 10;
-          message = "dotlink ${name}: declarative settings must use current schema version 10.";
+            || instance.settings.version == 12;
+          message = "dotlink ${name}: declarative settings must use current schema version 12 (omit version and the module supplies it).";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {
           assertion = instance.sshAgentSocket == null || lib.hasPrefix "/" instance.sshAgentSocket;
           message = "dotlink ${name}: sshAgentSocket must be an absolute Unix socket path.";
-        })
-        active)
-      ++ (lib.mapAttrsToList (name: instance: {
-          assertion = builtins.length (lib.unique instance.hostAccess.gpu) == builtins.length instance.hostAccess.gpu;
-          message = "dotlink ${name}: hostAccess.gpu must not contain duplicate vendors.";
-        })
-        active)
-      ++ (lib.mapAttrsToList (name: instance: {
-          assertion = lib.all (key: lib.elem key cacheKeys) (builtins.attrNames instance.cacheAccess);
-          message = "dotlink ${name}: cacheAccess contains an unsupported cache name.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {

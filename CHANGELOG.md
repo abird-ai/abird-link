@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-13
+
+### Changed
+
+- **NixOS module API, breaking.** `settings` is now the only place config-file fields are authored, and it is rendered verbatim (plus `version`) into a read-only `/etc/dotlink/config[.<profile>].jsonc`, with `DOTLINK_CONFIG_FILE` naming the base. Nothing else expresses config: the unit carries no command-line flags, and the environment holds deployment facts only (`DOTLINK_SUPERVISOR`, `DOTLINK_COLOR`, `DOTLINK_CONFIG_FILE`, `DOTLINK_PROFILE`, `DOTLINK_SSH_AGENT_SOCKET`, credential files). Option mapping:
+
+  | removed | replace with |
+  | --- | --- |
+  | `hostAccess.nixDaemon` / `nixConfig` / `sshAgent` / `gitConfig` / `kvm` | `settings.permissions.allow_nix_daemon` / `allow_nix_config` / `allow_ssh_agent` / `allow_git_config` / `allow_kvm` |
+  | `hostAccess.gpu` | `settings.permissions.allow_gpu` |
+  | `cacheAccess.<name> = "ro"\|"rw"` | `settings.caches = [ {kind = "<name>"; mode = "ro"\|"rw";} ]` |
+  | `logging.verbosity` | `settings.logging.verbosity` |
+  | `serialize` | `settings.serialize` |
+
+  A service that reuses a user profile keeps that profile (`settings = null`) and can express the same policy through `environment.DOTLINK_*` if it must be declarative.
+- `settings.transports.stdio = true` is now an evaluation error: a systemd unit has no stdin to serve. This replaces the silent `DOTLINK_STDIO=0` override.
+
+### Added
+
+- Config schema **v12**: a cache grant may omit `path`, so a config file can express a cache that dotlink discovers (as `--allow-cache-<name>` does). Saved path-less grants resolve together with the environment and CLI layers, later layers winning.
+- Unknown config fields are rejected at load, so a typo in `settings` fails naming the field instead of being ignored. Cache kinds and modes accept the CLI spellings (`cargo-registry`, `rw`) as aliases.
+
 ## [0.15.3] - 2026-11-13
 
 ### Changed
@@ -571,6 +593,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.16.0]: https://github.com/abird-ai/dotlink/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/abird-ai/dotlink/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/abird-ai/dotlink/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/abird-ai/dotlink/compare/v0.15.0...v0.15.1

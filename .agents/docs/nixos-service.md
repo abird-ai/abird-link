@@ -76,7 +76,8 @@ services.dotlink = {
   };
 
   extraPackages = with pkgs; [ git ripgrep fd ];
-  logging.verbosity = "tools";
+    logging.verbosity = "tools";
+  };
 };
 ```
 
@@ -140,16 +141,18 @@ services.dotlink = {
   enable = true;
   user = "alice";
   workingDirectory = "/home/alice/projects";
-  hostAccess = {
-    nixDaemon = true;
+  settings.permissions = {
+    allow_nix_daemon = true;
     nixConfig = true;
     gitConfig = true;
     sshAgent = true;
   };
   # GCR is discovered automatically from the service user's UID.
   # sshAgentSocket = "/run/user/1000/gcr/ssh"; # optional override
-  cacheAccess."cargo-registry" = "rw";
-  cacheAccess."cargo-git" = "ro";
+  settings.caches = [
+    {kind = "cargo-registry"; mode = "rw";}
+    {kind = "cargo-git"; mode = "ro";}
+  ];
 };
 ```
 
@@ -188,11 +191,11 @@ signing works best when `user.signingkey` contains a `key::ssh-ed25519 ...`
 
 The Nix daemon grants controlled Unix-socket access, independent of shell
 network permission. `NIX_REMOTE=daemon` is configured internally, and the
-user's XDG nix.conf is shared read-only only when `hostAccess.nixConfig` is
+user's XDG nix.conf is shared read-only only when `settings.permissions.allow_nix_config` is
 true. Git similarly maps only the user's existing `~/.gitconfig` and
 `$XDG_CONFIG_HOME/git/config`; `includeIf` targets and `.ssh` are not
 implicitly mounted. These config files may contain credentials—review before
-enabling. Each enabled `cacheAccess` key maps to a matching discovered
+enabling. Each enabled `settings.caches` entry maps to a matching discovered
 `--allow-cache-<kind>=ro|rw` flag; all 13 known families are accepted.
 
 ## KVM and GPU acceleration
@@ -205,9 +208,11 @@ services.dotlink = {
   enable = true;
   user = "alice";
   workingDirectory = "/home/alice/projects";
-  hostAccess = {
-    kvm = true;
-    gpu = [ "amd" "nvidia" ];
+  settings = {
+    permissions = {
+      allow_kvm = true;
+      allow_gpu = [ "amd" "nvidia" ];
+    };
   };
   # Optional: install selected tools into this service's PATH.
   # extraPackages = with pkgs; [ vulkan-tools qemu ];
@@ -344,12 +349,12 @@ systemctl status dotlink-work
 journalctl -u dotlink-work -f
 ```
 
-`services.dotlink.serialize = true;` sets `DOTLINK_SERIALIZE` to execute one MCP
+`settings.serialize = true;` executes one MCP
 tool call at a time. The default is `false` on Linux, allowing
 independent shell and file operations concurrently. Named instances can
 override the setting. See the README for the non-Linux fallback.
 
-`logging.verbosity` controls activity detail:
+`settings.logging.verbosity` controls activity detail:
 
 | Setting | Contents |
 | --- | --- |
