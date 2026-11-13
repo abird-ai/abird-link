@@ -62,48 +62,72 @@
     assert output["sandboxed"] is True, output
     assert output["stdout"] == "project-ok\n", output
   '';
+  storeConfigs = pkgs.runCommand "dotlink-store-configs" {} ''
+    mkdir -p "$out/odd'quote\$%"
+    cp ${pkgs.writeText "default.jsonc" (builtins.toJSON ((settings 3000 "dotlink") // {version = 10;}))} "$out/odd'quote\$%/custom.jsonc"
+    cp ${pkgs.writeText "named.jsonc" (builtins.toJSON ((settings 3001 "dotlink-named") // {version = 10;}))} "$out/odd'quote\$%/custom.named.jsonc"
+  '';
+  node = storeBacked: {
+    imports = [module];
+    virtualisation.memorySize = 2048;
+    environment.systemPackages = [pkgs.python3];
+    systemd.tmpfiles.rules = [
+      "d /var/lib/dotlink/work 0700 dotlink dotlink -"
+      "f /var/lib/dotlink/work/fixture.txt 0600 dotlink dotlink - project-ok\\n"
+      "f /run/dotlink-test-key 0600 root root - test-key"
+    ];
+    services.dotlink = {
+      enable = true;
+      workingDirectory = "/var/lib/dotlink/work";
+      settings =
+        if storeBacked
+        then null
+        else settings 3000 "dotlink";
+      configFile =
+        if storeBacked
+        then "${storeConfigs}/odd'quote$%/custom.jsonc"
+        else null;
+      credentials.runtimeApiKeyFile = "/run/dotlink-test-key";
+      instances.named = {
+        settings =
+          if storeBacked
+          then null
+          else settings 3001 "dotlink-named";
+        configFile =
+          if storeBacked
+          then "${storeConfigs}/odd'quote$%/custom.jsonc"
+          else null;
+        credentials.runtimeApiKeyFile = "/run/dotlink-test-key";
+      };
+    };
+  };
 in
   pkgs.testers.runNixOSTest {
     name = "dotlink-nixos-service";
-    nodes.machine = {
-      imports = [module];
-      virtualisation.memorySize = 2048;
-      environment.systemPackages = [pkgs.python3];
-      systemd.tmpfiles.rules = [
-        "d /var/lib/dotlink/work 0700 dotlink dotlink -"
-        "f /var/lib/dotlink/work/fixture.txt 0600 dotlink dotlink - project-ok\\n"
-        "f /run/dotlink-test-key 0600 root root - test-key"
-      ];
-      services.dotlink = {
-        enable = true;
-        workingDirectory = "/var/lib/dotlink/work";
-        settings = settings 3000 "dotlink";
-        credentials.runtimeApiKeyFile = "/run/dotlink-test-key";
-        instances.named = {
-          settings = settings 3001 "dotlink-named";
-          credentials.runtimeApiKeyFile = "/run/dotlink-test-key";
-        };
-      };
+    nodes = {
+      machine = node false;
+      store = node true;
     };
     testScript = ''
       start_all()
-      for unit, port, filename in [
-          ("dotlink", 3000, "config.jsonc"),
-          ("dotlink-named", 3001, "config.named.jsonc"),
-      ]:
-          machine.wait_for_unit(f"{unit}.service")
-          machine.wait_for_open_port(port)
-          config = f"/run/{unit}/{filename}"
-          machine.succeed(f"test $(stat -c %a /run/{unit}) = 700")
-          machine.succeed(f"test $(stat -c %a {config}) = 400")
-          machine.succeed(f"test ! -L {config}")
-          machine.succeed(f"${pkgs.python3}/bin/python ${probe} {port} {unit} {filename}")
-          # A fresh start must replace runtime edits with declarative settings.
-          machine.succeed(f"chmod 600 {config}; echo invalid > {config}")
-          machine.succeed(f"systemctl restart {unit}")
-          machine.wait_for_open_port(port)
-          machine.succeed(f"${pkgs.python3}/bin/python ${probe} {port} {unit} {filename}")
-          machine.succeed(f"systemctl stop {unit}; test ! -e /run/{unit}")
-          machine.succeed(f"test ! -e /run/credentials/{unit}.service")
+      for host in [machine, store]:
+          for unit, port, filename in [
+              ("dotlink", 3000, "config.jsonc"),
+              ("dotlink-named", 3001, "config.named.jsonc"),
+          ]:
+              host.wait_for_unit(f"{unit}.service")
+              host.wait_for_open_port(port)
+              config = f"/run/{unit}/{filename}"
+              host.succeed(f"test $(stat -c %a /run/{unit}) = 700")
+              host.succeed(f"test $(stat -c %a {config}) = 400")
+              host.succeed(f"test ! -L {config}")
+              host.succeed(f"${pkgs.python3}/bin/python ${probe} {port} {unit} {filename}")
+              # A fresh start must replace runtime edits with declarative settings.
+              host.succeed(f"chmod 600 {config}; echo invalid > {config}")
+              host.succeed(f"systemctl restart {unit}")
+              host.wait_for_open_port(port)
+              host.succeed(f"${pkgs.python3}/bin/python ${probe} {port} {unit} {filename}")
+              host.succeed(f"systemctl stop {unit}; test ! -e /run/{unit}")
+              host.succeed(f"test ! -e /run/credentials/{unit}.service")
     '';
   }

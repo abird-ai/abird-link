@@ -27,6 +27,9 @@ jobs:
       - name: Run tests and lint checks
         run: nix flake check -L
 
+      - name: Run NixOS service VM regression
+        run: nix build .#nixosTests.dotlink-service -L
+
       - name: Build every release binary
         run: nix build .#release-all --out-link result-release
 

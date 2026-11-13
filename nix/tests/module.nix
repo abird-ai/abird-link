@@ -76,6 +76,17 @@
     };
   };
 
+  storeConfig = pkgs.writeTextDir "config.jsonc" "{}";
+  storeBacked = eval {
+    services.dotlink = {
+      enable = true;
+      workingDirectory = "/var/lib/dotlink/work";
+      configFile = "${storeConfig}/config.jsonc";
+      instances.other.configFile = "${storeConfig}/config.jsonc";
+      instances.custom.configFile = "${storeConfig}/custom.config.jsonc";
+    };
+  };
+
   disabled = eval {
     services.dotlink = {
       enable = false;
@@ -207,11 +218,21 @@
     (external.config.systemd.services.dotlink-other.environment.DOTLINK_CONFIG == "/etc/dotlink-other/config.jsonc")
     (!(external.config.systemd.services.dotlink-other.serviceConfig ? RuntimeDirectory))
 
+    (valid storeBacked)
+    (storeBacked.config.systemd.services.dotlink.environment.DOTLINK_CONFIG == "%t/dotlink/config.jsonc")
+    (storeBacked.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
+    (lib.hasInfix "${builtins.unsafeDiscardStringContext storeConfig}/config.jsonc" storeBacked.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
+    (lib.hasSuffix " %t/dotlink/config.jsonc" storeBacked.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
+    (storeBacked.config.systemd.services.dotlink-other.environment.DOTLINK_CONFIG == "%t/dotlink-other/config.jsonc")
+    (lib.hasInfix "${builtins.unsafeDiscardStringContext storeConfig}/config.other.jsonc" storeBacked.config.systemd.services.dotlink-other.serviceConfig.ExecStartPre)
+    (lib.hasSuffix " %t/dotlink-other/config.other.jsonc" storeBacked.config.systemd.services.dotlink-other.serviceConfig.ExecStartPre)
+    (lib.hasInfix "${builtins.unsafeDiscardStringContext storeConfig}/custom.config.custom.jsonc" storeBacked.config.systemd.services.dotlink-custom.serviceConfig.ExecStartPre)
+
     (valid managed)
     (managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG == "%t/dotlink/config.jsonc")
     (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
     (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectoryMode == "0700")
-    (lib.hasInfix "/bin/install -m 0400 /nix/store/" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
+    (lib.hasInfix ''/bin/install -m 0400 "/nix/store/'' managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
     (lib.hasSuffix " %t/dotlink/config.jsonc" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
     (managed.config.systemd.services.dotlink.environment.DOTLINK_API_KEY_FILE == "%d/dotlink-api-key")
     (managed.config.systemd.services.dotlink.environment.NGROK_AUTHTOKEN_FILE == "%d/ngrok-authtoken")

@@ -39,5 +39,4 @@ in
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     nixos-module = import ./tests/module.nix {inherit pkgs module;};
-    nixos-service = import ./tests/service.nix {inherit pkgs module;};
   }

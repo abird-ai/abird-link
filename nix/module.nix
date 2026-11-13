@@ -7,6 +7,7 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }: let
   inherit (lib) mkOption types;
@@ -83,6 +84,8 @@
       description = ''
         Optional explicit JSONC file used as DOTLINK_CONFIG. Null reuses the
         selected user's XDG default. Mutually exclusive with settings.
+        Store-backed files are copied into a private runtime directory at startup;
+        non-store paths are used unchanged.
       '';
     };
     credentials = {
@@ -302,9 +305,23 @@
     settingsFile =
       pkgs.writeText "dotlink-${name}.jsonc"
       (builtins.toJSON (instance.settings // {version = 10;}));
+    stageConfig = instance.settings != null || (instance.configFile != null && lib.hasPrefix "/nix/store/" instance.configFile);
+    # Match setup::profiled_path: configFile is a base path, not a named file.
+    externalName = baseNameOf instance.configFile;
+    externalParts = builtins.match "(.+)\\.([^.]+)" externalName;
+    externalProfileName =
+      if externalParts == null
+      then "${lib.removeSuffix "." externalName}.${profile}"
+      else "${builtins.elemAt externalParts 0}.${profile}.${builtins.elemAt externalParts 1}";
+    configSource =
+      if instance.settings != null
+      then settingsFile
+      else if profile == null
+      then instance.configFile
+      else "${dirOf instance.configFile}/${externalProfileName}";
     runtimeDirectory = named name;
     configPath =
-      if instance.settings != null
+      if stageConfig
       then "%t/${runtimeDirectory}/config.jsonc"
       else instance.configFile;
     hostEnabled =
@@ -391,12 +408,12 @@
         StandardError = "journal";
         UMask = "0077";
       }
-      // lib.optionalAttrs (instance.settings != null) {
+      // lib.optionalAttrs stageConfig {
         # A store-backed protected config overlaps the shell's /nix/store
         # runtime bind. Copy it, never symlink it or relax the sandbox guard.
         RuntimeDirectory = runtimeDirectory;
         RuntimeDirectoryMode = "0700";
-        ExecStartPre = "${pkgs.coreutils}/bin/install -m 0400 ${settingsFile} %t/${runtimeDirectory}/${configName}";
+        ExecStartPre = "${pkgs.coreutils}/bin/install -m 0400 ${utils.escapeSystemdExecArg configSource} %t/${runtimeDirectory}/${configName}";
       }
       // lib.optionalAttrs (instance.group != null) {Group = instance.group;}
       // lib.optionalAttrs (instance.hostAccess.kvm || instance.hostAccess.gpu != []) {

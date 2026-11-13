@@ -26,3 +26,13 @@ None.
 - [x] `DOTLINK_TEST_BWRAP=1 cargo test --locked --all-features` — `1bbbe57`:
   781 passed.
 - [x] `git diff --check` — `1bbbe57`.
+
+## Review follow-up — 2026-11-13
+
+- [x] Separate `nixosTests.dotlink-service` from aggregate checks; dedicated CI step.
+- [x] Stage explicit store-backed base/default and named sibling config files.
+- [x] Preserve non-store paths and use systemd-native argument escaping.
+- [x] Correct authorship and co-author metadata.
+- [x] Expand VM coverage to generated/store-backed default/named units.
+- [x] Aggregate checks and two-node VM regression passed on x86_64-linux.
+- [ ] Mark ready after upstream CI is green.

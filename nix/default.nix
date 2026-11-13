@@ -59,6 +59,10 @@ in {
       native = native.${system};
       module = self.nixosModules.default;
     });
+  nixosTests.dotlink-service = import ./tests/service.nix {
+    inherit (native.x86_64-linux) pkgs;
+    module = self.nixosModules.default;
+  };
   devShells = forAllSystems (system: {default = development.${system}.shell;});
   formatter = forAllSystems (system: development.${system}.formatter);
 }

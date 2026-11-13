@@ -100,8 +100,10 @@ the JSONC filename. For a named instance, dotlink selects the sibling
 `config.<instance>.jsonc` file from that base path. Generated `settings`
 automatically copy the correctly named sibling into each service's runtime
 directory, so each instance retains independent saved keys and OAuth state.
-`configFile` paths are used unchanged; a store-backed external `configFile`
-can still conflict with shell runtime mounts.
+Store-backed `configFile` paths use the same private runtime staging. For named
+instances, the source is the selected sibling beside the base path, matching
+normal profile lookup; it must exist in the store. Non-store paths remain
+unchanged. Store sources are public: keep secrets in credential files.
 
 ## Optional credential overrides
 
