@@ -4177,9 +4177,13 @@ mod tests {
             panic!("acknowledgement changed native task status")
         };
         let replayed: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
+        // Same contract as above: `expected` is a separate execution, so its
+        // completion stamp may land in another second. Comparing the raw value
+        // made this test pass or fail on a clock boundary.
         assert_eq!(
-            serde_json::to_value(replayed).unwrap(),
-            serde_json::to_value(expected).unwrap()
+            without_clock(&replayed),
+            without_clock(&expected),
+            "the replayed native task result must inline the original tools/call result"
         );
     }
 
