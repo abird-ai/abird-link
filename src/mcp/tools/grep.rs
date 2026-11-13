@@ -17,8 +17,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{
-    GlobFilter, LocalMachine, WalkFilter, dot, marker_bytes, marker_files, marker_hits, ok_text,
-    retain_best, tool_error, trim_to_result_budget,
+    GlobFilter, LocalMachine, WalkFilter, WalkProgress, dot, marker_bytes, marker_files,
+    marker_hits, ok_text, retain_best, tool_error, trim_to_result_budget,
 };
 use crate::mcp::AccessNeed;
 
@@ -79,7 +79,8 @@ pub(crate) struct GrepArgs {
     /// Regular expression, or literal text when `literal` is set. Maximum 1024 printable characters.
     pub(crate) pattern: String,
 
-    /// Directory to search. Relative paths resolve from the directory where dotlink was launched.
+    /// Directory to search recursively, or a single file. Relative paths
+    /// resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
     pub(super) path: String,
 
@@ -328,12 +329,10 @@ impl LocalMachine {
             .with_context(|| format!("invalid regex: {}", args.pattern))?;
 
         let root = self.resolve_existing(&args.path, AccessNeed::Read).await?;
-        if !tokio::fs::metadata(&root).await?.is_dir() {
-            anyhow::bail!(
-                "not a directory: {} (use read for a single file)",
-                args.path
-            );
-        }
+        // An explicit file is searched directly. Discovery, glob and ignore
+        // filtering only make sense for a directory; the scan budgets below
+        // still bound how much of the file is read.
+        let single_file = !tokio::fs::metadata(&root).await?.is_dir();
 
         let glob = GlobFilter::optional(args.glob.as_deref())?;
         let before = args.before.unwrap_or(0).min(MAX_GREP_CONTEXT);
@@ -347,33 +346,38 @@ impl LocalMachine {
         // complete walk, not an arbitrary enumeration-order prefix. Only paths
         // are retained; files are opened individually after the walk.
         let candidate_limit = MAX_GREP_FILES.min(max_scanned_files);
-        let mut candidates = BinaryHeap::<PathBuf>::with_capacity(candidate_limit);
-        let mut candidates_capped = false;
-        let progress = self
-            .walk_entries_bounded(
-                &root,
-                usize::MAX,
-                WalkFilter {
-                    skip_hidden: args.skip_hidden,
-                    gitignore: args.gitignore,
-                },
-                super::MAX_WALK_VISITS,
-                |entry| {
-                    if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
-                        return true;
-                    }
-                    if glob
-                        .as_ref()
-                        .is_some_and(|glob| !glob.matches_entry(&entry.relative))
-                    {
-                        return true;
-                    }
-                    candidates_capped |= retain_best(&mut candidates, entry.path, candidate_limit);
-                    true
-                },
-            )
-            .await?;
-        let candidates = candidates.into_sorted_vec();
+        let (candidates, progress, candidates_capped) = if single_file {
+            (vec![root.clone()], WalkProgress::default(), false)
+        } else {
+            let mut candidates = BinaryHeap::<PathBuf>::with_capacity(candidate_limit);
+            let mut candidates_capped = false;
+            let progress = self
+                .walk_entries_bounded(
+                    &root,
+                    usize::MAX,
+                    WalkFilter {
+                        skip_hidden: args.skip_hidden,
+                        gitignore: args.gitignore,
+                    },
+                    super::MAX_WALK_VISITS,
+                    |entry| {
+                        if entry.kind != "file" || entry.size > MAX_GREP_FILE_BYTES as u64 {
+                            return true;
+                        }
+                        if glob
+                            .as_ref()
+                            .is_some_and(|glob| !glob.matches_entry(&entry.relative))
+                        {
+                            return true;
+                        }
+                        candidates_capped |=
+                            retain_best(&mut candidates, entry.path, candidate_limit);
+                        true
+                    },
+                )
+                .await?;
+            (candidates.into_sorted_vec(), progress, candidates_capped)
+        };
 
         let mut paging = Paging {
             offset,
@@ -834,7 +838,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text files recursively. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry explicit text markers or JSON `scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons` with every concurrent cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
+        description = "Search UTF-8 text files. `path` may be a directory (searched recursively) or a single file.  `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry explicit text markers or JSON `scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons` with every concurrent cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
         annotations(
             title = "Search files",
             read_only_hint = true,
@@ -1552,6 +1556,40 @@ mod walk_tests {
         std::fs::write(root.join(".gitignore"), "x".repeat(64 * 1024 + 1)).unwrap();
         let error = machine.grep_impl(args).await.unwrap_err().to_string();
         assert!(error.contains("byte .gitignore limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_file_path_is_searched_directly() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("one.rs"), "alpha beta\ngamma alpha\n").unwrap();
+        std::fs::write(root.join("two.rs"), "alpha only\n").unwrap();
+        let machine = test_machine(root.clone());
+
+        // A directory search still finds both files.
+        let both = machine
+            .grep_impl(grep_args("alpha"))
+            .await
+            .expect("directory search");
+        assert!(both.contains("one.rs"), "{both}");
+        assert!(both.contains("two.rs"), "{both}");
+
+        // Naming one file searches only that file, even if a glob would exclude it.
+        let mut args = grep_args("alpha");
+        args.path = "one.rs".to_owned();
+        args.output_mode = GrepOutputMode::Files;
+        let files: Value = serde_json::from_str(&machine.grep_impl(args.clone()).await.unwrap())
+            .expect("single-file files search");
+        let listed = files["files"].as_array().expect("files array");
+        assert_eq!(listed.len(), 1, "{files}");
+        assert!(files["incomplete"].is_null(), "{files}");
+
+        // Content mode works on the same path, with context.
+        args.output_mode = GrepOutputMode::Content;
+        args.after = Some(1);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert!(content.contains("alpha"), "{content}");
+        assert!(!content.contains("two.rs"), "{content}");
     }
 
     #[cfg(unix)]
