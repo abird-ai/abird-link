@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-11-13
+
+### Fixed
+
+- The shell schema test asserts whichever shell tool the platform exposes (`bash` on Unix, `powershell` on Windows) instead of hard-coding Bash. v0.14.5 was tagged but never published because that assertion failed only on the Windows native-test job.
+
 ## [0.14.5] - 2026-11-13
 
 ### Changed
@@ -516,6 +522,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.14.6]: https://github.com/abird-ai/dotlink/compare/v0.14.5...v0.14.6
 [0.14.5]: https://github.com/abird-ai/dotlink/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/abird-ai/dotlink/compare/v0.14.3...v0.14.4
 [0.14.0]: https://github.com/abird-ai/dotlink/compare/v0.13.1...v0.14.0

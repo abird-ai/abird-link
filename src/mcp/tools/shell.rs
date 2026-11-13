@@ -3619,7 +3619,14 @@ mod tests {
             description.contains(&crate::jobs::shell_job_follow_up(None)),
             "{description}"
         );
-        assert!(description.contains("Bash"), "{description}");
+        // The shell tool is bash on Unix and powershell on Windows; assert the
+        // label the implementation picks rather than a fixed one.
+        let expected = if crate::mcp::shell_tool_name() == "powershell" {
+            "PowerShell"
+        } else {
+            "Bash"
+        };
+        assert!(description.contains(expected), "{description}");
         let tunnel = with_profile_limits(shell.clone(), 42, 2048, Some(Duration::from_secs(30)));
         let tunnel = tunnel.description.as_deref().unwrap();
         assert!(tunnel.contains("after 30s"), "{tunnel}");
