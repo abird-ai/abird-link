@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
     net::SocketAddr,
@@ -2763,10 +2764,38 @@ pub(crate) const CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG_FILE";
 /// Accepted for compatibility; superseded by [`CONFIG_FILE_ENV`].
 const LEGACY_CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG";
 
+/// Resolve the config-file override from both names.
+///
+/// The canonical name wins outright. The legacy alias is still honoured so an
+/// existing deployment keeps working, and the caller learns it is deprecated —
+/// a comment alone would leave it silently permanent.
+fn resolve_config_override(
+    canonical: Option<OsString>,
+    legacy: Option<OsString>,
+) -> (Option<PathBuf>, bool) {
+    if let Some(path) = canonical {
+        return (Some(PathBuf::from(path)), false);
+    }
+    match legacy {
+        Some(path) => (Some(PathBuf::from(path)), true),
+        None => (None, false),
+    }
+}
+
 fn config_file_override() -> Option<PathBuf> {
-    env::var_os(CONFIG_FILE_ENV)
-        .or_else(|| env::var_os(LEGACY_CONFIG_FILE_ENV))
-        .map(PathBuf::from)
+    let (path, used_legacy) = resolve_config_override(
+        env::var_os(CONFIG_FILE_ENV),
+        env::var_os(LEGACY_CONFIG_FILE_ENV),
+    );
+    if used_legacy {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "{LEGACY_CONFIG_FILE_ENV} is a deprecated alias for {CONFIG_FILE_ENV}; rename the environment variable"
+            );
+        });
+    }
+    path
 }
 
 fn config_parent_is_dotlink_owned() -> bool {
@@ -4400,6 +4429,20 @@ mod tests {
         // working; the canonical name is DOTLINK_CONFIG_FILE.
         assert_eq!(CONFIG_FILE_ENV, "DOTLINK_CONFIG_FILE");
         assert_eq!(LEGACY_CONFIG_FILE_ENV, "DOTLINK_CONFIG");
+
+        let canonical = OsString::from("/run/dotlink/config.jsonc");
+        let legacy = OsString::from("/etc/dotlink/config.jsonc");
+        // The canonical name wins when a deployment sets both, and only the
+        // legacy name is reported as deprecated.
+        assert_eq!(
+            resolve_config_override(Some(canonical.clone()), Some(legacy.clone())),
+            (Some(PathBuf::from(&canonical)), false)
+        );
+        assert_eq!(
+            resolve_config_override(None, Some(legacy.clone())),
+            (Some(PathBuf::from(&legacy)), true)
+        );
+        assert_eq!(resolve_config_override(None, None), (None, false));
     }
 
     #[test]
