@@ -85,7 +85,7 @@ Default runs are quiet. Add `-v` to see tool activity:
 ~~~text
 $ dotlink -v -p aw
 
-dotlink v0.15.0
+dotlink v0.15.1
 ────────────────────────────────────────────────────────
 • Profile    aw
 • Transports openai
@@ -515,6 +515,7 @@ OUTPUT & DIAGNOSTICS
 --list-tools                    show tools exposed by the effective policy
 --print-id                      print configured tunnel ID (no Runtime key needed)
 -s, --serialize                 execute MCP tools one at a time (opt-in)
+    --no-serialize              allow concurrent calls even when the profile serializes
 -q, --quiet                     suppress TOOL activity
 -v, --verbose                   -v TOOL; -vv TOOL + REQ
 --color <auto|always|never>     control colors in help and human output
@@ -737,7 +738,7 @@ nix build .#release-all
 
 The bundle contains static Linux x86_64/ARM64 binaries, Windows x86_64/ARM64, and macOS ARM64. The static Linux builds run across NixOS, Debian, and other compatible distributions. Individual Nix outputs are available as `dist-linux-*`, `dist-windows-*`, and `dist-macos-aarch64`.
 
-To publish a GitHub Release, push a tag matching the Cargo version, such as `v0.15.0`. CI rebuilds the Nix release graph and uploads each binary plus its `.sha256` sidecar as an individual release asset; the Actions ZIP bundle is not published as the release.
+To publish a GitHub Release, push a tag matching the Cargo version, such as `v0.15.1`. CI rebuilds the Nix release graph and uploads each binary plus its `.sha256` sidecar as an individual release asset; the Actions ZIP bundle is not published as the release.
 
 Cross-build outputs, stable filenames, installer overrides, and platform release details: `.agents/docs/release-install.md`.
 

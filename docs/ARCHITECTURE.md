@@ -520,7 +520,7 @@ Every bounded transport ultimately enforces a serialized `CallToolResult` postco
 
 OpenAI Secure MCP Tunnel messages are bounded by the hosted 10 MiB serialized-envelope limit. dotlink caps the complete embedded MCP message at 9 MiB, reserving 1 MiB for tunnel wrapper/header metadata, while raw/tool transfer ceilings remain 8 MiB. The hosted request lifetime is a fixed 120 s and dotlink holds back 5 s for terminal delivery. Every shell call is durable from admission: the request waits only through its transport budget, then renders the ordinary result from terminal metadata plus leased spools if that complete result fits the response budget; otherwise it exposes the same stable job/task id, even when execution already finished. Execution timeouts are never rewritten.
 
-Only -s/--serialize runs all handlers through one exclusive gate. Linux
+Only -s/--serialize runs all handlers through one exclusive gate; --no-serialize revokes a configured value for one run. Linux
 uses openat2; macOS uses pinned-root, component-wise openat with O_NOFOLLOW.
 Both permit independent native requests to run concurrently. Windows retains
 its operation gate and uses named cross-process mutation mutexes deduplicated

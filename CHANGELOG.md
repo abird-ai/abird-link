@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-13
+
+### Added
+
+- `--no-serialize` revokes tool-call serialization for one run, matching the `--no-stdio`/`--no-http`/`--no-ngrok` pattern. Until now `--serialize` could only enable, so a profile or `DOTLINK_SERIALIZE` value could not be undone for a single invocation. Precedence is now uniform in both directions: the CLI wins over the environment and the profile.
+
 ## [0.15.0] - 2026-11-13
 
 ### Added
@@ -546,6 +552,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.15.1]: https://github.com/abird-ai/dotlink/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/abird-ai/dotlink/compare/v0.14.8...v0.15.0
 [0.14.8]: https://github.com/abird-ai/dotlink/compare/v0.14.7...v0.14.8
 [0.14.7]: https://github.com/abird-ai/dotlink/compare/v0.14.6...v0.14.7

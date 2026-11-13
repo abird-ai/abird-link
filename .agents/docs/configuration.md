@@ -49,7 +49,7 @@ Profiles are JSONC: comments and trailing commas are allowed. OpenAI Runtime key
 
 Local HTTP and stdio **intentionally have no shared admission budget**: the model/client controls concurrency. The OpenAI tunnel has a separate in-flight bound, and tool-specific file/output/timeout bounds still apply. This is a deliberate operator choice and should not be re-raised as an architectural defect without a concrete separate bug.
 
-Running `dotlink --serialize` (or `-s`) executes all MCP calls sequentially within that process; it does not change the persisted schema, require a profile migration, or coordinate separate dotlink instances. Linux defaults to concurrent tool execution with descriptor-rooted filesystem IO; other platforms preserve the conservative gate until their secure file operations are implemented.
+Running `dotlink --serialize` (or `-s`) executes all MCP calls sequentially; `--no-serialize` revokes a profile or environment setting for one run within that process; it does not change the persisted schema, require a profile migration, or coordinate separate dotlink instances. Linux defaults to concurrent tool execution with descriptor-rooted filesystem IO; other platforms preserve the conservative gate until their secure file operations are implemented.
 
 ## Setup flow
 

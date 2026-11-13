@@ -359,9 +359,14 @@ struct Args {
     print_id: bool,
 
     /// Execute one MCP tool call at a time instead of allowing concurrent calls.
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, conflicts_with = "no_serialize")]
     #[arg(help_heading = "Output & diagnostics")]
     serialize: bool,
+
+    /// Allow concurrent MCP tool calls even when the selected profile sets `serialize`.
+    #[arg(long, conflicts_with = "serialize")]
+    #[arg(help_heading = "Output & diagnostics")]
+    no_serialize: bool,
 
     /// Suppress TOOL activity even when verbosity enables it.
     #[arg(short = 'q', long)]
@@ -990,6 +995,19 @@ fn selected_profile(args: &Args) -> Option<String> {
     })
 }
 
+/// Serialization is enabled by a CLI flag, the environment or the profile, and
+/// an explicit `--no-serialize` revokes the latter two. Bare `--serialize` can
+/// only enable, so it never disables a configured value.
+fn resolve_serialize(cli_enable: bool, cli_disable: bool, configured: bool) -> bool {
+    if cli_disable {
+        false
+    } else if cli_enable {
+        true
+    } else {
+        configured
+    }
+}
+
 async fn run_main(supervisor: &Supervisor) -> Result<()> {
     let args = parse_args();
     let launch_dir = std::env::current_dir()?;
@@ -1498,7 +1516,7 @@ async fn prepare_runtime(
         #[cfg(target_os = "linux")]
         host_shell,
         log: log.clone(),
-        serialize: args.serialize || setup.config.serialize,
+        serialize: resolve_serialize(args.serialize, args.no_serialize, setup.config.serialize),
         allow_shell: policy.allow_shell,
         sandbox_shell: policy.sandbox_shell,
         allow_network: policy.allow_network,
@@ -3406,6 +3424,17 @@ mod tests {
                 .unwrap()
                 .serialize
         );
+    }
+
+    #[test]
+    fn serialize_negative_flag_revokes_profile_and_env() {
+        assert!(!resolve_serialize(false, false, false));
+        assert!(resolve_serialize(false, false, true));
+        assert!(resolve_serialize(true, false, false));
+        // The negative flag wins over a configured value, which is what lets a
+        // one-run override undo `DOTLINK_SERIALIZE=1` or a saved profile.
+        assert!(!resolve_serialize(false, true, true));
+        assert!(Args::try_parse_from(["dotlink", "--serialize", "--no-serialize"]).is_err());
     }
 
     #[test]
