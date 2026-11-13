@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-11-13
+
 ### Added
 
 - JSON results from shell and job tools carry `ts` (UTC epoch seconds) taken from the completion, not the render moment, so a replayed or native-task-inlined result stays byte-identical to the original `tools/call` result. The server instructions plus the shell description ask the caller to anchor a turn on its first `ts` and checkpoint a summary around `TURN_CHECKPOINT_MINUTES` (40). dotlink never infers a turn boundary: the anchor lives in the caller's context, and per-job `elapsed_ms` stays the anchor-free age of the longest-running piece.
@@ -636,6 +638,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
+[0.16.3]: https://github.com/abird-ai/dotlink/compare/v0.16.2...v0.16.3
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
 [0.16.2]: https://github.com/abird-ai/dotlink/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/abird-ai/dotlink/compare/v0.16.0...v0.16.1
