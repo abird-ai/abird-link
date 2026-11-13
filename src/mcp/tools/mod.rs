@@ -184,6 +184,15 @@ fn dot() -> String {
     ".".to_owned()
 }
 
+/// UTC epoch seconds, stamped into JSON payloads so a caller can keep its own
+/// turn clock. Advisory only: dotlink never infers a turn boundary.
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 fn ok_text(text: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text.into())])
 }

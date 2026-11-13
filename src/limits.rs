@@ -18,11 +18,15 @@ pub(crate) const OPENAI_TUNNEL_DELIVERY_RESERVE: Duration = Duration::from_secs(
 /// here. Consuming the remaining window in full therefore races the caller's own
 /// timeout and loses the response, and durable execution makes those last
 /// seconds worth nothing. Past this point the same job handle is returned.
-pub(crate) const OPENAI_TUNNEL_SYNC_HOLD: Duration = Duration::from_secs(30);
+pub(crate) const OPENAI_TUNNEL_SYNC_HOLD: Duration = Duration::from_secs(90);
 const _: () = assert!(
     OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
         < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()
 );
+/// Advisory checkpoint horizon for one conversation turn. Guidance only: dotlink
+/// never infers a turn boundary, it stamps `ts` and the caller keeps its own.
+pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 40;
+
 /// OpenAI Secure MCP Tunnel's serialized request/response message ceiling.
 pub(crate) const OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Reserve between the complete embedded MCP message and the hosted tunnel

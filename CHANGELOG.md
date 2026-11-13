@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- JSON results from shell and job tools carry `ts` (UTC epoch seconds), and the server instructions plus the shell description ask the caller to anchor a turn on its first `ts` and checkpoint a summary around `TURN_CHECKPOINT_MINUTES` (40). dotlink never infers a turn boundary: the anchor lives in the caller's context, and per-job `elapsed_ms` stays the anchor-free age of the longest-running piece.
+
+### Changed
+
+- The synchronous shell hold returns to `OPENAI_TUNNEL_SYNC_HOLD` = 90 s. The 30 s experiment showed the handoff was not the failure mode — long turns died on the client's own message delivery, with every request answered — while a wider window lets more commands finish inline instead of becoming handles.
+
 ## [0.16.2] - 2026-11-13
 
 ### Fixed

@@ -174,11 +174,13 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. If it is still running after {}s, this returns a job handle instead of output and the command keeps running; {follow_up}.",
-            hold.as_secs()
+            "Run a {shell} command. If it is still running after {}s, this returns a job handle instead of output and the command keeps running; {follow_up}. Results carry `ts` (epoch seconds); checkpoint a summary around {} min in a turn.",
+            hold.as_secs(),
+            crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command. This waits until the command finishes or timeout_secs expires; job_start runs it in the background and returns the same handle: {follow_up}."
+            "Run a {shell} command. This waits until the command finishes or timeout_secs expires; job_start runs it in the background and returns the same handle: {follow_up}. Results carry `ts` (epoch seconds); checkpoint a summary around {} min in a turn.",
+            crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
 }
@@ -3627,9 +3629,19 @@ mod tests {
             "Bash"
         };
         assert!(description.contains(expected), "{description}");
-        let tunnel = with_profile_limits(shell.clone(), 42, 2048, Some(Duration::from_secs(30)));
+        // Use the real hold so the advertised window cannot drift from it.
+        let hold = crate::limits::OPENAI_TUNNEL_SYNC_HOLD;
+        let tunnel = with_profile_limits(shell.clone(), 42, 2048, Some(hold));
         let tunnel = tunnel.description.as_deref().unwrap();
-        assert!(tunnel.contains("after 30s"), "{tunnel}");
+        assert!(
+            tunnel.contains(&format!("after {}s", hold.as_secs())),
+            "{tunnel}"
+        );
+        assert!(tunnel.contains("`ts`"), "{tunnel}");
+        assert!(
+            tunnel.contains(&crate::limits::TURN_CHECKPOINT_MINUTES.to_string()),
+            "{tunnel}"
+        );
         // A local transport never hands off early, and must not claim a window.
         assert!(!description.contains("after "), "{description}");
         assert!(
@@ -3939,6 +3951,10 @@ mod tests {
             "{receipt}"
         );
         assert!(receipt["elapsed_ms"].is_u64(), "{receipt}");
+        // The response clock the caller anchors its turn on: a plausible UTC
+        // epoch, never zero and never in the future.
+        let ts = receipt["ts"].as_u64().expect("receipt carries ts");
+        assert!(ts > 1_600_000_000, "{receipt}");
         assert!(receipt["stdout_bytes"].is_u64(), "{receipt}");
         // No duplicated pointer keys: the instructions field is the only place
         // the follow-up tool names appear.

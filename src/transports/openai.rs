@@ -7515,10 +7515,10 @@ name"
         });
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(30))
+            Ok(Some(90))
         );
         assert_eq!(call.pointer("/params/arguments/timeout_secs"), None);
-        assert_eq!(sync_meta(&call), Some(30_000));
+        assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
         let meta = call["params"]["_meta"].as_object().unwrap();
         assert!(!meta.contains_key("io.abird.dotlink/futureField"));
@@ -7543,13 +7543,13 @@ name"
             let mut call = shell(json!({"command":"true","timeout_secs":value}));
             assert_eq!(
                 annotate_response_context(&mut call, window, reserve, "request", "token"),
-                Ok(Some(30))
+                Ok(Some(90))
             );
             assert_eq!(
                 call.pointer("/params/arguments/timeout_secs"),
                 Some(&json!(value))
             );
-            assert_eq!(sync_meta(&call), Some(30_000));
+            assert_eq!(sync_meta(&call), Some(90_000));
         }
 
         // Invalid argument types are also left untouched for schema validation;
@@ -7557,13 +7557,13 @@ name"
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(30))
+            Ok(Some(90))
         );
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!("600"))
         );
-        assert_eq!(sync_meta(&call), Some(30_000));
+        assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
 
         // Explicit background jobs carry request identity but no synchronous

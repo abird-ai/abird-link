@@ -839,6 +839,7 @@ type JobResult<T> = std::result::Result<T, JobError>;
 
 #[derive(Debug, Serialize)]
 struct JobOutputPage<'a> {
+    ts: u64,
     job_id: &'a str,
     stream: &'static str,
     offset: u64,
@@ -1430,6 +1431,7 @@ impl JobManager {
             .collect::<Vec<_>>();
         jobs.sort_by_key(|entry| std::cmp::Reverse(entry.created));
         serde_json::json!({
+            "ts": crate::mcp::now_unix(),
             "jobs": jobs.into_iter().take(limit).map(|entry| serde_json::json!({
                 "job_id": entry.id,
                 "status": entry.status(),
@@ -2122,6 +2124,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             )]));
         }
         let text = serde_json::json!({
+            "ts": crate::mcp::now_unix(),
             "exit_code": completion.exit_code,
             "success": completion.success,
             "timed_out": false,
@@ -2144,6 +2147,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let next = timed_out
         .then_some("job_start starts it in the background, or retry with a larger timeout_secs");
     let text = serde_json::json!({
+        "ts": crate::mcp::now_unix(),
         "exit_code": completion.exit_code,
         "success": completion.success,
         "timed_out": completion.status == JobStatus::TimedOut,
@@ -2338,6 +2342,7 @@ impl OutputPageRender<'_> {
             String::from_utf8_lossy(bytes).into_owned()
         };
         serde_json::to_string(&JobOutputPage {
+            ts: crate::mcp::now_unix(),
             job_id: self.id,
             stream: self.stream.label(),
             offset: self.offset,
@@ -2365,6 +2370,7 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         |_| entry.stderr_retained,
     );
     serde_json::json!({
+        "ts": crate::mcp::now_unix(),
         "job_id": entry.id,
         "task_id": entry.id,
         "status": entry.status(),
@@ -2477,6 +2483,7 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
                 "no output in this reply; {}; {SHELL_JOB_DO_NOT_REPEAT}",
                 shell_job_follow_up(None)
             ),
+            "ts": crate::mcp::now_unix(),
             "job_id": entry.id,
             "task_id": entry.id,
             "status": entry.status(),
