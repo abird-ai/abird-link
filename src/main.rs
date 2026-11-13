@@ -951,11 +951,42 @@ fn main() -> ExitCode {
     recovery.exit_code()
 }
 
+/// Logging verbosity may also come from the environment, using the same
+/// vocabulary the NixOS module exposes: `lifecycle`, `tools` (-v) or `requests`
+/// (-vv). Precedence matches every other setting here: CLI flag > `DOTLINK_*`
+/// environment > saved profile > built-in default. Verbosity has no profile
+/// field yet, so the environment sits directly above the default; an operator
+/// can therefore set a level through a systemd drop-in without pinning
+/// `ExecStart` to a store path.
+const VERBOSITY_ENV: &str = "DOTLINK_VERBOSITY";
+
+fn resolve_verbosity(
+    cli_verbose: u8,
+    cli_quiet: bool,
+    env_value: Option<&str>,
+) -> Result<(u8, bool)> {
+    if cli_verbose > 0 || cli_quiet {
+        return Ok((cli_verbose, cli_quiet));
+    }
+    let Some(raw) = env_value else {
+        return Ok((0, false));
+    };
+    match raw.trim() {
+        "" | "lifecycle" => Ok((0, false)),
+        "tools" => Ok((1, false)),
+        "requests" => Ok((2, false)),
+        other => bail!("{VERBOSITY_ENV} must be lifecycle, tools or requests, not {other:?}"),
+    }
+}
+
 async fn run_main(supervisor: &Supervisor) -> Result<()> {
     let args = parse_args();
     let launch_dir = std::env::current_dir()?;
 
-    let log = LogConfig::new(args.verbose, args.quiet, args.color);
+    let verbosity_env = std::env::var(VERBOSITY_ENV).ok();
+    let (verbose, quiet) = resolve_verbosity(args.verbose, args.quiet, verbosity_env.as_deref())
+        .map_err(recovery::config_failure)?;
+    let log = LogConfig::new(verbose, quiet, args.color);
     let setup_color = args.color.stdout_enabled();
     let default_filter = "dotlink=warn";
     let filter = EnvFilter::try_from_default_env()
@@ -3345,6 +3376,50 @@ mod tests {
                 .unwrap()
                 .serialize
         );
+    }
+
+    #[test]
+    fn verbosity_env_supplies_a_default_and_cli_wins() {
+        assert_eq!(resolve_verbosity(0, false, None).unwrap(), (0, false));
+        assert_eq!(
+            resolve_verbosity(0, false, Some("lifecycle")).unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, false, Some("tools")).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, false, Some("requests")).unwrap(),
+            (2, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, false, Some(" requests ")).unwrap(),
+            (2, false),
+            "surrounding whitespace is tolerated"
+        );
+        assert_eq!(resolve_verbosity(0, false, Some("")).unwrap(), (0, false));
+        // Explicit CLI flags always win over the environment.
+        assert_eq!(
+            resolve_verbosity(1, false, Some("requests")).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            resolve_verbosity(2, false, Some("tools")).unwrap(),
+            (2, false)
+        );
+        assert_eq!(
+            resolve_verbosity(0, true, Some("requests")).unwrap(),
+            (0, true)
+        );
+        // An unknown value fails closed and names what is accepted, so a typo
+        // cannot look like logging that is quietly off.
+        let error = resolve_verbosity(0, false, Some("debug"))
+            .unwrap_err()
+            .to_string();
+        for expected in ["lifecycle", "tools", "requests"] {
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

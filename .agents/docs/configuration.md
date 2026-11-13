@@ -269,6 +269,10 @@ Allow rules are additive. Deny rules win. Bare path flags target the launch dire
 
 Shell access requires at least one readable directory.
 
+## Logging level
+
+`-q` silences activity logging, `-v` logs TOOL activity and `-vv` adds REQ diagnostics. Settings resolve in one order everywhere: CLI flag > `DOTLINK_*` environment > saved profile > built-in default. Verbosity has no profile field, so `-q`/`-v`/`-vv` sit above `DOTLINK_VERBOSITY`, which supplies `lifecycle`, `tools` or `requests` and sits above the default. A systemd drop-in can therefore set the level with `Environment=` instead of overriding `ExecStart`, which would pin the package store path and silently freeze upgrades. An unrecognized value is an operator configuration error that names the accepted values.
+
 ## Runtime terminal controls
 
 Interactive runs without stdio expose immediate key controls:
