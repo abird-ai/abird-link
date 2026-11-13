@@ -24,37 +24,39 @@
     };
   };
 
+  managedSettings = {
+    tunnel_id = "tunnel_fixture";
+    transports.openai = true;
+    permissions = {
+      default_allow = true;
+      allow_shell = true;
+      allow_nix_daemon = true;
+      allow_nix_config = true;
+      allow_ssh_agent = true;
+      allow_git_config = true;
+      allow_kvm = true;
+      allow_gpu = ["amd" "nvidia"];
+    };
+    caches = [
+      {
+        kind = "cargo-registry";
+        mode = "ro";
+      }
+      {
+        kind = "go-mod";
+        mode = "rw";
+      }
+    ];
+    logging.verbosity = "tools";
+    serialize = true;
+  };
+
   managed = eval {
     services.dotlink = {
       enable = true;
       user = "alice";
       workingDirectory = "/home/alice/projects";
-      settings = {
-        tunnel_id = "tunnel_fixture";
-        transports.openai = true;
-        permissions = {
-          default_allow = true;
-          allow_shell = true;
-          allow_nix_daemon = true;
-          allow_nix_config = true;
-          allow_ssh_agent = true;
-          allow_git_config = true;
-          allow_kvm = true;
-          allow_gpu = ["amd" "nvidia"];
-        };
-        caches = [
-          {
-            kind = "cargo-registry";
-            mode = "ro";
-          }
-          {
-            kind = "go-mod";
-            mode = "rw";
-          }
-        ];
-        logging.verbosity = "tools";
-        serialize = true;
-      };
+      settings = managedSettings;
       credentials.runtimeApiKeyFile = "/run/secrets/dotlink-key";
       credentials.ngrokAuthTokenFile = "/run/secrets/ngrok";
       sshAgentSocket = "/run/user/1000/gcr/ssh";
@@ -137,6 +139,57 @@
   systemd255 = atSystemdVersion "255.13";
   systemd257 = atSystemdVersion "257.9";
   systemd258 = atSystemdVersion "258.1";
+  profileBacked = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      profile = "work";
+      extraGroups = ["kvm" "render" "video"];
+      extraPackages = [pkgs.git];
+    };
+  };
+  duplicateSlot = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      instances.work = {
+        profile = "default";
+        workingDirectory = "/home/alice/work";
+      };
+    };
+  };
+  duplicateBind = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      settings.transports = {
+        openai = false;
+        http = true;
+      };
+      instances.work.settings.transports = {
+        openai = false;
+        http = true;
+      };
+    };
+  };
+  duplicateTunnel = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      settings = {
+        transports.openai = true;
+        tunnel_id = "tunnel_shared";
+      };
+      instances.work.settings = {
+        transports.openai = true;
+        tunnel_id = "tunnel_shared";
+      };
+    };
+  };
   invalidWorkingDirectory = eval {
     services.dotlink = {
       enable = true;
@@ -145,7 +198,10 @@
   };
 
   managedUnitText = managed.config.systemd.units."dotlink.service".text;
-  managedProfile = builtins.fromJSON (builtins.readFile managed.config.environment.etc."dotlink/config.jsonc".source);
+  # The same writeText name and content hash to the same store path, so this is
+  # exactly the source the unit stages; reading it needs no internal derivation.
+  managedSource = pkgs.writeText "dotlink-default.jsonc" (builtins.toJSON (managedSettings // {version = 12;}));
+  managedProfile = builtins.fromJSON (builtins.readFile managedSource);
 
   valid = cfg:
     lib.all
@@ -197,7 +253,19 @@
     (dotlinkWarnings systemd258 == [])
 
     (valid managed)
-    (managed.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG_FILE)
+    (managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE == "/run/dotlink/config.jsonc")
+    (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
+    (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectoryMode == "0700")
+    (lib.hasInfix "install -m 0400" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
+    (lib.hasInfix
+      (builtins.unsafeDiscardStringContext (toString managedSource))
+      (builtins.unsafeDiscardStringContext managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre))
+    (!(managed.config.environment.etc ? "dotlink/config.jsonc"))
+    (normal.config.systemd.services.dotlink.environment.DOTLINK_STDIO == "0")
+    (managed.config.systemd.services.dotlink-test.serviceConfig.RuntimeDirectory == "dotlink-test")
+    (managed.config.systemd.services.dotlink-test.environment.DOTLINK_CONFIG_FILE == "/run/dotlink-test/config.jsonc")
+    (managed.config.systemd.services.dotlink-test.environment.DOTLINK_PROFILE == "test")
+    (!(managed.config.systemd.services.dotlink-work.serviceConfig ? RuntimeDirectory))
     (managed.config.systemd.services.dotlink.environment.DOTLINK_API_KEY_FILE == "%d/dotlink-api-key")
     (managed.config.systemd.services.dotlink.environment.NGROK_AUTHTOKEN_FILE == "%d/ngrok-authtoken")
     (managed.config.systemd.services.dotlink.serviceConfig.LoadCredential
@@ -221,7 +289,7 @@
     (lib.any (cache: cache.kind == "go-mod" && cache.mode == "rw") managedProfile.caches)
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_ALLOW_KVM))
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_SERIALIZE))
-    (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_STDIO))
+    (managed.config.systemd.services.dotlink.environment.DOTLINK_STDIO == "0")
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_VERBOSITY))
     (managed.config.systemd.services.dotlink.environment.DOTLINK_COLOR == "never")
     managedProfile.permissions.allow_kvm
@@ -250,7 +318,19 @@
     (!valid invalid)
     (!valid invalidSecret)
     (valid autoDetectedGcrAgent)
-    (autoDetectedGcrAgent.config.environment.etc."dotlink/config.jsonc".source != null)
+    (autoDetectedGcrAgent.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
+    # Mode B: policy and provisioning come from the selected user's profile plus
+    # explicit deployment options, because the module cannot read that profile.
+    (valid profileBacked)
+    (profileBacked.config.systemd.services.dotlink.environment.DOTLINK_PROFILE == "work")
+    (!(profileBacked.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG_FILE))
+    (!(profileBacked.config.systemd.services.dotlink.serviceConfig ? RuntimeDirectory))
+    (profileBacked.config.systemd.services.dotlink.serviceConfig.SupplementaryGroups == ["kvm" "render" "video"])
+    (lib.elem pkgs.git profileBacked.config.systemd.services.dotlink.path)
+    (!(lib.elem pkgs.nix profileBacked.config.systemd.services.dotlink.path))
+    (!valid duplicateSlot)
+    (!valid duplicateBind)
+    (!valid duplicateTunnel)
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? DOTLINK_SSH_AGENT_SOCKET))
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? SSH_AUTH_SOCK))
     (!valid stdioEnabled)

@@ -1215,6 +1215,37 @@ async fn discover_developer_caches() -> Vec<DiscoveredCache> {
 /// family whose directory does not exist is skipped with a warning rather
 /// than failing startup, matching the fact that caches appear and disappear
 /// with the service user's activity.
+/// Merge saved cache grants with the environment and CLI layers.
+///
+/// A saved grant with an explicit path owns that path: a later layer may change
+/// its mode but never silently moves the mount to a discovered directory.
+/// Path-less saved grants are discovery requests, so they compete with the later
+/// layers for their kind and the last layer wins.
+pub(crate) fn merge_cache_layers(
+    saved: &[CacheGrant],
+    environment: &[(CacheKind, CacheMode)],
+    cli: &[(CacheKind, CacheMode)],
+) -> (Vec<CacheGrant>, Vec<(CacheKind, CacheMode)>) {
+    let mut explicit: Vec<CacheGrant> = saved
+        .iter()
+        .filter(|grant| grant.path.is_some())
+        .cloned()
+        .collect();
+    let mut requests: Vec<(CacheKind, CacheMode)> = saved
+        .iter()
+        .filter(|grant| grant.path.is_none())
+        .map(|grant| (grant.kind, grant.mode))
+        .collect();
+    for (kind, mode) in environment.iter().chain(cli) {
+        requests.retain(|(existing, _)| existing != kind);
+        match explicit.iter_mut().find(|grant| grant.kind == *kind) {
+            Some(grant) => grant.mode = *mode,
+            None => requests.push((*kind, *mode)),
+        }
+    }
+    (explicit, requests)
+}
+
 pub async fn cache_grants_for_cli(requests: &[(CacheKind, CacheMode)]) -> Result<Vec<CacheGrant>> {
     if requests.is_empty() {
         return Ok(Vec::new());
@@ -2701,8 +2732,9 @@ fn ensure_dotlink_config_dir() -> Result<PathBuf> {
 
 /// Canonical name of the config-file override.
 ///
-/// The file, not the profile, is what moves: `DOTLINK_PROFILE` still selects the
-/// slot and `profiled_path` derives `config.<profile>.jsonc` from this base.
+/// An explicit file is used verbatim: naming a file means that file is read.
+/// `DOTLINK_PROFILE` then selects only the private state slot (credentials,
+/// OAuth grants), and `profiled_path` suffixes the *default* path alone.
 pub(crate) const CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG_FILE";
 /// Accepted for compatibility; superseded by [`CONFIG_FILE_ENV`].
 const LEGACY_CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG";
@@ -2718,11 +2750,15 @@ fn config_parent_is_dotlink_owned() -> bool {
 }
 
 fn config_path(profile: Option<&str>) -> Result<PathBuf> {
-    let base = match config_file_override() {
-        Some(path) => path,
-        None => dotlink_config_dir()?.join("config.jsonc"),
-    };
-    profiled_path(&base, profile)
+    resolve_config_path(config_file_override().as_deref(), profile)
+}
+
+/// An explicit file is used verbatim; only the default path is profiled.
+fn resolve_config_path(explicit: Option<&Path>, profile: Option<&str>) -> Result<PathBuf> {
+    match explicit {
+        Some(path) => Ok(path.to_path_buf()),
+        None => profiled_path(&dotlink_config_dir()?.join("config.jsonc"), profile),
+    }
 }
 
 fn credential_path(profile: Option<&str>) -> Result<PathBuf> {
@@ -4225,6 +4261,56 @@ mod tests {
         .map(|_| ())
         .expect_err("unknown field must be rejected");
         assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn cache_layers_keep_configured_paths_and_let_later_layers_win_the_mode() {
+        let saved = vec![
+            CacheGrant {
+                kind: CacheKind::Npm,
+                path: Some(PathBuf::from("/srv/npm")),
+                mode: CacheMode::ReadOnly,
+            },
+            CacheGrant {
+                kind: CacheKind::Uv,
+                path: None,
+                mode: CacheMode::ReadOnly,
+            },
+        ];
+
+        // A later layer changes the mode of an explicit grant without moving it.
+        let (grants, requests) = merge_cache_layers(
+            &saved,
+            &[(CacheKind::Npm, CacheMode::ReadWrite)],
+            &[(CacheKind::Uv, CacheMode::ReadWrite)],
+        );
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].path.as_deref(), Some(Path::new("/srv/npm")));
+        assert_eq!(grants[0].mode, CacheMode::ReadWrite);
+        // The path-less saved grant is a request, so the CLI layer replaced it.
+        assert_eq!(requests, vec![(CacheKind::Uv, CacheMode::ReadWrite)]);
+
+        // Nothing newer: saved values stand.
+        let (grants, requests) = merge_cache_layers(&saved, &[], &[]);
+        assert_eq!(grants[0].mode, CacheMode::ReadOnly);
+        assert_eq!(requests, vec![(CacheKind::Uv, CacheMode::ReadOnly)]);
+    }
+
+    #[test]
+    fn explicit_config_file_is_used_verbatim_not_profiled() {
+        // A named file stays the file that is read; the profile only selects the
+        // private state slot, so two services cannot share secrets by accident
+        // while still reading exactly the file the module staged for them.
+        let explicit = Path::new("/run/dotlink-work/config.jsonc");
+        assert_eq!(
+            resolve_config_path(Some(explicit), Some("work")).unwrap(),
+            explicit
+        );
+        let implicit = resolve_config_path(None, Some("work")).unwrap();
+        assert_eq!(
+            implicit.file_name().unwrap(),
+            std::ffi::OsStr::new("config.work.jsonc")
+        );
     }
 
     #[test]

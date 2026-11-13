@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-13
+
+### Fixed
+
+- A rendered `settings` config could not start whenever the sandboxed shell was enabled: `/nix/store` is an implicit shell runtime mount while the active config is a protected path, so assembly failed with `runtime mount /nix/store overlaps protected path …`. The module now copies the rendered file (and any `configFile` under `/nix/store`, `/etc` or `/run`) into the unit's private `RuntimeDirectory` at each start and points `DOTLINK_CONFIG_FILE` at `/run/dotlink[.<instance>]/config.jsonc`. A store symlink could never work — the guard resolves the configured path.
+- Removed the `/etc/dotlink/config.jsonc` publication. It was never the file the process read, so it was a second name for the same bytes; the staged `/run` path is now the single truth.
+- An explicit config file is used verbatim. `profile` selects the private state slot (saved key, OAuth grants) and only suffixes the *default* config path, so a named instance no longer silently reads `<base>.<instance>.jsonc` instead of the file it named.
+- `DOTLINK_CACHES` or a CLI cache flag above a saved grant with an explicit path replaced that path with a discovered directory. A later layer now changes the grant's mode and keeps its path; path-less saved grants remain discovery requests and still lose to later layers.
+- Instances that reuse a user profile lost `nix`, `git` and `openssh` from the service `PATH`, and lost the `kvm`, `render` and `video` supplementary groups, because both are now derived from `settings.permissions`, which that mode does not set. Add `extraGroups` for groups the profile grants and `extraPackages` for executables; the module cannot read a user-owned profile.
+- A systemd unit no longer honours `transports.stdio = true` from a reused profile. `DOTLINK_STDIO=0` is again a deployment invariant beside `DOTLINK_COLOR=never`, and declaring it in `settings` stays an evaluation error.
+
+### Added
+
+- Evaluation-time assertions for the properties that make several services independent: one private state slot per `(user, profile)`, one `settings.transports.http_bind`, and one `settings.tunnel_id`.
+- `extraGroups` declares supplementary groups the module cannot derive, so host provisioning stays a deployment fact rather than a guess about a profile.
+
+### Changed
+
+- `profile` may again be combined with `settings` or `configFile`: the config file says what runs, the profile says which private state belongs to it.
+
 ## [0.16.0] - 2026-11-13
 
 ### Changed
@@ -593,6 +613,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.16.1]: https://github.com/abird-ai/dotlink/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/abird-ai/dotlink/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/abird-ai/dotlink/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/abird-ai/dotlink/compare/v0.15.1...v0.15.2

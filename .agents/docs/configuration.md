@@ -287,13 +287,13 @@ The environment layer covers every setting the NixOS module can express, so a de
 
 Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` is parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
 
-A profile is a named slot; its config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author that file, while `profile` selects it — they are not separate layers, and an explicit `profile` cannot be combined with either authoring option.
+A profile is a named slot; its default config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author the config file, while `profile` selects the private state slot (saved keys, OAuth grants). An explicit config file is read verbatim — the profile then only suffixes the *default* path.
 
 The NixOS module expresses each setting in exactly one layer: policy goes into the profile it renders when `settings` is set, and into the environment when it reuses a user-owned profile. That keeps the order meaningful — the module never overrides the profile it just wrote, while a drop-in can still override either mode from the environment.
 
-`settings` is the *only* place config-file fields are authored; there are no typed siblings to reconcile. It is rendered verbatim (plus `version`) and published read-only at `/etc/dotlink/config.<profile>.jsonc`, with `DOTLINK_CONFIG_FILE` naming the base. Unknown fields are rejected at load, so a typo fails with the field named instead of being ignored.
+`settings` is the *only* place config-file fields are authored; there are no typed siblings to reconcile. It is rendered verbatim (plus `version`) and copied into the unit's private runtime directory at each start, so `DOTLINK_CONFIG_FILE` names a private `/run/dotlink…/config.jsonc` rather than a store file that the sandbox guard would reject. Unknown fields are rejected at load, so a typo fails with the field named instead of being ignored.
 
-Environment assignments replace the saved value (`DOTLINK_ALLOW_KVM=0` clears a profile grant), whereas CLI grants are additive and cannot revoke. Revocation without the environment stays a deny rule or a profile edit. `DOTLINK_PROFILE` resolves `<stem>.<profile>.<ext>` beside `DOTLINK_CONFIG`, so a hand-written override must keep the base named `config.jsonc`.
+Environment assignments replace the saved value (`DOTLINK_ALLOW_KVM=0` clears a profile grant), whereas CLI grants are additive and cannot revoke. Revocation without the environment stays a deny rule or a profile edit. `DOTLINK_PROFILE` resolves `<stem>.<profile>.<ext>` beside the *default* config path; an explicit `DOTLINK_CONFIG_FILE` is used as written.
 
 ## Runtime terminal controls
 

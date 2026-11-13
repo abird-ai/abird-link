@@ -89,14 +89,19 @@ existing JSONC schema, not a second independently maintained config format.
 Never include keys, passwords, or tokens inside `settings`, as Nix store
 objects are not secret.
 
-Alternatively, set `configFile = "/path/to/config.jsonc";` to select an
-external **base** JSONC file without generating a file in the Nix store.
-`settings` and `configFile` are mutually exclusive. They also cannot be
-combined with an explicit `profile`, because named-profile selection changes
-the JSONC filename. For a named instance, dotlink selects the sibling
-`config.<instance>.jsonc` file from that base path. Generated `settings`
-automatically create the correctly named sibling in the Nix store, so each
-instance retains independent saved keys and OAuth state.
+Alternatively, set `configFile = "/path/to/config.jsonc";` to use an external
+JSONC file. `settings` and `configFile` are mutually exclusive, and the value is
+used verbatim: naming a file means that file is read.
+
+Rendered `settings` (and any `configFile` under `/nix/store`, `/etc` or `/run`)
+are copied into the unit's private runtime directory at each start, because the
+store is an implicit shell runtime mount while the active config is a protected
+path. `DOTLINK_CONFIG_FILE` therefore names `/run/dotlink/config.jsonc` (or
+`/run/dotlink-<instance>/config.jsonc`), never the store source.
+
+`profile` is orthogonal: it selects the private state slot (saved keys, OAuth
+grants) and only suffixes the *default* config path, so two services on one host
+stay independent without touching how their config files are located.
 
 ## Optional credential overrides
 

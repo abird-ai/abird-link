@@ -1481,28 +1481,11 @@ async fn prepare_runtime(
         // Saved grants with an explicit path are used as written. Path-less
         // saved grants are requests for discovery, so they join the environment
         // and CLI layers and are resolved together, later layers winning.
-        let mut caches: Vec<setup::CacheGrant> = setup
-            .config
-            .caches
-            .iter()
-            .filter(|grant| grant.path.is_some())
-            .cloned()
-            .collect();
-        let mut requests: Vec<(setup::CacheKind, setup::CacheMode)> = setup
-            .config
-            .caches
-            .iter()
-            .filter(|grant| grant.path.is_none())
-            .map(|grant| (grant.kind, grant.mode))
-            .collect();
-        for (kind, mode) in setup::env_cache_requests()? {
-            requests.retain(|(existing, _)| *existing != kind);
-            requests.push((kind, mode));
-        }
-        for (kind, mode) in args.cache_flags.requested() {
-            requests.retain(|(existing, _)| *existing != kind);
-            requests.push((kind, mode));
-        }
+        let (mut caches, requests) = setup::merge_cache_layers(
+            &setup.config.caches,
+            &setup::env_cache_requests()?,
+            &args.cache_flags.requested(),
+        );
         for override_cache in cache_grants_for_cli(&requests).await? {
             caches.retain(|saved| saved.kind != override_cache.kind);
             caches.push(override_cache);
