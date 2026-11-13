@@ -628,38 +628,63 @@ fn default_app_config() -> AppConfig {
     }
 }
 
-fn migrate_config(mut config: AppConfig) -> Result<AppConfig> {
+/// Decode a config file oldest-first: migrate the raw value, then decode strictly.
+///
+/// Strict decoding turns a typo into an error instead of a silently ignored
+/// setting. Running it *after* migration is what lets a profile written for an
+/// older schema keep loading once a later schema retires a field.
+fn load_config(text: &str) -> Result<AppConfig> {
+    let mut value: serde_json::Value = parse_jsonc(text)?;
+    migrate_value(&mut value)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn migrate_value(value: &mut serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("profile config must be a JSON object"))?;
+    let from = object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow!("profile config is missing its schema version"))?;
+    let from = u32::try_from(from)
+        .map_err(|_| anyhow!("profile config schema version is out of range: {from}"))?;
     let current = config_version();
-    if config.version > current {
+    if from > current {
         bail!(
-            "profile uses newer schema version {}; this dotlink supports version {}. Upgrade dotlink instead of overwriting the profile",
-            config.version,
-            current
+            "profile uses newer schema version {from}; this dotlink supports version {current}. Upgrade dotlink instead of overwriting the profile"
         );
     }
 
-    while config.version < current {
-        match config.version {
-            // v10 added only additive/defaulted fields: oauth (disabled by default)
-            // and transports.ngrok_domain (None by default). Existing v9 values
-            // retain the same meaning under v10 unless the new public-ingress
-            // safety validation requires the user to configure OAuth explicitly.
-            9 => config.version = 10,
-            // v11 adds two additive/defaulted fields: serialize (false) and
-            // logging.verbosity (lifecycle). Saved v10 values keep their meaning.
-            10 => config.version = 11,
-            // v11 added serialize and logging.verbosity; v12 makes a cache
-            // entry's `path` optional so discovery can supply it.
-            11 => config.version = 12,
-            version => {
-                bail!(
-                    "profile uses schema version {version}; no automatic migration path to version {current} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one"
-                );
-            }
-        }
+    let mut version = from;
+    while version < current {
+        migration_step(version, object)?;
+        version += 1;
     }
+    object.insert("version".to_owned(), serde_json::Value::from(current));
+    Ok(())
+}
 
-    Ok(config)
+/// One schema step, applied to the raw value before the strict decode.
+///
+/// A field a later schema removed is retired here, next to the version that
+/// dropped it, so an older profile has it removed before decoding. Every step
+/// so far is additive, so there is nothing to retire yet.
+fn migration_step(
+    from: u32,
+    _value: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    match from {
+        // v10 added only additive/defaulted fields: oauth (disabled by default)
+        // and transports.ngrok_domain (None by default).
+        // v11 adds serialize (false) and logging.verbosity (lifecycle).
+        // v12 makes a cache entry's `path` optional so discovery can supply it.
+        9..=11 => Ok(()),
+        version => bail!(
+            "profile uses schema version {version}; no automatic migration path to version {} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one",
+            config_version()
+        ),
+    }
 }
 
 fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfig>> {
@@ -672,10 +697,8 @@ fn read_profile_config_migrated(profile: Option<&str>) -> Result<Option<AppConfi
     else {
         return Ok(None);
     };
-    let config: AppConfig =
-        parse_jsonc(&text).with_context(|| format!("failed to parse {}", path.display()))?;
     let config =
-        migrate_config(config).with_context(|| format!("failed to migrate {}", path.display()))?;
+        load_config(&text).with_context(|| format!("failed to load {}", path.display()))?;
     Ok(Some(config))
 }
 
@@ -2488,6 +2511,7 @@ fn save_config_locked(
     profile: Option<&str>,
     owner_changed: bool,
 ) -> Result<()> {
+    ensure_manageable_profile("profile saving")?;
     let previous = read_profile_config(profile)?;
     // Permit repair of any unusable selected key while preserving the atomic
     // commit point for the new immutable credential generation. Management
@@ -2754,11 +2778,37 @@ fn config_path(profile: Option<&str>) -> Result<PathBuf> {
 }
 
 /// An explicit file is used verbatim; only the default path is profiled.
+///
+/// A suffixed sibling next to an explicit file means the two readings disagree
+/// (before 0.16.1 the profile won), so refuse to guess instead of silently
+/// reading a different config than the one that was named.
 fn resolve_config_path(explicit: Option<&Path>, profile: Option<&str>) -> Result<PathBuf> {
-    match explicit {
-        Some(path) => Ok(path.to_path_buf()),
-        None => profiled_path(&dotlink_config_dir()?.join("config.jsonc"), profile),
+    let Some(base) = explicit else {
+        return profiled_path(&dotlink_config_dir()?.join("config.jsonc"), profile);
+    };
+    if let Some(profile) = profile {
+        let sibling = profiled_path(base, Some(profile))?;
+        if sibling.exists() {
+            bail!(
+                "both {} and {} exist; an explicit config file is read verbatim, so remove one of them",
+                base.display(),
+                sibling.display()
+            );
+        }
     }
+    Ok(base.to_path_buf())
+}
+
+/// A profile dotlink owns lives under its private config directory. An explicit
+/// config file belongs to the operator, so management refuses rather than
+/// rewriting or deleting a deployment's active config.
+fn ensure_manageable_profile(action: &str) -> Result<()> {
+    if config_file_override().is_some() {
+        bail!(
+            "{action} is unavailable while an explicit config file is set ({CONFIG_FILE_ENV}); edit that file directly"
+        );
+    }
+    Ok(())
 }
 
 fn credential_path(profile: Option<&str>) -> Result<PathBuf> {
@@ -2954,6 +3004,7 @@ fn delete_profile_artifacts(name: &str, config: &Path, key: &Path) -> Result<()>
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
+    ensure_manageable_profile("profile deletion")?;
     let target = profile_target(name)?;
     let config = config_path(target)?;
     let key = credential_path(target)?;
@@ -4297,6 +4348,25 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_config_file_refuses_an_ambiguous_profiled_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("config.jsonc");
+        std::fs::write(&base, "{}").unwrap();
+        // Only the named file: verbatim, no guessing.
+        assert_eq!(
+            resolve_config_path(Some(&base), Some("work")).unwrap(),
+            base
+        );
+        // Both readings exist: refuse rather than silently pick one.
+        std::fs::write(dir.path().join("config.work.jsonc"), "{}").unwrap();
+        let error = resolve_config_path(Some(&base), Some("work")).unwrap_err();
+        assert!(error.to_string().contains("both"), "{error}");
+        assert!(error.to_string().contains("config.work.jsonc"), "{error}");
+        // No profile: the explicit file is the only reading.
+        assert_eq!(resolve_config_path(Some(&base), None).unwrap(), base);
+    }
+
+    #[test]
     fn explicit_config_file_is_used_verbatim_not_profiled() {
         // A named file stays the file that is read; the profile only selects the
         // private state slot, so two services cannot share secrets by accident
@@ -4383,13 +4453,9 @@ mod tests {
           }
         }
         "#;
-        let parsed = parse_jsonc::<AppConfig>(v9).unwrap();
-        assert_eq!(parsed.version, 9);
-        assert!(parsed.transports.ngrok_domain.is_none());
-        assert!(!parsed.oauth.enabled);
-        assert!(parsed.oauth.public_url.is_none());
-
-        let migrated = migrate_config(parsed).unwrap();
+        // Decoded after migration, so a v9 profile still loads under strict
+        // field checking and keeps every conservative default.
+        let migrated = load_config(v9).unwrap();
         assert_eq!(migrated.version, config_version());
         assert!(migrated.transports.stdio);
         // v11 additive defaults keep a pre-v11 profile conservative.
@@ -4431,7 +4497,7 @@ mod tests {
         config.runtime_api_key.clear();
         config.oauth = OAuthConfig::default();
 
-        let mut migrated = migrate_config(config).unwrap();
+        let migrated = load_config(&serialize_jsonc(&config).unwrap()).unwrap();
         assert_eq!(migrated.version, config_version());
         let error = validate_config_structure(&migrated).unwrap_err();
         assert!(
@@ -4442,24 +4508,27 @@ mod tests {
 
         // Profile management must still be able to move a migrated profile
         // back into a safe state before saving it as the current schema.
+        let mut migrated = migrated;
         apply_profile_bool(&mut migrated, ProfileBool::Http, false).unwrap();
         validate_config_structure(&migrated).unwrap();
     }
 
     #[test]
     fn unknown_older_and_newer_schemas_are_not_guessed() {
-        let mut config = example_config();
-        config.version = 8;
-        let error = migrate_config(config.clone()).err().unwrap();
-        assert!(error.to_string().contains("no automatic migration path"));
+        let too_old = load_config(r#"{ "version": 8 }"#).err().unwrap();
+        assert!(too_old.to_string().contains("no automatic migration path"));
 
-        config.version = 13;
-        let error = migrate_config(config).err().unwrap();
-        assert!(error.to_string().contains("newer schema version 13"));
+        let newer = load_config(r#"{ "version": 13 }"#).err().unwrap();
+        assert!(newer.to_string().contains("newer schema version 13"));
 
-        let missing =
-            parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
-        assert!(missing.is_err());
+        let missing = load_config(r#"{ "transports": { "openai": false }, "permissions": {} }"#);
+        assert!(missing.is_err(), "a missing version is never guessed");
+
+        let unknown = load_config(r#"{ "version": 12, "permissions": { "allow_kvmm": true } }"#);
+        assert!(
+            unknown.err().unwrap().to_string().contains("unknown field"),
+            "strict decoding still rejects a typo after migration"
+        );
     }
 
     #[test]

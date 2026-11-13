@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-11-13
+
+### Fixed
+
+- An explicit config file that also had a profiled sibling (for example `/etc/d.jsonc` plus `DOTLINK_PROFILE=work` and `/etc/d.work.jsonc`) silently switched which file was read when 0.16.1 made explicit paths verbatim. Both readings existing is now a configuration error naming both files; only one reading stays unambiguous.
+- Profile management could rewrite or delete a deployment's active config, because `profile save`/`profile delete` resolve through the same explicit path. They now refuse while an explicit config file is set and point at the file to edit instead.
+- A failing staging copy restarted the unit with backoff. `ExecStartPre` is now prefixed `-`, so dotlink starts, finds no config, and reports the real reason once.
+- Two instances that both relied on the built-in HTTP port, or on an unset `tunnel_id`, were not caught by the ingress assertions. The built-in default now counts as one shared binding, and the tunnel check no longer depends on an instance declaring an id.
+- `pkgs.nix` joined the unit `PATH` for any host integration, pulling the closure into units that only use the SSH agent or git config. It follows the Nix grants again.
+
+### Changed
+
+- Schema migration runs on the raw JSON value and strict decoding happens afterwards, so a future schema can retire a field without breaking every older profile. No fields are retired today; the seam is the point.
+- `settings` schema version is one module constant instead of a literal repeated in the render and the assertion.
+
 ## [0.16.1] - 2026-11-13
 
 ### Fixed
@@ -613,6 +628,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.16.2]: https://github.com/abird-ai/dotlink/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/abird-ai/dotlink/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/abird-ai/dotlink/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/abird-ai/dotlink/compare/v0.15.2...v0.15.3

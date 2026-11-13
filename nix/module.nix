@@ -180,6 +180,10 @@
     then "dotlink"
     else "dotlink-${name}";
   validName = name: builtins.match "[A-Za-z0-9_-]+" name != null;
+  # Keep in sync with `setup::config_version()`. The module supplies the version
+  # so `settings` never restates it and an older dotlink fails closed instead of
+  # guessing at a newer file.
+  schemaVersion = 12;
   validProfile = profile: profile == null || validName profile;
   # Nix store files are public: reject the common credential-shaped keys,
   # including nested keys. Users must provide secrets with LoadCredential.
@@ -234,7 +238,9 @@
       instance.configFile
       != null
       && (
-        lib.hasPrefix "/nix/store/" instance.configFile
+        # Every runtime bind root the shell guard would reject, plus /run for
+        # another unit's staged config: none of them can be the active file.
+        lib.hasPrefix "/nix/" instance.configFile
         || lib.hasPrefix "/etc/" instance.configFile
         || lib.hasPrefix "/run/" instance.configFile
       );
@@ -244,7 +250,7 @@
       if declarative
       then
         pkgs.writeText "dotlink-${name}.jsonc" (
-          builtins.toJSON (instance.settings // {version = 12;})
+          builtins.toJSON (instance.settings // {version = schemaVersion;})
         )
       else instance.configFile;
     configPath =
@@ -257,11 +263,7 @@
       ++ instance.extraGroups
     );
     permissions = instance.settings.permissions or {};
-    hostEnabled =
-      permissions.allow_nix_daemon or false
-      || permissions.allow_nix_config or false
-      || permissions.allow_ssh_agent or false
-      || permissions.allow_git_config or false;
+    nixEnabled = permissions.allow_nix_daemon or false || permissions.allow_nix_config or false;
     credentials =
       lib.optionals (instance.credentials.runtimeApiKeyFile != null)
       ["dotlink-api-key:${instance.credentials.runtimeApiKeyFile}"]
@@ -300,7 +302,7 @@
     startLimitIntervalSec = 0;
     path =
       instance.extraPackages
-      ++ lib.optionals hostEnabled [pkgs.nix]
+      ++ lib.optionals nixEnabled [pkgs.nix]
       ++ lib.optionals (permissions.allow_git_config or false) [pkgs.git]
       ++ lib.optionals (permissions.allow_ssh_agent or false) [pkgs.git pkgs.openssh];
     environment = serviceEnv;
@@ -338,7 +340,9 @@
       // lib.optionalAttrs staged {
         RuntimeDirectory = runtimeDirectory;
         RuntimeDirectoryMode = "0700";
-        ExecStartPre = "${pkgs.coreutils}/bin/install -m 0400 ${
+        # `-`: a failed copy must not become a restart loop. dotlink then starts
+        # without a config and classifies the missing file itself.
+        ExecStartPre = "-${pkgs.coreutils}/bin/install -m 0400 ${
           utils.escapeSystemdExecArg (toString configSource)
         } /run/${runtimeDirectory}/config.jsonc";
       }
@@ -413,12 +417,14 @@ in {
       ++ (
         let
           transportOf = instance: instance.settings.transports or {};
-          binds = lib.filter (bind: bind != null) (
+          # `false` = no HTTP transport. Null = the built-in default port, so two
+          # instances that both rely on it still collide without naming it here.
+          binds = lib.filter (bind: bind != false) (
             lib.mapAttrsToList (
               _: instance:
                 if (transportOf instance).http or false
-                then (transportOf instance).http_bind or "127.0.0.1:3000"
-                else null
+                then (transportOf instance).http_bind or null
+                else false
             )
             active
           );
@@ -434,11 +440,11 @@ in {
         in [
           {
             assertion = lib.length binds == lib.length (lib.unique binds);
-            message = "dotlink instances must not share settings.transports.http_bind: ${lib.concatStringsSep ", " binds} is declared more than once.";
+            message = "dotlink instances must not share one HTTP ingress: one settings.transports.http_bind (or the built-in default) is used twice.";
           }
           {
             assertion = lib.length tunnels == lib.length (lib.unique tunnels);
-            message = "dotlink instances must not share one settings.tunnel_id: ${lib.concatStringsSep ", " tunnels} is declared more than once.";
+            message = "dotlink instances must not share one settings.tunnel_id: one tunnel is used twice.";
           }
         ]
       )
@@ -447,8 +453,8 @@ in {
             instance.settings
             == null
             || !(instance.settings ? version)
-            || instance.settings.version == 12;
-          message = "dotlink ${name}: declarative settings must use current schema version 12 (omit version and the module supplies it).";
+            || instance.settings.version == schemaVersion;
+          message = "dotlink ${name}: declarative settings must use the current schema version ${toString schemaVersion} (omit version and the module supplies it).";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {

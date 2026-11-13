@@ -190,6 +190,23 @@
       };
     };
   };
+  storeConfig = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      # A store-backed explicit file cannot be the active config either.
+      configFile = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dotlink/config.jsonc";
+    };
+  };
+  mutableConfig = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      configFile = "/home/alice/etc/dotlink.jsonc";
+    };
+  };
   invalidWorkingDirectory = eval {
     services.dotlink = {
       enable = true;
@@ -256,6 +273,7 @@
     (managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE == "/run/dotlink/config.jsonc")
     (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
     (managed.config.systemd.services.dotlink.serviceConfig.RuntimeDirectoryMode == "0700")
+    (lib.hasInfix "-/nix/store/" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
     (lib.hasInfix "install -m 0400" managed.config.systemd.services.dotlink.serviceConfig.ExecStartPre)
     (lib.hasInfix
       (builtins.unsafeDiscardStringContext (toString managedSource))
@@ -328,6 +346,12 @@
     (profileBacked.config.systemd.services.dotlink.serviceConfig.SupplementaryGroups == ["kvm" "render" "video"])
     (lib.elem pkgs.git profileBacked.config.systemd.services.dotlink.path)
     (!(lib.elem pkgs.nix profileBacked.config.systemd.services.dotlink.path))
+    # A store-backed explicit file is staged too; an operator-owned path is used
+    # as written, so a hand-edited config needs no restart-time copy.
+    (storeConfig.config.systemd.services.dotlink.serviceConfig.RuntimeDirectory == "dotlink")
+    (storeConfig.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE == "/run/dotlink/config.jsonc")
+    (!(mutableConfig.config.systemd.services.dotlink.serviceConfig ? RuntimeDirectory))
+    (mutableConfig.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE == "/home/alice/etc/dotlink.jsonc")
     (!valid duplicateSlot)
     (!valid duplicateBind)
     (!valid duplicateTunnel)

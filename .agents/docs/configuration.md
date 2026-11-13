@@ -287,7 +287,7 @@ The environment layer covers every setting the NixOS module can express, so a de
 
 Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` is parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
 
-A profile is a named slot; its default config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author the config file, while `profile` selects the private state slot (saved keys, OAuth grants). An explicit config file is read verbatim — the profile then only suffixes the *default* path.
+A profile is a named slot; its default config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author the config file, while `profile` selects the private state slot (saved keys, OAuth grants). An explicit config file is read verbatim — the profile then only suffixes the *default* path. If a suffixed sibling exists beside the explicit file, loading fails and names both, instead of silently reading one of them.
 
 The NixOS module expresses each setting in exactly one layer: policy goes into the profile it renders when `settings` is set, and into the environment when it reuses a user-owned profile. That keeps the order meaningful — the module never overrides the profile it just wrote, while a drop-in can still override either mode from the environment.
 

@@ -224,9 +224,12 @@ services.dotlink = {
 };
 ```
 
-The module grants `SupplementaryGroups = [ "kvm" "render" "video" ];`
-when all three capabilities are enabled. A KVM-only service receives just
-`kvm`; GPU access adds `render` and `video`. Only this systemd unit receives
+The module grants `SupplementaryGroups` from `settings.permissions`: `kvm` for
+`allow_kvm`, `render` and `video` for `allow_gpu`, plus anything listed in
+`extraGroups`. A service that reuses a user profile has no `settings` for the
+module to read, so it must declare the groups it needs with `extraGroups` and
+the executables with `extraPackages` — profile grants alone cannot widen the
+unit's groups or `PATH`. Only this systemd unit receives
 these additional groups; dotlink does not change the user's global groups.
 The selected user and active NixOS graphics stack must support the device
 nodes. Additional `DevicePolicy` or `DeviceAllow` restrictions configured
