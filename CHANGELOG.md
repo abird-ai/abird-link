@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.3] - 2026-11-13
+
+### Changed
+
+- The NixOS module expresses each setting in exactly one layer. When it renders a profile (`settings`), policy goes into that profile: grants become `permissions.*`, `serialize`, `logging.verbosity` and `transports.stdio`. The former environment entries for those keys are gone, because environment outranks the profile and silently overrode the user's own declarative settings. A reused user profile still receives them as environment defaults, so both modes keep a drop-in override path.
+- `DOTLINK_COLOR` now fails closed on an unrecognized value instead of falling back to `auto`, matching every other environment setting.
+- `DOTLINK_CACHES` is parsed before the sandboxed shell is considered, so a typo is reported even when shell access is off.
+
+### Fixed
+
+- An explicitly named file that the text search cannot use now says why. `grep` on a file over the per-file ceiling, or on binary/invalid-UTF-8 bytes, previously returned an empty result after the file was skipped; it now reports the reason and points at `bread`, matching the explicitness of the old "not a directory" error. The tool description also states that `glob`, `gitignore` and `skip_hidden` do not apply to a file path.
+- Environment grant semantics are documented accurately: an environment assignment replaces the saved value (`DOTLINK_ALLOW_KVM=0` clears a profile grant) while CLI grants stay additive.
+
 ## [0.15.2] - 2026-11-13
 
 ### Fixed
@@ -558,6 +571,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.15.3]: https://github.com/abird-ai/dotlink/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/abird-ai/dotlink/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/abird-ai/dotlink/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/abird-ai/dotlink/compare/v0.14.8...v0.15.0
