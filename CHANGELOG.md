@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-11-13
+
+### Changed
+
+- The NixOS module passes `logging.verbosity` as `DOTLINK_VERBOSITY` instead of adding `-v`/`-vv` to the command line. A configuration decision no longer occupies the highest-precedence rung: a one-run CLI flag still overrides it, a systemd drop-in can set the level with `Environment=`, and neither has to replace `ExecStart` — which restates the store path and silently freezes the package version across upgrades. `lifecycle` emits nothing, so the built-in default applies. A custom `package` override needs 0.14.7 or newer for the environment variable to be read.
+
 ## [0.14.7] - 2026-11-13
 
 ### Added
@@ -528,6 +534,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.14.8]: https://github.com/abird-ai/dotlink/compare/v0.14.7...v0.14.8
 [0.14.7]: https://github.com/abird-ai/dotlink/compare/v0.14.6...v0.14.7
 [0.14.6]: https://github.com/abird-ai/dotlink/compare/v0.14.5...v0.14.6
 [0.14.5]: https://github.com/abird-ai/dotlink/compare/v0.14.4...v0.14.5
