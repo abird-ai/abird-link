@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.5] - 2026-11-13
+
+### Fixed
+
+- `promoted_native_task_returns_the_exact_original_shell_result` compared a replayed native-task result against a second execution of the same command with `ts` intact, so it passed or failed on a one-second clock boundary. That is the failure that blocked the 0.16.3 release build. The assertion now strips the completion stamp the way the earlier comparison in the same test already did; the contract under test — every field except the wall clock — is unchanged.
+
 ## [0.16.4] - 2026-11-13
 
 ### Added
@@ -651,6 +657,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
+[0.16.5]: https://github.com/abird-ai/dotlink/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/abird-ai/dotlink/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/abird-ai/dotlink/compare/v0.16.2...v0.16.3
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
