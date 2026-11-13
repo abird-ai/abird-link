@@ -141,10 +141,13 @@ enum OutputEncoding {
 /// always clamped to the remaining window so it cannot outlive its response.
 fn resolve_wait(wait_secs: Option<u64>, budget: Option<Duration>) -> Duration {
     let requested = wait_secs.map(Duration::from_secs);
+    let ceiling = crate::limits::DEFAULT_JOB_WAIT;
     match (requested, budget) {
         (Some(wait), Some(budget)) => wait.min(budget),
-        (Some(wait), None) => wait,
-        (None, Some(budget)) => crate::limits::DEFAULT_JOB_WAIT.min(budget),
+        // No window (stdio, local HTTP): the wait is still bounded, because one
+        // poll must never hold a request — or a serial transport — indefinitely.
+        (Some(wait), None) => wait.min(ceiling),
+        (None, Some(budget)) => ceiling.min(budget),
         (None, None) => Duration::ZERO,
     }
 }
@@ -157,7 +160,8 @@ struct JobGetArgs {
     /// Wait up to this many seconds for the job to finish before returning its
     /// status. Defaults to 90 where the transport supplies a response window and
     /// is clamped to what remains of it, so a wait cannot outlive the response.
-    /// 0 returns immediately, which is what an interactive status check wants.
+    /// 0 returns immediately, which is what an interactive status check wants;
+    /// 90 is also the ceiling where no response window exists.
     #[serde(default)]
     wait_secs: Option<u64>,
 }
@@ -181,7 +185,8 @@ struct JobOutputArgs {
     encoding: OutputEncoding,
     /// Wait up to this many seconds for output past `offset` (or for the job to
     /// finish) before paging. Defaults to 90 where the transport supplies a
-    /// response window and is clamped to what remains of it. 0 pages immediately.
+    /// response window and is clamped to what remains of it; 90 is also the
+    /// ceiling where no window exists. 0 pages immediately.
     #[serde(default)]
     wait_secs: Option<u64>,
 }
@@ -420,5 +425,44 @@ mod wait_tests {
         );
         // 0 always means "answer now".
         assert_eq!(resolve_wait(Some(0), Some(secs(60))), Duration::ZERO);
+        // Without a window an explicit wait is still bounded: one poll must not
+        // hold a serial transport open for as long as the caller typed.
+        assert_eq!(resolve_wait(Some(3_600), None), secs(90));
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::{JobGetArgs, JobOutputArgs};
+
+    #[test]
+    fn wait_is_accepted_on_both_waiting_tools_and_typos_still_fail() {
+        let get: JobGetArgs = serde_json::from_value(serde_json::json!({
+            "job_id": "job-1",
+            "wait_secs": 30
+        }))
+        .expect("job_get accepts wait_secs");
+        assert_eq!(get.wait_secs, Some(30));
+
+        let output: JobOutputArgs = serde_json::from_value(serde_json::json!({
+            "job_id": "job-1",
+            "wait_secs": 5
+        }))
+        .expect("job_output accepts wait_secs");
+        assert_eq!(output.wait_secs, Some(5));
+
+        // Omission is the common case and must stay valid.
+        let omitted: JobOutputArgs =
+            serde_json::from_value(serde_json::json!({"job_id": "job-1"})).unwrap();
+        assert_eq!(omitted.wait_secs, None);
+
+        // The strict-field policy still names a typo instead of ignoring it.
+        assert!(
+            serde_json::from_value::<JobGetArgs>(serde_json::json!({
+                "job_id": "job-1",
+                "wait": 30
+            }))
+            .is_err()
+        );
     }
 }
