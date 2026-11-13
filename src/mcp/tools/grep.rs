@@ -22,15 +22,15 @@ use super::{
 };
 use crate::mcp::AccessNeed;
 
-const MAX_GREP_HITS: usize = 200;
-const MAX_GREP_FILE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_GREP_HITS: usize = 200;
+pub(crate) const MAX_GREP_FILE_BYTES: usize = 1_048_576;
 const MAX_GREP_PATTERN: usize = 1024;
 const MAX_GREP_PER_FILE: usize = 50;
 const MAX_GREP_CONTEXT: usize = 8;
-const MAX_GREP_FILES: usize = 65_536;
+pub(crate) const MAX_GREP_FILES: usize = 65_536;
 /// Per-request search I/O (not a limit on concurrent HTTP/stdio tool calls).
-const MAX_GREP_SCAN_BYTES: usize = 32 * 1024 * 1024;
-const MAX_GREP_SCAN_FILES: usize = 4_096;
+pub(crate) const MAX_GREP_SCAN_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_GREP_SCAN_FILES: usize = 4_096;
 /// Rendered-size estimate for one JSON array element (braces, keys, quotes).
 const JSON_ENTRY_OVERHEAD: usize = 48;
 
@@ -870,7 +870,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text files. `path` may be a directory (searched recursively) or a single file; for a file, `glob`, `gitignore` and `skip_hidden` do not apply and the file is searched directly. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry explicit text markers or JSON `scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons` with every concurrent cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
+        description = "Search UTF-8 text. `path` is a directory (recursive) or a single file; for a file, `glob`/`gitignore`/`skip_hidden` do not apply. `pattern` is regex unless `literal`; `glob` uses the `ls` grammar. `output_mode`: content (matches with context), files, count (per-file; `page_total` is page-scoped). Paging: `offset`/`limit` (limit <={grep_hits}); `gitignore`/`skip_hidden` are opt-in. Budgets per call: {walk_visits} entries visited, {grep_scan} read across <={grep_files} candidates; narrow `path`/`glob` for complete results. Incomplete replies carry text markers or JSON `scan_incomplete`, `incomplete_reason` (first cause) and `incomplete_reasons` (all: directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Replies obey the output byte ceiling and contain whole lines only. Skipped: files over {grep_file}, binary control bytes, invalid UTF-8, symlinks.",
         annotations(
             title = "Search files",
             read_only_hint = true,

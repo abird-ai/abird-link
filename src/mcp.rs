@@ -2547,6 +2547,28 @@ fn tool_call_log_outcome(
     }
 }
 
+impl LocalMachine {
+    /// One place where advertised text is made true: profile ceilings plus the
+    /// limit placeholders resolved from the same constants that enforce them.
+    fn describe_tool(&self, tool: Tool, tokens: &[(&'static str, String)]) -> Tool {
+        let mut tool = with_profile_limits(
+            tool,
+            self.config.max_shell_timeout_secs,
+            self.config.max_output_bytes,
+            self.config.sync_hold,
+        );
+        tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
+        tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
+        tools::jobs::with_job_limits(
+            &mut tool,
+            self.config.max_shell_timeout_secs,
+            self.config.max_output_bytes,
+        );
+        tools::substitute_description_tokens(&mut tool, tokens);
+        tool
+    }
+}
+
 #[tool_handler(
     router = self.policy_tool_router(),
     name = "dotlink",
@@ -2558,6 +2580,7 @@ impl rmcp::ServerHandler for LocalMachine {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let tokens = tools::description_tokens(self.jobs.retention_secs());
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
@@ -2567,22 +2590,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 .policy_tool_router()
                 .list_all()
                 .into_iter()
-                .map(|tool| {
-                    let mut tool = with_profile_limits(
-                        tool,
-                        self.config.max_shell_timeout_secs,
-                        self.config.max_output_bytes,
-                        self.config.sync_hold,
-                    );
-                    tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
-                    tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
-                    tools::jobs::with_job_limits(
-                        &mut tool,
-                        self.config.max_shell_timeout_secs,
-                        self.config.max_output_bytes,
-                    );
-                    tool
-                })
+                .map(|tool| self.describe_tool(tool, &tokens))
                 .collect(),
             meta: None,
             next_cursor: None,
@@ -2593,20 +2601,7 @@ impl rmcp::ServerHandler for LocalMachine {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.policy_tool_router().get(name).cloned().map(|tool| {
-            let mut tool = with_profile_limits(
-                tool,
-                self.config.max_shell_timeout_secs,
-                self.config.max_output_bytes,
-                self.config.sync_hold,
-            );
-            tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
-            tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
-            tools::jobs::with_job_limits(
-                &mut tool,
-                self.config.max_shell_timeout_secs,
-                self.config.max_output_bytes,
-            );
-            tool
+            self.describe_tool(tool, &tools::description_tokens(self.jobs.retention_secs()))
         })
     }
 
@@ -2618,7 +2613,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 .build(),
         )
         .with_server_info(Implementation::new("dotlink", env!("CARGO_PKG_VERSION")))
-        .with_instructions(format!("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. Shell and job results carry `ts` (UTC epoch seconds): keep the first `ts` of the current turn as your anchor and aim to checkpoint with a short summary around {} minutes. File-tool results are paged and carry no clock, so read it from the shell or job result surrounding them.", crate::limits::TURN_CHECKPOINT_MINUTES).to_owned())
+        .with_instructions(format!("Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed. Long shell calls may become durable MCP tasks/jobs instead of being shortened to a transport deadline. Shell and job results carry `ts` (UTC epoch seconds): keep the first `ts` of the current turn as your anchor and aim to checkpoint with a short summary around {} minutes. File-tool results are paged and carry no clock, so read it from the shell or job result surrounding them. When you finish with a job, `job_ack` the highest offset you received: unacked output keeps holding the session budget until retention expires.", crate::limits::TURN_CHECKPOINT_MINUTES).to_owned())
     }
 
     async fn get_task(

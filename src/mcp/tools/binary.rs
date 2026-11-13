@@ -29,7 +29,7 @@ use crate::mcp::sha256;
 /// Maximum source/result size of a streamed binary edit. Input/output bytes
 /// need not be simultaneously retained in memory.
 const MAX_BINARY_EDIT_FILE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BEDIT_RANGES: usize = 32;
+pub(crate) const MAX_BEDIT_RANGES: usize = 32;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -522,7 +522,7 @@ impl LocalMachine {
 #[tool_router(router = "binary_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Read a binary file. format=mcp returns typed MCP image/audio/blob content for the complete file; base64 or hex returns encoded bytes for a byte window with offset/limit.",
+        description = "Read a binary file. `format=mcp` returns typed image/audio/blob content for the whole file; `base64` or `hex` returns encoded bytes for the `offset`/`limit` window.",
         annotations(
             title = "Read binary file",
             read_only_hint = true,
@@ -546,7 +546,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Create or replace a binary file atomically using base64 or hex data.",
+        description = "Create or replace a binary file atomically from `base64` or `hex` data.",
         annotations(
             title = "Write binary file",
             read_only_hint = false,
@@ -563,7 +563,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Edit byte ranges in an existing binary file, all or nothing. `edits` is an array of {offset, length?, data, encoding}, at most 32 ranges; offsets are relative to the original file, ranges are applied ascending (insert before replace at one offset, request order otherwise), and overlaps are rejected. `length` defaults to the decoded payload size, 0 inserts, and empty data with a positive length deletes. An optional hex `sha256` precondition is re-checked against the file before writing, and the write is atomic. Returns a receipt with path, changed, ranges, bytes_written, size_before and size_after; changed is false when the result equals the original and nothing was written.",
+        description = "Edit byte ranges in an existing binary file, all or nothing. `edits` is <={bedit_ranges} {offset, length?, data, encoding}; offsets refer to the original file and apply ascending (insert before replace at one offset, otherwise request order); overlaps are rejected. `length` defaults to the decoded payload size, 0 inserts, empty data with length deletes. Optional hex `sha256` precondition is re-checked before writing; the write is atomic. Receipt: path, changed, ranges, bytes_written, size_before, size_after; changed=false when the result equals the original.",
         annotations(
             title = "Edit binary file",
             read_only_hint = false,
@@ -1030,7 +1030,10 @@ mod tests {
 
     #[test]
     fn the_advertised_description_states_the_enforced_limits() {
-        let tool = LocalMachine::all_tools().get("bedit").cloned().unwrap();
+        let mut tool = LocalMachine::all_tools().get("bedit").cloned().unwrap();
+        let tokens =
+            crate::mcp::tools::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        crate::mcp::tools::substitute_description_tokens(&mut tool, &tokens);
         let description = tool.description.clone().unwrap_or_default();
         assert!(
             description.contains(&MAX_BEDIT_RANGES.to_string()),

@@ -73,13 +73,6 @@ fn bounded_edit_ops<'de, D: serde::Deserializer<'de>>(
 
 /// Advertise the same limits the parser, planner, and logger enforce.
 pub(crate) fn with_edit_limits(tool: &mut Tool) {
-    let current = tool.description.take().unwrap_or_default();
-    tool.description = Some(
-        format!(
-            "{current} At most {MAX_EDIT_FILES} distinct files and {MAX_EDIT_OPS} edits per call."
-        )
-        .into(),
-    );
     super::mutation::set_array_max_items(tool, "edits", MAX_EDIT_OPS);
 }
 
@@ -377,7 +370,7 @@ impl LocalMachine {
 #[tool_router(router = "edit_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Replace exact text in one or more existing UTF-8 files. `edits` is an ordered array of {path, old_text, new_text, replace_all?} (bounded per call). Every edit carries its own required path; repeating it edits the same file's evolving buffer. Each old_text must be unique unless replace_all is set, and must not be a substring of an earlier edit's new_text in the same file. `read` prefixes lines with a line number and a tab; never include that prefix in old_text. Every file is planned and re-checked before anything is written, and each file replacement is atomic; the multi-file commit sequence is not a transaction, so a commit failure can leave earlier files replaced. Returns a receipt with per-file path, edits and line_delta, plus edits_applied and changed_files.",
+        description = "Replace exact text in existing UTF-8 files, all or nothing per file. `edits` is an ordered array of {path, old_text, new_text, replace_all?}; each carries its own path, and repeating a path edits that file's evolving buffer. `old_text` must be unique unless `replace_all`, and must not be a substring of an earlier edit's `new_text` in the same file. Never include `read`'s line-number prefix. Every file is planned and re-checked before any write; each replacement is atomic, but the multi-file sequence is not a transaction, so a failure can leave earlier files replaced. Receipt: per-file path/edits/line_delta plus edits_applied and changed_files. Limits: {edit_files} files, {edit_ops} edits per call.",
         annotations(
             title = "Edit text files",
             read_only_hint = false,
@@ -790,6 +783,10 @@ mod tests {
     #[test]
     fn the_advertised_description_states_the_enforced_limits() {
         let tool = LocalMachine::all_tools().get("edit").cloned().unwrap();
+        let mut tool = tool;
+        let tokens =
+            crate::mcp::tools::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        crate::mcp::tools::substitute_description_tokens(&mut tool, &tokens);
         let description = tool.description.clone().unwrap_or_default();
         for limit in [MAX_EDIT_FILES, MAX_EDIT_OPS] {
             assert!(

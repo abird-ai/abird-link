@@ -84,17 +84,59 @@ fn bounded_job_error(message: impl Into<String>) -> String {
 const JOB_WAIT_POLL: Duration = Duration::from_millis(200);
 
 const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
-    ("job_get", "job_get for status"),
-    ("job_output", "job_output(offset) to read output"),
-    ("job_ack", "job_ack(highest read) to release the spool"),
-    ("job_cancel", "job_cancel to stop it"),
+    ("job_get", "job_get=status"),
+    ("job_output", "job_output(offset)=output"),
+    ("job_ack", "job_ack(highest read)=free spool"),
+    ("job_cancel", "job_cancel=stop"),
 ];
 
 /// The one prohibition that belongs wherever a handle is handed back.
-pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run the command";
+pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run a command that returned a handle";
 
 /// One follow-up sentence, dropping the tool whose result the caller is already
 /// reading: a `job_get` payload must not tell the caller to call `job_get`.
+/// What a caller should do next, given the job's actual stage.
+///
+/// A finished job that still holds output must be acknowledged; one that is
+/// fully released needs no instruction at all, so the field is omitted rather
+/// than kept as dead prose.
+#[derive(Clone, Copy)]
+pub(crate) struct JobFollowUp {
+    finished: bool,
+    unacked: bool,
+}
+
+impl JobFollowUp {
+    fn of(entry: &JobEntry) -> Self {
+        Self {
+            finished: entry.completion.is_some(),
+            unacked: entry.stdout_retained > 0 || entry.stderr_retained > 0,
+        }
+    }
+}
+
+pub(crate) fn job_follow_up(state: JobFollowUp, already_used: Option<&str>) -> Option<String> {
+    if !state.finished {
+        return Some(shell_job_follow_up(already_used));
+    }
+    if !state.unacked {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (tool, clause) in [
+        ("job_output", "job_output(offset)=remaining output"),
+        (
+            "job_ack",
+            "job_ack(highest read)=free the spool and its session budget",
+        ),
+    ] {
+        if Some(tool) != already_used {
+            parts.push(clause);
+        }
+    }
+    Some(format!("output complete: {}", parts.join(", ")))
+}
+
 pub(crate) fn shell_job_follow_up(already_used: Option<&str>) -> String {
     let mut text = String::from("call ");
     let mut first = true;
@@ -943,6 +985,11 @@ impl JobManager {
     #[cfg(test)]
     pub(crate) fn new(retention: Duration) -> Result<Self> {
         Self::with_spool_limit(retention, DEFAULT_JOB_SPOOL_BYTES)
+    }
+
+    /// User-visible retention this manager applies, for advertised text.
+    pub(crate) fn retention_secs(&self) -> u64 {
+        self.inner.retention_secs.load(Ordering::Relaxed)
     }
 
     pub(crate) fn with_spool_limit(retention: Duration, spool_limit_bytes: u64) -> Result<Self> {
@@ -2424,7 +2471,7 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         || stored_len(&entry.stderr_path, None),
         |_| entry.stderr_retained,
     );
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "ts": crate::mcp::now_unix(),
         "job_id": entry.id,
         "task_id": entry.id,
@@ -2452,9 +2499,11 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
             "truncated": completion.is_some_and(|value| value.stderr.truncated),
             "released": entry.stderr_released,
         },
-        "next": shell_job_follow_up(Some("job_get")),
-    })
-    .to_string()
+    });
+    if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
+        payload["next"] = serde_json::Value::String(next);
+    }
+    payload.to_string()
 }
 
 fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
@@ -3132,17 +3181,44 @@ mod tests {
         let all = shell_job_follow_up(None);
         assert_eq!(
             all,
-            "call job_get for status, job_output(offset) to read output, job_ack(highest read) to release the spool, job_cancel to stop it",
+            "call job_get=status, job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop",
             "{all}"
         );
         // A payload from one job tool never tells the caller to call it again.
         let from_status = shell_job_follow_up(Some("job_get"));
         assert_eq!(
             from_status,
-            "call job_output(offset) to read output, job_ack(highest read) to release the spool, job_cancel to stop it",
+            "call job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop",
             "{from_status}"
         );
         assert!(!from_status.contains("job_get"), "{from_status}");
+    }
+
+    #[test]
+    fn finished_job_follow_up_asks_for_the_ack_and_drops_cancel() {
+        let running = JobFollowUp {
+            finished: false,
+            unacked: false,
+        };
+        assert_eq!(
+            job_follow_up(running, Some("job_get")).unwrap(),
+            "call job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop"
+        );
+        let held = JobFollowUp {
+            finished: true,
+            unacked: true,
+        };
+        let next = job_follow_up(held, Some("job_get")).unwrap();
+        assert!(
+            next.contains("job_ack(highest read)=free the spool and its session budget"),
+            "{next}"
+        );
+        assert!(!next.contains("job_cancel"), "{next}");
+        let released = JobFollowUp {
+            finished: true,
+            unacked: false,
+        };
+        assert_eq!(job_follow_up(released, Some("job_get")), None);
     }
 
     #[test]

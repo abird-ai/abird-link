@@ -21,7 +21,7 @@ use crate::mcp::AccessNeed;
 
 const DEFAULT_READ_LINES: usize = 4 * 1024;
 /// Limit work before a requested line window, independently of output size.
-const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(super) struct ReadArgs {
@@ -414,7 +414,7 @@ impl LocalMachine {
 #[tool_router(router = "text_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Read a UTF-8 text file as numbered lines. `offset` is the 1-based first line (default 1), `limit` the line count (default 4096), and each line is prefixed with its number and a tab unless `numbered` is false, which returns the text exactly. A capped window ends with one truncation marker. Skipping to an offset scans at most 32 MiB per call; use grep or a narrower file if exceeded. An offset past the end of the file is an error.",
+        description = "Read a UTF-8 text file as numbered lines. `offset` is the 1-based first line (default 1), `limit` the line count (default 4096); each line is prefixed with its number and a tab unless `numbered` is false, which returns the text exactly. A capped window ends with one truncation marker. Skipping to an offset scans at most {read_scan} per call; beyond that use grep or a narrower file. An offset past EOF is an error.",
         annotations(
             title = "Read text file",
             read_only_hint = true,
@@ -438,7 +438,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Create or replace a UTF-8 text file atomically. Missing parent directories are created automatically. The file is either the previous content or the new content, never a partial write.",
+        description = "Create or replace a UTF-8 text file atomically; missing parent directories are created. The file is the previous content or the new content, never partial.",
         annotations(
             title = "Write text file",
             read_only_hint = false,

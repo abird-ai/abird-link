@@ -21,8 +21,8 @@ use super::{
 use crate::mcp::AccessNeed;
 use crate::mcp::lexical_normalize;
 
-const MAX_PATCH_FILES: usize = 32;
-const MAX_PATCH_HUNKS: usize = 64;
+pub(crate) const MAX_PATCH_FILES: usize = 32;
+pub(crate) const MAX_PATCH_HUNKS: usize = 64;
 /// The ambiguity message lists at most this many line numbers.
 const MAX_AMBIGUOUS_LINES: usize = 10;
 
@@ -1343,7 +1343,7 @@ impl LocalMachine {
 #[tool_router(router = "patch_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Apply a Codex-grammar patch with per-file atomic replacement. Supports \"*** Update File:\" hunks and \"*** Add File:\" only; the Codex \"*** End of File\" marker restricts eligible context matches to EOF and can anchor an addition-only append; unanchored context-free hunks, Delete and Move are rejected. At most 32 files and 64 hunks per call. Hunks are located by their context lines (exact first, then trailing-whitespace-tolerant), an ambiguous match fails, and hunks apply top-down within a file. `*** Add File` is create-only and a path claimed by two sections is refused. Every file is planned and re-checked before any commit; each file replacement is atomic, but the multi-file commit sequence is not a transaction, so a commit failure can leave earlier files replaced. best_effort writes the files that planned cleanly and reports the rest. Returns a receipt with per-file hunks/added/removed and mode (strict or best_effort).",
+        description = "Apply a Codex-grammar patch with per-file atomic replacement. Only `*** Update File:` hunks and `*** Add File:`; the `*** End of File` marker restricts context matching to EOF and anchors an append-only hunk; unanchored context-free hunks, Delete and Move are rejected. Limits: {patch_files} files, {patch_hunks} hunks. Hunks match by context lines (exact first, then trailing-whitespace tolerant); ambiguity fails; hunks apply top-down per file. `*** Add File` is create-only; a path claimed by two sections is refused. Files are planned and re-checked before commit; each replacement is atomic, but the multi-file sequence is not a transaction. `best_effort` writes what planned cleanly and reports the rest. Receipt: per-file hunks/added/removed and mode (strict or best_effort).",
         annotations(
             title = "Apply patch",
             read_only_hint = false,
@@ -2693,7 +2693,10 @@ mod tests {
 
     #[test]
     fn the_advertised_description_states_the_enforced_limits() {
-        let tool = LocalMachine::all_tools().get("patch").cloned().unwrap();
+        let mut tool = LocalMachine::all_tools().get("patch").cloned().unwrap();
+        let tokens =
+            crate::mcp::tools::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        crate::mcp::tools::substitute_description_tokens(&mut tool, &tokens);
         let description = tool.description.clone().unwrap_or_default();
         for limit in [MAX_PATCH_FILES, MAX_PATCH_HUNKS] {
             assert!(

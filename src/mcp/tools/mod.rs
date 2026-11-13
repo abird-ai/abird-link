@@ -15,6 +15,80 @@ pub(crate) mod matching;
 pub(crate) mod mutation;
 pub(crate) mod patch;
 pub(crate) mod shell;
+
+/// Human-readable byte ceiling for a tool description. Powers of two only, so
+/// the text never drifts from the enforced number.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Human-readable duration for a tool description, same rule as `human_bytes`.
+pub(crate) fn human_duration(secs: u64) -> String {
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// Limits a description may interpolate. One source of truth per number, so
+/// changing a constant changes what the model reads.
+pub(crate) fn description_tokens(job_retention_secs: u64) -> Vec<(&'static str, String)> {
+    use crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM;
+    vec![
+        ("{spool}", human_bytes(MAX_JOB_SPOOL_BYTES_PER_STREAM)),
+        ("{retention}", human_duration(job_retention_secs)),
+        ("{grep_scan}", human_bytes(grep::MAX_GREP_SCAN_BYTES as u64)),
+        ("{grep_file}", human_bytes(grep::MAX_GREP_FILE_BYTES as u64)),
+        ("{grep_hits}", grep::MAX_GREP_HITS.to_string()),
+        (
+            "{grep_files}",
+            grep::MAX_GREP_FILES
+                .min(grep::MAX_GREP_SCAN_FILES)
+                .to_string(),
+        ),
+        ("{walk_visits}", MAX_WALK_VISITS.to_string()),
+        ("{read_scan}", human_bytes(text::MAX_READ_SCAN_BYTES as u64)),
+        ("{patch_files}", patch::MAX_PATCH_FILES.to_string()),
+        ("{patch_hunks}", patch::MAX_PATCH_HUNKS.to_string()),
+        ("{bedit_ranges}", binary::MAX_BEDIT_RANGES.to_string()),
+        ("{edit_files}", MAX_EDIT_FILES.to_string()),
+        ("{edit_ops}", MAX_EDIT_OPS.to_string()),
+    ]
+}
+
+/// Resolve the limit placeholders of one advertised tool.
+pub(crate) fn substitute_description_tokens(
+    tool: &mut rmcp::model::Tool,
+    tokens: &[(&'static str, String)],
+) {
+    let Some(description) = tool.description.as_deref() else {
+        return;
+    };
+    let mut text = description.to_owned();
+    for (token, value) in tokens {
+        if text.contains(token) {
+            text = text.replace(token, value);
+        }
+    }
+    if text != description {
+        tool.description = Some(text.into());
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod text;
@@ -1216,6 +1290,66 @@ impl Verified {
 
 #[cfg(test)]
 mod tests {
+    /// Placeholders a description may only use if `description_tokens` knows
+    /// them: `{lower_snake}` spans, not JSON braces.
+    fn unknown_placeholders(text: &str, known: &[&str]) -> Vec<String> {
+        let mut unknown = Vec::new();
+        let mut index = 0;
+        while let Some(open) = text[index..].find('{') {
+            let start = index + open;
+            let Some(len) = text[start..].find('}') else {
+                break;
+            };
+            let inner = &text[start + 1..start + len];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                let token = format!("{{{inner}}}");
+                if !known.contains(&token.as_str()) {
+                    unknown.push(token);
+                }
+            }
+            index = start + len + 1;
+        }
+        unknown
+    }
+
+    #[test]
+    fn every_advertised_description_resolves_its_limits() {
+        use std::collections::BTreeSet;
+        let tokens = super::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        let known: Vec<&str> = tokens.iter().map(|(token, _)| *token).collect();
+        let mut used = BTreeSet::new();
+        for mut tool in crate::mcp::LocalMachine::all_tools().list_all() {
+            let raw = tool.description.clone().unwrap_or_default();
+            let unknown = unknown_placeholders(&raw, &known);
+            assert!(unknown.is_empty(), "{} uses {unknown:?}", tool.name);
+            for token in &known {
+                if raw.contains(token) {
+                    used.insert(*token);
+                }
+            }
+            super::substitute_description_tokens(&mut tool, &tokens);
+            let rendered = tool.description.clone().unwrap_or_default();
+            assert!(
+                unknown_placeholders(&rendered, &known).is_empty(),
+                "{} left a placeholder unresolved",
+                tool.name
+            );
+        }
+        for token in known {
+            assert!(used.contains(token), "{token} is declared but never used");
+        }
+    }
+
+    #[test]
+    fn human_units_stay_exact() {
+        assert_eq!(super::human_bytes(64 * 1024 * 1024), "64 MiB");
+        assert_eq!(super::human_bytes(1024 * 1024), "1 MiB");
+        assert_eq!(super::human_bytes(1536), "1536 bytes");
+        assert_eq!(super::human_duration(3600), "1 h");
+        assert_eq!(super::human_duration(90), "90 s");
+        assert_eq!(super::human_duration(600), "10 min");
+    }
+
     use super::*;
     use crate::mcp::tools::test_support::test_machine;
 

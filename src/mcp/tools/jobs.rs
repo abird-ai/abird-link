@@ -214,7 +214,7 @@ struct JobListArgs {
 #[tool_router(router = "jobs_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Start a shell command explicitly in the background and return its durable job/task id immediately. Ordinary bash/powershell calls use the same execution layer but first wait through their response window. Each stdout/stderr spool retains up to 64 MiB; larger streams are fully drained but the retained prefix is marked truncated. Poll with job_get, page durable output with job_output, acknowledge received bytes with job_ack, and cancel with job_cancel.",
+        description = "Start a shell command in the background; returns its durable job/task id immediately. Ordinary bash/powershell use the same execution layer but first wait through their response window. Spools retain <={spool} per stream, drained fully, with the retained prefix marked truncated. Follow up: job_get=status, job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop.",
         annotations(
             title = "Start background shell job",
             read_only_hint = false,
@@ -234,7 +234,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "List recent durable shell jobs that were exposed to the caller. Useful after a lost creation response; returns stable job ids, status/phase, elapsed time and session spool usage.",
+        description = "List recent durable jobs exposed in this runtime, not scoped to a conversation, so entries may belong to another client of the same bridge. Useful after a lost creation response: stable ids, status/phase, elapsed, session spool usage.",
         annotations(
             title = "List shell jobs",
             read_only_hint = true,
@@ -248,7 +248,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Get the current state of a long-running shell job. Returns status, elapsed time, exit state and durable stdout/stderr byte counts. The job id is also the native MCP task id when Tasks are supported. `wait_secs` (default 90 where the transport supplies a response window, clamped to what remains) waits for the job to finish before answering; 0 returns its current state at once.",
+        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts. The job id is the native task id when Tasks are supported. `wait_secs`: 90 by default where the transport supplies a response window, clamped to what remains, waiting for completion; 0 answers immediately.",
         annotations(
             title = "Get shell job status",
             read_only_hint = true,
@@ -280,7 +280,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read one durable page of a shell job's stdout or stderr by raw byte offset. This operation never acknowledges or deletes output, so it stays replayable; with `wait_secs` it may first wait for new output or completion. Pages are bounded by max_output_bytes; continue from next_offset until complete=true, then call job_ack with the highest safely received offset. `wait_secs` (default 90 where the transport supplies a response window, clamped to what remains) waits for new output past `offset` or for the job to finish; 0 pages whatever is retained now. Each stream retains at most 64 MiB and reports truncation beyond that. After both terminal streams are fully acknowledged, compatibility-job spools are released; native MCP Tasks compact them to the ordinary-result prefix needed for exact `tasks/get` replay and remove that prefix when task retention expires.",
+        description = "Read one page of a job's stdout or stderr by raw byte offset. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages are bounded by `max_output_bytes`; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. Streams retain <={spool} and report truncation.",
         annotations(
             title = "Read shell job output",
             read_only_hint = true,
@@ -330,7 +330,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Acknowledge a durable stdout/stderr byte offset after the caller has safely received it. This is the only operation that advances output cleanup; job_output itself is a pure replayable read. Once both terminal streams are fully acknowledged, compatibility-job spools are released. Native MCP Tasks instead compact them to the exact-result prefix required by future `tasks/get` calls and retain only that prefix until task retention expires.",
+        description = "Acknowledge `job_output`'s `next_offset` for the same `stream` once received. The only operation that advances cleanup: after both terminal streams are fully acknowledged, compatibility spools are released. Native tasks instead keep the exact-result prefix that `tasks/get` replays, until task retention expires. Unacked output holds the session spool budget until retention ({retention}).",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,
@@ -350,7 +350,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Request cancellation of a running shell job. Cancellation kills the contained command tree; terminal jobs are left unchanged. Output already spooled remains available through job_output until acknowledged or expired.",
+        description = "Cancel a running shell job; kills its command tree. Terminal jobs are unchanged. Output already spooled stays readable via job_output until acknowledged or expired.",
         annotations(
             title = "Cancel shell job",
             read_only_hint = false,
@@ -396,8 +396,16 @@ mod tests {
                 .contains("8388608")
         );
 
+        let tokens =
+            crate::mcp::tools::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        crate::mcp::tools::substitute_description_tokens(&mut start, &tokens);
         let start_description = start.description.as_deref().unwrap();
-        assert!(start_description.contains("64 MiB"));
+        assert!(
+            start_description.contains(&crate::mcp::tools::human_bytes(
+                crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM
+            )),
+            "{start_description}"
+        );
     }
 }
 

@@ -271,7 +271,7 @@ impl LocalMachine {
 #[tool_router(router = "discovery_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "List files and directories. `depth` defaults to 1, to the pattern's own path-segment count, or to unbounded when the pattern contains `**`; an explicit `depth` always wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Returns {\"entries\":[{\"path\",\"kind\",\"size\"}],\"truncated\":bool,\"scan_incomplete\":bool,\"incomplete_reason\":string|null,\"incomplete_reasons\":string[]}. Incomplete causes are directory_budget/traversal_error; incomplete_reason retains the first cause for compatibility while incomplete_reasons preserves concurrent causes. Results are sorted only among scanned entries; narrow path/pattern. The reply also respects `max_output_bytes`.",
+        description = "List files and directories. `depth` defaults to 1, to the pattern's path-segment count, or unbounded when it contains `**`; an explicit `depth` wins. Symlinked directories and in-flight `.dotlink-*.tmp` files are skipped. Reply: {entries:[{path,kind,size}],truncated,scan_incomplete,incomplete_reason,incomplete_reasons}; causes are directory_budget/traversal_error, `incomplete_reason` keeping the first for compatibility. Ordering holds only among scanned entries; narrow path/pattern. Reply respects `max_output_bytes`.",
         annotations(
             title = "List files",
             read_only_hint = true,
