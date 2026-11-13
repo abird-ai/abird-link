@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-11-13
+
+### Changed
+
+- The synchronous shell hold drops from 90 s to `OPENAI_TUNNEL_SYNC_HOLD` = 30 s. Long commands now hand back their durable job handle early enough to keep the caller's turn responsive, instead of holding it for most of the hosted window.
+- The `bash`/`powershell` descriptions state the handoff, the exact hold and the follow-up calls, assembled from one shared clause list so adding or removing a job tool cannot leave the schema stale. Local transports advertise no window because they never hand off.
+- Job payloads carry exactly one prose field, `next`. Handoff receipts, `job_get` status and the timeout result no longer embed instructions in data values, and `job_get` does not tell the caller to call `job_get`.
+- In-flight job status is `running` everywhere: `JobStatus::Working` is renamed rather than serde-aliased, and the duplicate `phase` lifecycle field is gone from `job_list`, `job_get` and the handoff receipt.
+
 ## [0.14.4] - 2026-11-12
 
 ### Fixed
@@ -507,6 +516,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.14.5]: https://github.com/abird-ai/dotlink/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/abird-ai/dotlink/compare/v0.14.3...v0.14.4
 [0.14.0]: https://github.com/abird-ai/dotlink/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/abird-ai/dotlink/compare/v0.13.0...v0.13.1
