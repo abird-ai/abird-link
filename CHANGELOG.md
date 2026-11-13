@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-11-13
+
+### Added
+
+- `DOTLINK_VERBOSITY` sets the logging level for long-running services: `lifecycle`, `tools` (`-v`) or `requests` (`-vv`). It follows the usual order — CLI flag > `DOTLINK_*` environment > saved profile > built-in default — so a systemd drop-in can set the level with `Environment=` instead of overriding `ExecStart`, which pins the package store path and silently freezes upgrades. An unrecognized value fails startup as an operator configuration error naming the accepted values.
+
 ## [0.14.6] - 2026-11-13
 
 ### Fixed
@@ -522,6 +528,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.14.7]: https://github.com/abird-ai/dotlink/compare/v0.14.6...v0.14.7
 [0.14.6]: https://github.com/abird-ai/dotlink/compare/v0.14.5...v0.14.6
 [0.14.5]: https://github.com/abird-ai/dotlink/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/abird-ai/dotlink/compare/v0.14.3...v0.14.4
