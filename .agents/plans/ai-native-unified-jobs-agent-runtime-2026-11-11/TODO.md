@@ -27,7 +27,9 @@ Session, Agent, guardian or routing semantics here.
       shell/`batch background:true` replaces start and fresh constructors replace restart.
 - [ ] Preserve Process natural stdout, Graph natural result/node coordinate reads, retention/ACK,
       same-Job handoff, stdin current-authority checks, cancellation/unknown settlement,
-      replay/MCP Task ownership and protected-path/sandbox invariants.
+      replay/MCP Task ownership and protected-path/sandbox invariants. Every startup
+      generates a fresh authenticated runtime generation: old finite `j:` refs are never
+      reused, old cursors/proofs reject, and live Process/Graph Jobs cannot resurrect.
 - [ ] Keep standalone/model Graph on reviewed DL-150 native/shell leaves. AW-hosted model
       Graphs additionally allow `agent` with original Agent/Turn/child-effect owner; dotlink
       standalone never exposes it. **Nested `batch` is rejected on model/SDK/host Graphs**.
@@ -36,6 +38,7 @@ Session, Agent, guardian or routing semantics here.
 ### Dotlink checkpoint 1 — standalone
 - [ ] Run together: flat catalog, shell sync/handoff/background, Graph whole/node reads,
       ACK ownership, authorized→revoked stdin, cancel/unknown, duplicate control replay,
+      **runtime restart rejects stale Job refs/cursors without ID reuse or resurrection**,
       protocol-clean stdio, and representative protected-path/sandbox denial.
 
 ## D2 — authenticated AW bridge
@@ -43,12 +46,15 @@ Session, Agent, guardian or routing semantics here.
 - [ ] Accept only AW-resolved canonical refs/operations and authenticated original replay ID,
       actor/source/site/resource/grant/membership/writer provenance. AW Policy/Session/team
       semantics remain opaque upstream facts.
-- [ ] Define one **per-attempt AW source-fenced Start authorization**: existing AW authority
-      owner atomically rechecks current epochs/grants and records Start against the original
-      invocation, serialized with revocation. dotlink checks a fresh exact single-use proof and
-      current local launcher/sandbox/source/site/resource authority before effects. Old
-      upstream envelopes cannot substitute for Start; AW offline/mismatched/unknown attempt
-      blocks new work; already committed/unknown effects remain truthful.
+- [ ] Define one **per-attempt AW source-fenced Start authorization**: AW atomically
+      rechecks current grants/epochs and records exact original invocation, effect-attempt ID,
+      operation/ref/args digest, target dotlink host/profile **and live runtime generation**,
+      bounded expiry and source/site/writer fence, serialized with revocation. dotlink
+      consumes it once through the **existing** replay owner and rechecks current local
+      launcher/sandbox/source/site/resource authority. Proof expiry must not outlive
+      dedupe retention; no old-generation proof can restart an ambiguous effect, and AW
+      may not issue a replacement Start for that same unknown attempt. AW offline blocks
+      **new** authorization, not an already committed same-generation dispatch.
 - [ ] Preserve WriterFence requirements for durable/multi-writer remote ownership.
 - [ ] Keep Agent jobs/read/filter/history/parent state owned by AW. Standalone dotlink never stores it.
 - [ ] Reject constructor wake and later subscribe on dotlink-owned live Process/Graph sources until
@@ -58,8 +64,10 @@ Session, Agent, guardian or routing semantics here.
 - [ ] Run together: AW→remote Process/Graph execution/control/read, stale writer/source/site denial,
       missing local sandbox grant despite upstream allow, revoked stdin before bytes, duplicate
       request idempotence, no Agent state leakage, unsupported remote wake rejection. Race
-      AW revoke against remote Start: revoke-first denies; Start-first is one accepted/unknown
-      attempt; offline AW/stale proof cannot authorize another effect. No double launch.
+      AW revoke against remote Start: revoke-first denies; Start-first permits at most one
+      accepted/unknown attempt. Test duplicate proof/response loss, expiry versus dedupe
+      retention, target generation restart, offline **before new authorization** versus offline
+      **after accepted Start**. Old proof never executes in a new generation; no double launch.
 
 ## D3 — cutover cleanup + final integration gate
 
@@ -80,8 +88,9 @@ Session, Agent, guardian or routing semantics here.
 ## Completion
 
 dotlink integration is complete when the standalone surface is canonical, the AW bridge remains
-thin, current-authority-intersecting and source-fenced at remote Start, no old route is reachable,
-no Agent/Session/Policy engine exists in dotlink, and all applicable grouped checkpoints pass.
+thin, current-authority-intersecting, runtime-generation-fenced and replay-safe at remote Start,
+no old route is reachable, no Agent/Session/Policy engine exists in dotlink, and all
+applicable grouped checkpoints pass.
 
 ## Execution guard
 
