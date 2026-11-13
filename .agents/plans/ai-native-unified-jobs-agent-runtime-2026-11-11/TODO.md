@@ -21,25 +21,38 @@ Session, Agent, guardian or routing semantics here.
 
 ## D1 — shared revision + standalone jobs cutover
 
-- [ ] Consume exact reviewed shared `aw-tools`/ref/Job types and mechanical flat-name →
+- [x] Consume exact reviewed shared `aw-tools`/ref/Job types and mechanical flat-name →
       semantic-ID mapping.
-- [ ] Replace old standalone job_* routes with `jobs_list/get/read/ack/send/cancel`;
+      - 2026-11-13: pinned `aw-tools`, `aw-tools-fs-unix` and `aw-tools-fs-win` to reviewed AW
+        implementation checkpoint `9e9ab043410241c3f797f760d93a1cfd9126fdd2`. Standalone
+        `j:<handle>[/n:<coordinate>]` parsing now uses shared `ExecutionRef`/typed suffixes and
+        shell-name resolution uses shared `OperationId`; no AW Agent/Session/Policy host layer is
+        imported.
+- [x] Replace old standalone job_* routes with `jobs_list/get/read/ack/send/cancel`;
       shell/`batch background:true` replaces start and fresh constructors replace restart.
-- [ ] Preserve Process natural stdout, Graph natural result/node coordinate reads, retention/ACK,
+- [x] Preserve Process natural stdout, Graph natural result/node coordinate reads, retention/ACK,
       same-Job handoff, stdin current-authority checks, cancellation/unknown settlement,
       replay/MCP Task ownership and protected-path/sandbox invariants. Every startup
       generates a fresh authenticated runtime generation: old finite `j:` refs are never
       reused, old cursors/proofs reject, and live Process/Graph Jobs cannot resurrect.
-- [ ] Keep standalone/model Graph on reviewed DL-150 native/shell leaves. AW-hosted model
+- [x] Keep standalone/model Graph on reviewed DL-150 native/shell leaves. AW-hosted model
       Graphs additionally allow `agent` with original Agent/Turn/child-effect owner; dotlink
       standalone never exposes it. **Nested `batch` is rejected on model/SDK/host Graphs**.
       Qualified typed SDK/host `jobs.*` leaves do not expand the standalone provider schema.
 
 ### Dotlink checkpoint 1 — standalone
-- [ ] Run together: flat catalog, shell sync/handoff/background, Graph whole/node reads,
+- [x] Run together: flat catalog, shell sync/handoff/background, Graph whole/node reads,
       ACK ownership, authorized→revoked stdin, cancel/unknown, duplicate control replay,
       **runtime restart rejects stale Job refs/cursors without ID reuse or resurrection**,
       protocol-clean stdio, and representative protected-path/sandbox denial.
+      - 2026-11-13: focused changed-path gates plus owner-sensitive MCP Task/replay/stdio/
+        protected-path carry-forward are green on L5. Graph root `result` is synthesized and
+        non-ACKable; exact node ACK is fenced to the highest offset actually returned by
+        `jobs_read`.
+      - 2026-11-14 repin qualification against AW `9e9ab043410241c3f797f760d93a1cfd9126fdd2`:
+        `cargo fmt --all -- --check`, locked all-feature tests and strict all-target Clippy are
+        green; the main binary suite is 637 passed / 1 intentionally ignored and all integration
+        suites, including canonical stdio Jobs flow, pass.
 
 ## D2 — authenticated AW bridge
 

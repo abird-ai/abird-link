@@ -528,11 +528,11 @@ fn checked_job_retention(value: u64) -> Result<std::time::Duration> {
 
 /// Canonical shell node corresponding to a model-visible tool name.
 fn shell_node_tool(name: &str) -> Option<aw_tools::filesystem::batch::NodeTool> {
-    use aw_tools::filesystem::batch::NodeTool;
-    match name {
-        "bash" => Some(NodeTool::Bash),
-        "pwsh" => Some(NodeTool::Pwsh),
-        "powershell" => Some(NodeTool::Powershell),
+    use aw_tools::{OperationId, filesystem::batch::NodeTool};
+    match OperationId::from_model_name(name)? {
+        OperationId::Bash => Some(NodeTool::Bash),
+        OperationId::Pwsh => Some(NodeTool::Pwsh),
+        OperationId::Powershell => Some(NodeTool::Powershell),
         _ => None,
     }
 }
@@ -599,6 +599,7 @@ pub enum Capability {
     ShellUnix,
     ShellWindows,
     Job,
+    JobInput,
 }
 
 /// One row per advertised tool: the single place that records capability,
@@ -722,43 +723,37 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         concurrent_read: false,
     },
     ToolSpec {
-        name: "job_start",
+        name: "jobs_list",
         capability: Capability::Job,
+        request_replay: false,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "jobs_get",
+        capability: Capability::Job,
+        request_replay: false,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "jobs_read",
+        capability: Capability::Job,
+        request_replay: false,
+        concurrent_read: true,
+    },
+    ToolSpec {
+        name: "jobs_ack",
+        capability: Capability::Job,
+        request_replay: false,
+        concurrent_read: false,
+    },
+    ToolSpec {
+        name: "jobs_send",
+        capability: Capability::JobInput,
         request_replay: true,
         concurrent_read: false,
     },
     ToolSpec {
-        name: "job_list",
-        capability: Capability::Job,
-        request_replay: false,
-        concurrent_read: true,
-    },
-    ToolSpec {
-        name: "job_get",
-        capability: Capability::Job,
-        request_replay: false,
-        concurrent_read: true,
-    },
-    ToolSpec {
-        name: "job_output",
-        capability: Capability::Job,
-        request_replay: false,
-        concurrent_read: true,
-    },
-    ToolSpec {
-        name: "job_ack",
-        capability: Capability::Job,
-        request_replay: false,
-        concurrent_read: false,
-    },
-    ToolSpec {
-        name: "job_cancel",
-        capability: Capability::Job,
-        request_replay: false,
-        concurrent_read: false,
-    },
-    ToolSpec {
-        name: "job_restart",
+        name: "jobs_cancel",
         capability: Capability::Job,
         request_replay: true,
         concurrent_read: false,
@@ -785,6 +780,7 @@ impl Capabilities {
             Capability::ReadWrite => self.read_write,
             Capability::ShellUnix | Capability::ShellWindows => self.shell,
             Capability::Job => self.shell || self.read || self.write || self.read_write,
+            Capability::JobInput => self.shell,
         }
     }
 }
@@ -2355,13 +2351,12 @@ impl LocalMachine {
         matches!(
             name,
             "batch"
-                | "job_start"
-                | "job_restart"
-                | "job_list"
-                | "job_get"
-                | "job_output"
-                | "job_ack"
-                | "job_cancel"
+                | "jobs_list"
+                | "jobs_get"
+                | "jobs_read"
+                | "jobs_ack"
+                | "jobs_send"
+                | "jobs_cancel"
         )
     }
 
@@ -3263,13 +3258,11 @@ mod tests {
                 "bread",
                 "find",
                 "grep",
-                "job_ack",
-                "job_cancel",
-                "job_get",
-                "job_list",
-                "job_output",
-                "job_restart",
-                "job_start",
+                "jobs_ack",
+                "jobs_cancel",
+                "jobs_get",
+                "jobs_list",
+                "jobs_read",
                 "ls",
                 "read"
             ]
@@ -3299,13 +3292,11 @@ mod tests {
                 "edit",
                 "find",
                 "grep",
-                "job_ack",
-                "job_cancel",
-                "job_get",
-                "job_list",
-                "job_output",
-                "job_restart",
-                "job_start",
+                "jobs_ack",
+                "jobs_cancel",
+                "jobs_get",
+                "jobs_list",
+                "jobs_read",
                 "ls",
                 "mv",
                 "patch",
@@ -3331,13 +3322,11 @@ mod tests {
             [
                 "batch",
                 "bwrite",
-                "job_ack",
-                "job_cancel",
-                "job_get",
-                "job_list",
-                "job_output",
-                "job_restart",
-                "job_start",
+                "jobs_ack",
+                "jobs_cancel",
+                "jobs_get",
+                "jobs_list",
+                "jobs_read",
                 "mv",
                 "rm",
                 "write"
@@ -3365,13 +3354,11 @@ mod tests {
                 "cp",
                 "find",
                 "grep",
-                "job_ack",
-                "job_cancel",
-                "job_get",
-                "job_list",
-                "job_output",
-                "job_restart",
-                "job_start",
+                "jobs_ack",
+                "jobs_cancel",
+                "jobs_get",
+                "jobs_list",
+                "jobs_read",
                 "ls",
                 "mv",
                 "read",
@@ -3469,9 +3456,9 @@ mod tests {
                 "grep",
                 "read",
                 "bread",
-                "job_list",
-                "job_get",
-                "job_output"
+                "jobs_list",
+                "jobs_get",
+                "jobs_read"
             ]
         );
     }
@@ -3802,8 +3789,8 @@ mod tests {
                 "pwsh",
                 "powershell",
                 "batch",
-                "job_start",
-                "job_restart",
+                "jobs_send",
+                "jobs_cancel",
             ]
         );
         for spec in TOOL_SPECS {

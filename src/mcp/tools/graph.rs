@@ -24,7 +24,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{sync::oneshot, time::Instant};
 
-use super::{LocalMachine, dot, resolve_capped, shared_native, shell::ShellArgs};
+use super::{
+    LocalMachine, dot, resolve_capped, shared_native,
+    shell::{ShellArgs, ShellJobRun},
+};
 use crate::jobs::{JobCompletion, JobHandle, JobStart, SharedShellWriters};
 
 const DEFAULT_GRAPH_WIDTH: usize = 8;
@@ -34,12 +37,13 @@ const SHELL_RESULT_BYTES: usize = 4 * 1024;
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphArgs {
     pub(crate) ops: Vec<Value>,
-}
-
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RestartArgs {
-    pub(crate) id: String,
+    /// Return an exposed Job handoff after admission instead of waiting for the
+    /// Graph result in this tools/call.
+    #[serde(default)]
+    pub(crate) background: bool,
+    /// Optional display metadata only; never part of Graph node semantics.
+    #[serde(default)]
+    pub(crate) title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +60,8 @@ struct GraphShellArgs {
     max_output_bytes: Option<usize>,
     #[serde(default)]
     writes: Option<Vec<String>>,
+    #[serde(default)]
+    interactive: bool,
 }
 
 impl GraphShellArgs {
@@ -74,6 +80,7 @@ impl GraphShellArgs {
 #[derive(Clone)]
 struct PreparedShellNode {
     args: ShellArgs,
+    interactive: bool,
     footprint: Footprint,
     timeout_secs: u64,
     output_limit: usize,
@@ -245,6 +252,7 @@ async fn prepare_shell_node(
     let output_limit = runtime.output_limit(shell_args.max_output_bytes);
     Ok(PreparedShellNode {
         args: shell_args,
+        interactive: args.interactive,
         footprint,
         timeout_secs,
         output_limit,
@@ -328,6 +336,7 @@ pub(crate) async fn prepare(machine: &LocalMachine, ops: Vec<Value>) -> Result<P
     prepare_compiled(machine, graph).await
 }
 
+#[cfg(test)]
 pub(crate) async fn prepare_existing(
     machine: &LocalMachine,
     graph: Graph,
@@ -595,7 +604,7 @@ async fn execute_shell(
     }
     crate::shell_process::configure(&mut command);
     crate::credentials::hide_from_child(&mut command)
-        .stdin(if node.args.stdin.is_some() {
+        .stdin(if node.args.stdin.is_some() || node.interactive {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -617,15 +626,16 @@ async fn execute_shell(
     let context = runtime
         .shell
         .job_result_context(&working_dir, node.timeout_secs);
-    let completion = LocalMachine::run_shell_job(
+    let completion = LocalMachine::run_shell_job(ShellJobRun {
         command,
-        node.args.stdin,
+        stdin_text: node.args.stdin,
+        interactive: node.interactive,
         deadline,
-        job.clone(),
+        job: job.clone(),
         coordinate,
-        SharedShellWriters { stdout, stderr },
-        context,
-    )
+        shared_writers: SharedShellWriters { stdout, stderr },
+        result_context: context,
+    })
     .await;
     let terminal =
         (!completion.spawn_failed).then(|| crate::jobs::shared_process_terminal(&completion));
@@ -1091,7 +1101,25 @@ pub(crate) async fn start(
 }
 
 pub(crate) fn input_schema(node_tools: &[NodeTool]) -> Value {
-    aw_tools::filesystem::batch::parameters_for(node_tools.iter().copied())
+    let mut schema = aw_tools::filesystem::batch::parameters_for(node_tools.iter().copied());
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert(
+            "background".into(),
+            serde_json::json!({
+                "type":"boolean",
+                "description":"Expose the admitted Graph Job immediately instead of waiting in this call."
+            }),
+        );
+        properties.insert(
+            "title".into(),
+            serde_json::json!({
+                "type":["string","null"],
+                "maxLength":160,
+                "description":"Optional display title; does not affect execution semantics."
+            }),
+        );
+    }
+    schema
 }
 
 pub(crate) fn allowed_node_tools(
@@ -1336,6 +1364,7 @@ mod tests {
             timeout_secs: None,
             max_output_bytes: None,
             writes: Some(vec![absolute]),
+            interactive: false,
         };
         let absolute_footprint = shell_footprint(&machine, &absolute_args, &root).unwrap();
         assert!(!absolute_footprint.unknown_write());
@@ -1369,6 +1398,7 @@ mod tests {
             timeout_secs: None,
             max_output_bytes: None,
             writes: Some(vec!["src/*.rs".into()]),
+            interactive: false,
         };
         assert!(shell_footprint(&machine, &invalid, &root).is_err());
 
@@ -1421,6 +1451,112 @@ mod tests {
         let snapshot = machine.jobs.shared_snapshot(&started.id).unwrap();
         assert_eq!(snapshot.finished, 3);
         assert_eq!(snapshot.summary, Some((Primary::Ok, false, false)));
+    }
+
+    #[tokio::test]
+    async fn standalone_graph_root_result_is_synthesized_and_node_ack_is_delivery_fenced() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("a.txt"), "old").unwrap();
+        let machine = test_support::test_machine(root.clone());
+        let prepared = prepare(
+            &machine,
+            vec![
+                json!(["write", {"path":"a.txt","content":"alpha"}, "*"]),
+                json!(["read", {"path":"a.txt","numbered":false}, "1.ok"]),
+            ],
+        )
+        .await
+        .unwrap();
+        let started = start(&machine, prepared, None, None, true).await.unwrap();
+        assert!(matches!(
+            machine.jobs.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+
+        let aggregate: serde_json::Value = serde_json::from_str(
+            &machine
+                .jobs
+                .standalone_graph_result_page(&started.id, 0, 64 * 1024, 64 * 1024, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(aggregate["node"].is_null(), "{aggregate}");
+        assert_eq!(aggregate["stream"], "result");
+        assert!(
+            aggregate["data"].as_str().unwrap().contains("2\nalpha"),
+            "{aggregate}"
+        );
+        let root_ack = machine
+            .jobs
+            .acknowledge_node_output(
+                &started.id,
+                None,
+                Some(crate::jobs::JobOutputStream::Result),
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            root_ack.to_string().contains("synthesized aggregate"),
+            "{root_ack}"
+        );
+
+        let unread_ack = machine
+            .jobs
+            .acknowledge_node_output(
+                &started.id,
+                Some(2),
+                Some(crate::jobs::JobOutputStream::Result),
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            unread_ack.to_string().contains("exceeds bytes delivered"),
+            "{unread_ack}"
+        );
+
+        let node_page: serde_json::Value = serde_json::from_str(
+            &machine
+                .jobs
+                .output_node_page(
+                    &started.id,
+                    crate::jobs::OutputPageRequest {
+                        node: Some(2),
+                        stream: Some(crate::jobs::JobOutputStream::Result),
+                        offset: 0,
+                        requested_bytes: 1,
+                        response_ceiling: 64 * 1024,
+                        base64: false,
+                    },
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(node_page["next_offset"], 1);
+        assert_eq!(node_page["data"], "a");
+
+        let skip_ack = machine
+            .jobs
+            .acknowledge_node_output(
+                &started.id,
+                Some(2),
+                Some(crate::jobs::JobOutputStream::Result),
+                2,
+            )
+            .unwrap_err();
+        assert!(
+            skip_ack.to_string().contains("exceeds bytes delivered"),
+            "{skip_ack}"
+        );
+        machine
+            .jobs
+            .acknowledge_node_output(
+                &started.id,
+                Some(2),
+                Some(crate::jobs::JobOutputStream::Result),
+                1,
+            )
+            .unwrap();
     }
 
     #[cfg(unix)]

@@ -6,6 +6,10 @@ Owner: @pvl
 
 Status: **thin integration design under review** (2026-11-12). AW owns proposed semantics; dotlink `TODO.md` separates standalone finite-Job cutover (after AW A/B contracts), authenticated bridge (after AW E), and final gates. Parallel implementation does not freeze evolving public/API contracts; unchanged native/sandbox primitives are not repeatedly requalified.
 
+Current dotlink handoff: [../../docs/CURRENT_HANDOFF.md](../../docs/CURRENT_HANDOFF.md)
+Canonical cross-repo handoff: `/home/pvl/spaces/abird/src/aw/.agents/docs/CURRENT_HANDOFF.md`
+Next-agent launcher: [NEXT-AGENT.md](NEXT-AGENT.md)
+
 Full semantic design lives in AW:
 
     /home/pvl/spaces/abird/src/aw/.agents/plans/

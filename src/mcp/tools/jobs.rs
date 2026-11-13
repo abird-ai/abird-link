@@ -1,8 +1,7 @@
-//! Compatibility projections for the canonical live Job/Graph runtime.
+//! Standalone finite Job control surface over the canonical dotlink JobManager.
 //!
-//! Native MCP Tasks and these tools address the same JobManager entries and use
-//! the same job id. Clients without the Tasks extension can therefore start,
-//! poll, page output and cancel without holding one request open.
+//! Process/Graph execution, retention, replay, output ownership and ACK remain in
+//! `crate::jobs`. This module is only the flat model-facing projection.
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -13,10 +12,13 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
+
 use super::{LocalMachine, graph, ok_text, resolve_capped, tool_error};
-use crate::jobs::{JobHandoff, JobOutputStream, JobWait};
+use crate::jobs::{JobHandoff, JobOutputStream, JobWait, ProcessInput};
 
 const MAX_JOB_LIST_LIMIT: usize = 256;
+const MAX_WAIT_MS: u64 = 30_000;
 
 pub(crate) fn canonicalize_graph_router(
     router: &mut rmcp::handler::server::router::tool::ToolRouter<LocalMachine>,
@@ -29,16 +31,14 @@ pub(crate) fn canonicalize_graph_router(
         .cloned()
         .expect("canonical Graph schema is an object");
     let schema = std::sync::Arc::new(schema);
-    for name in ["batch", "job_start"] {
-        if let Some(route) = router.map.get_mut(name) {
-            route.attr.input_schema = schema.clone();
-        }
+    if let Some(route) = router.map.get_mut("batch") {
+        route.attr.input_schema = schema;
     }
 }
 
 pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes: usize) {
     let name = tool.name.as_ref();
-    if !matches!(name, "job_output" | "job_list") {
+    if !matches!(name, "jobs_read" | "jobs_list") {
         return;
     }
     let mut schema = (*tool.input_schema).clone();
@@ -48,15 +48,15 @@ pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes:
     else {
         return;
     };
-    if name == "job_output"
+    if name == "jobs_read"
         && let Some(property) = properties
-            .get_mut("max_output_bytes")
+            .get_mut("limit")
             .and_then(serde_json::Value::as_object_mut)
     {
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Serialized MCP result budget for this page. Defaults to {max_output_bytes}, must be at least {} and is capped at {max_output_bytes}.",
+                "Maximum retained raw bytes for this page. Defaults to the profile output ceiling, must be at least {} and is capped at {max_output_bytes}.",
                 crate::mcp::MIN_BYTE_LIMIT,
             )),
         );
@@ -69,7 +69,7 @@ pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes:
             serde_json::Value::from(max_output_bytes),
         );
     }
-    if name == "job_list"
+    if name == "jobs_list"
         && let Some(property) = properties
             .get_mut("limit")
             .and_then(serde_json::Value::as_object_mut)
@@ -83,28 +83,47 @@ pub(crate) fn with_job_limits(tool: &mut Tool, _max_secs: u64, max_output_bytes:
     tool.input_schema = std::sync::Arc::new(schema);
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct JobIdArgs {
-    /// Job/task identifier returned by a direct tool handoff or job_start.
-    #[serde(alias = "job_id")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StandaloneRef {
     id: String,
+    node: Option<usize>,
+}
+
+fn parse_ref(reference: &str) -> Result<StandaloneRef, String> {
+    if !reference.starts_with("j:") {
+        return Err("standalone Job ref must start with j:".into());
+    }
+    let resolved = ExecutionRef::parse(reference)
+        .map_err(|_| "invalid standalone Job ref".to_owned())?
+        .resolve(None, None)
+        .map_err(|_| "invalid standalone Job ref".to_owned())?;
+    match resolved.suffix() {
+        [ExecutionSegment::Job(job)] => Ok(StandaloneRef {
+            id: job.as_str().to_owned(),
+            node: None,
+        }),
+        [ExecutionSegment::Job(job), ExecutionSegment::Node(node)] => Ok(StandaloneRef {
+            id: job.as_str().to_owned(),
+            node: Some(node.get() as usize),
+        }),
+        _ => Err("standalone Job ref supports only j:<handle>[/n:<coordinate>]".into()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum OutputStream {
+enum ReadView {
     Result,
     Stdout,
     Stderr,
 }
 
-impl From<OutputStream> for JobOutputStream {
-    fn from(value: OutputStream) -> Self {
+impl From<ReadView> for JobOutputStream {
+    fn from(value: ReadView) -> Self {
         match value {
-            OutputStream::Result => Self::Result,
-            OutputStream::Stdout => Self::Stdout,
-            OutputStream::Stderr => Self::Stderr,
+            ReadView::Result => Self::Result,
+            ReadView::Stdout => Self::Stdout,
+            ReadView::Stderr => Self::Stderr,
         }
     }
 }
@@ -119,52 +138,101 @@ enum OutputEncoding {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct JobOutputArgs {
-    /// Job/task identifier.
-    #[serde(alias = "job_id")]
-    id: String,
-    /// Graph node coordinate. May be omitted only for a one-node Job.
+struct JobsListArgs {
     #[serde(default)]
-    node: Option<usize>,
-    /// result/stdout/stderr. Omit to use the node's natural primary stream.
+    cursor: Option<String>,
     #[serde(default)]
-    stream: Option<OutputStream>,
-    /// Raw byte offset in the selected retained stream. Defaults to zero.
-    #[serde(default)]
-    offset: Option<u64>,
-    /// Maximum response bytes for this page. Defaults to the profile output ceiling and is capped there.
-    #[serde(default)]
-    max_output_bytes: Option<usize>,
-    /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
-    #[serde(default)]
-    encoding: OutputEncoding,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct JobAckArgs {
-    /// Job/task identifier.
-    #[serde(alias = "job_id")]
-    id: String,
-    /// Graph node coordinate. May be omitted only for a one-node Job.
+struct JobsGetArgs {
+    #[serde(rename = "ref")]
+    reference: String,
     #[serde(default)]
-    node: Option<usize>,
-    /// result/stdout/stderr. Omit to use the node's natural primary stream.
+    rev: Option<u64>,
     #[serde(default)]
-    stream: Option<OutputStream>,
-    /// Highest raw byte offset safely received by the caller.
+    wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobsReadArgs {
+    #[serde(rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    view: Option<ReadView>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    encoding: OutputEncoding,
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobsAckArgs {
+    #[serde(rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    view: Option<ReadView>,
     offset: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum SendMode {
+    #[default]
+    Auto,
+    Queue,
+    Steer,
+    Interrupt,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct JobListArgs {
-    /// Zero-based offset into the current newest-first exposed-job snapshot.
+struct SendInput {
     #[serde(default)]
-    offset: usize,
-    /// Maximum recent exposed jobs to return. Defaults to 64, capped at 256.
+    text: Option<String>,
     #[serde(default)]
-    limit: Option<usize>,
+    eof: Option<bool>,
+}
+
+impl SendInput {
+    fn into_process(self) -> Result<ProcessInput, String> {
+        match (self.text, self.eof) {
+            (Some(text), None) if text.len() <= 64 * 1024 => {
+                Ok(ProcessInput::Text(text.into_bytes()))
+            }
+            (None, Some(true)) => Ok(ProcessInput::Eof),
+            _ => Err("jobs_send input must be exactly {text:string} or {eof:true}".into()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobsSendArgs {
+    #[serde(rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    rev: Option<u64>,
+    #[serde(default)]
+    mode: SendMode,
+    input: SendInput,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobsCancelArgs {
+    #[serde(rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    rev: Option<u64>,
 }
 
 #[tool_router(router = "jobs_router", vis = "pub(crate)")]
@@ -177,7 +245,10 @@ impl LocalMachine {
     ) -> CallToolResult {
         match self.jobs.wait_until(id, deadline).await {
             Ok(JobWait::Pending) => match self.jobs.expose_compatibility(id) {
-                Ok(receipt) => receipt,
+                Ok(_) => match self.jobs.standalone_status(id, None) {
+                    Ok((_, status)) => ok_text(status),
+                    Err(error) => tool_error(error),
+                },
                 Err(error) => tool_error(error),
             },
             Err(error) => tool_error(error),
@@ -192,8 +263,9 @@ impl LocalMachine {
                         if result_budget.is_some_and(|limit| {
                             crate::mcp::serialized_json_len(&result).is_none_or(|size| size > limit)
                         }) {
-                            return match self.jobs.expose_compatibility(id) {
-                                Ok(receipt) => receipt,
+                            let _ = self.jobs.expose_compatibility(id);
+                            return match self.jobs.standalone_status(id, None) {
+                                Ok((_, status)) => ok_text(status),
                                 Err(error) => tool_error(error),
                             };
                         }
@@ -202,10 +274,13 @@ impl LocalMachine {
                             Err(error) => tool_error(error),
                         }
                     }
-                    Ok(None) => match self.jobs.expose_compatibility(id) {
-                        Ok(receipt) => receipt,
-                        Err(error) => tool_error(error),
-                    },
+                    Ok(None) => {
+                        let _ = self.jobs.expose_compatibility(id);
+                        match self.jobs.standalone_status(id, None) {
+                            Ok((_, status)) => ok_text(status),
+                            Err(error) => tool_error(error),
+                        }
+                    }
                     Err(error) => tool_error(error),
                 }
             }
@@ -220,7 +295,12 @@ impl LocalMachine {
         match self.jobs.replay_handoff(id) {
             Ok(None) => None,
             Err(error) => Some(tool_error(error)),
-            Ok(Some(JobHandoff::Compatibility(receipt))) => Some(receipt),
+            Ok(Some(JobHandoff::Compatibility(_))) => Some(
+                self.jobs
+                    .standalone_status(id, None)
+                    .map(|(_, status)| ok_text(status))
+                    .unwrap_or_else(tool_error),
+            ),
             Ok(Some(JobHandoff::Synchronous)) => {
                 let render_budget = result_budget
                     .unwrap_or(self.config.max_output_bytes)
@@ -241,7 +321,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Execute a bounded canonical Graph of already-granted native filesystem and shell nodes. Independent nodes may run concurrently; conditions and conservative path footprints determine deterministic ordering. Returns the exact compact result when it completes within this request, otherwise hands off the same durable Job for job_get/job_output/job_ack/job_cancel.",
+        description = "Execute a bounded canonical Graph of already-granted native filesystem and shell nodes. Set background=true to return the admitted durable Graph Job immediately; otherwise dotlink returns the exact compact result when it completes within this request and hands off the same Job if the synchronous window closes.",
         annotations(
             title = "Run tool Graph",
             read_only_hint = false,
@@ -257,11 +337,13 @@ impl LocalMachine {
     ) -> CallToolResult {
         let result_budget = self.request_result_budget(&context);
         let request_key = self.request_job_key(&context);
+        let background = args.background;
+        let _display_title = args.title;
         let prepared = match graph::prepare(self, args.ops).await {
             Ok(prepared) => prepared,
             Err(error) => return tool_error(error),
         };
-        let started = match graph::start(self, prepared, None, request_key, false).await {
+        let started = match graph::start(self, prepared, None, request_key, background).await {
             Ok(started) => started,
             Err(error) => return tool_error(error),
         };
@@ -269,6 +351,12 @@ impl LocalMachine {
             && let Some(response) = self.replay_graph_response(&started.id, result_budget).await
         {
             return response;
+        }
+        if background {
+            return match self.jobs.standalone_status(&started.id, None) {
+                Ok((_, status)) => ok_text(status),
+                Err(error) => tool_error(error),
+            };
         }
         let deadline = self
             .request_sync_budget_millis(&context)
@@ -280,83 +368,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Start a bounded canonical Graph as a durable Job. The Job is exposed before any root node may execute. Poll with job_get, read node result/stdout/stderr with job_output, acknowledge with job_ack, cancel with job_cancel, or create a fresh execution with job_restart.",
-        annotations(
-            title = "Start tool Graph job",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn job_start(
-        &self,
-        Parameters(args): Parameters<graph::GraphArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> CallToolResult {
-        let prepared = match graph::prepare(self, args.ops).await {
-            Ok(prepared) => prepared,
-            Err(error) => return tool_error(error),
-        };
-        match graph::start(self, prepared, None, self.request_job_key(&context), true).await {
-            Ok(started) => match self.jobs.expose_compatibility(&started.id) {
-                Ok(receipt) => receipt,
-                Err(error) => tool_error(error),
-            },
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "Create a new durable execution from a terminal exposed Job's immutable Graph. Every node is revalidated and re-prepared under current grants, limits, filesystem authority and shell identity before the new Job is admitted. The source Job is never replayed in place.",
-        annotations(
-            title = "Restart tool Graph job",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn job_restart(
-        &self,
-        Parameters(args): Parameters<graph::RestartArgs>,
-        context: RequestContext<RoleServer>,
-    ) -> CallToolResult {
-        let source = match self.jobs.shared_snapshot(&args.id) {
-            Ok(snapshot)
-                if snapshot.lifecycle == aw_tools::filesystem::job::Lifecycle::Terminal =>
-            {
-                match self.jobs.shared_graph(&args.id) {
-                    Ok(graph) => graph,
-                    Err(error) => return tool_error(error),
-                }
-            }
-            Ok(_) => return tool_error("job_restart requires a terminal source Job"),
-            Err(error) => return tool_error(error),
-        };
-        let prepared = match graph::prepare_existing(self, source).await {
-            Ok(prepared) => prepared,
-            Err(error) => return tool_error(error),
-        };
-        match graph::start(
-            self,
-            prepared,
-            Some(args.id),
-            self.request_job_key(&context),
-            true,
-        )
-        .await
-        {
-            Ok(started) => match self.jobs.expose_compatibility(&started.id) {
-                Ok(receipt) => receipt,
-                Err(error) => tool_error(error),
-            },
-            Err(error) => tool_error(error),
-        }
-    }
-
-    #[tool(
-        description = "List recent exposed Jobs. Useful after a lost creation response; returns stable job ids, aggregate status/progress and retained-output usage.",
+        description = "List recent exposed standalone Process/Graph Jobs newest first. Paging uses a runtime-generation-bound opaque cursor; no Agent, Session or subtree state is listed.",
         annotations(
             title = "List Jobs",
             read_only_hint = true,
@@ -365,32 +377,34 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn job_list(
+    async fn jobs_list(
         &self,
-        Parameters(args): Parameters<JobListArgs>,
+        Parameters(args): Parameters<JobsListArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let limit = args.limit.unwrap_or(64);
+        let limit = args.limit.unwrap_or(20);
         if !(1..=MAX_JOB_LIST_LIMIT).contains(&limit) {
             return tool_error(format!(
-                "job_list limit must be within 1..={MAX_JOB_LIST_LIMIT}"
+                "jobs_list limit must be within 1..={MAX_JOB_LIST_LIMIT}"
             ));
         }
         let ceiling = self
             .request_result_budget(&context)
             .unwrap_or(self.config.max_output_bytes)
             .min(self.config.max_output_bytes);
-        match self.jobs.list_fitted(args.offset, limit, |page| {
-            let result = ok_text(page.to_owned());
-            crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= ceiling)
-        }) {
+        match self
+            .jobs
+            .standalone_list_fitted(args.cursor.as_deref(), limit, |page| {
+                let result = ok_text(page.to_owned());
+                crate::mcp::serialized_json_len(&result).is_some_and(|size| size <= ceiling)
+            }) {
             Ok(page) => ok_text(page),
             Err(error) => tool_error(error),
         }
     }
 
     #[tool(
-        description = "Get compact status for an exposed Job. Multi-node Graphs include aggregate progress and node outcome ranges; one-node shell Jobs retain process detail. The same opaque id is used by native MCP Tasks when eligible.",
+        description = "Observe one explicit standalone Process/Graph Job or Graph node. rev is a conditional observation token; wait_ms may wait for a different revision without changing execution timeout.",
         annotations(
             title = "Get Job status",
             read_only_hint = true,
@@ -399,15 +413,27 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn job_get(&self, Parameters(args): Parameters<JobIdArgs>) -> CallToolResult {
-        match self.jobs.status(&args.id) {
+    async fn jobs_get(&self, Parameters(args): Parameters<JobsGetArgs>) -> CallToolResult {
+        let reference = match parse_ref(&args.reference) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
+        let wait_ms = args.wait_ms.unwrap_or(0);
+        if wait_ms > MAX_WAIT_MS {
+            return tool_error(format!("jobs_get wait_ms exceeds {MAX_WAIT_MS}"));
+        }
+        match self
+            .jobs
+            .standalone_get(&reference.id, reference.node, args.rev, wait_ms)
+            .await
+        {
             Ok(status) => ok_text(status),
             Err(error) => tool_error(error),
         }
     }
 
     #[tool(
-        description = "Read one pure/replayable retained Job node page by raw byte offset. One-node Jobs may omit node; multi-node Jobs require it. Native nodes expose result; shell nodes expose result/stdout/stderr and default to stdout. job_output never acknowledges or deletes bytes; continue from next_offset and then call job_ack.",
+        description = "Read one replayable retained standalone Job view by raw offset. Process and Process-backed Graph nodes default to stdout; native/Graph results default to result. Reading never acknowledges or releases bytes.",
         annotations(
             title = "Read Job output",
             read_only_hint = true,
@@ -416,35 +442,74 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn job_output(
+    async fn jobs_read(
         &self,
-        Parameters(args): Parameters<JobOutputArgs>,
+        Parameters(args): Parameters<JobsReadArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let ceiling = resolve_capped(args.max_output_bytes, self.config.max_output_bytes);
+        if args.wait_ms.unwrap_or(0) > MAX_WAIT_MS {
+            return tool_error(format!("jobs_read wait_ms exceeds {MAX_WAIT_MS}"));
+        }
+        let reference = match parse_ref(&args.reference) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
+        let ceiling = resolve_capped(args.limit, self.config.max_output_bytes);
         let response_ceiling = self.request_result_budget(&context).unwrap_or(ceiling);
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
-        match crate::blocking::run(|| {
-            self.jobs.output_node_page(
-                &args.id,
+        let is_graph = match self.jobs.standalone_is_graph(&reference.id) {
+            Ok(value) => value,
+            Err(error) => return tool_error(error),
+        };
+        if is_graph && reference.node.is_none() {
+            if args
+                .view
+                .is_some_and(|view| !matches!(view, ReadView::Result))
+            {
+                return tool_error(
+                    "Graph root exposes only result; use j:<handle>/n:<coordinate> for node streams",
+                );
+            }
+            return match self
+                .jobs
+                .standalone_graph_result_page_wait(
+                    &reference.id,
+                    offset,
+                    ceiling,
+                    response_ceiling,
+                    base64,
+                    args.wait_ms.unwrap_or(0),
+                )
+                .await
+            {
+                Ok(page) => ok_text(page),
+                Err(error) => tool_error(error),
+            };
+        }
+        match self
+            .jobs
+            .output_node_page_wait(
+                &reference.id,
                 crate::jobs::OutputPageRequest {
-                    node: args.node,
-                    stream: args.stream.map(Into::into),
+                    node: reference.node,
+                    stream: args.view.map(Into::into),
                     offset,
                     requested_bytes: ceiling,
                     response_ceiling,
                     base64,
                 },
+                args.wait_ms.unwrap_or(0),
             )
-        }) {
+            .await
+        {
             Ok(page) => ok_text(page),
             Err(error) => tool_error(error),
         }
     }
 
     #[tool(
-        description = "Acknowledge one Job/node/stream raw-byte offset after safe receipt. One-node Jobs may omit node; multi-node Jobs require it. This is the only job-output operation that advances cleanup; physical release waits for every exact output owner.",
+        description = "Explicitly acknowledge one exact retained Job ref/view through a raw byte offset after safe receipt. ACK is monotonic/idempotent and is never implied by jobs_read.",
         annotations(
             title = "Acknowledge Job output",
             read_only_hint = false,
@@ -453,20 +518,61 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn job_ack(&self, Parameters(args): Parameters<JobAckArgs>) -> CallToolResult {
+    async fn jobs_ack(&self, Parameters(args): Parameters<JobsAckArgs>) -> CallToolResult {
+        let reference = match parse_ref(&args.reference) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
         match self.jobs.acknowledge_node_output(
-            &args.id,
-            args.node,
-            args.stream.map(Into::into),
+            &reference.id,
+            reference.node,
+            args.view.map(Into::into),
             args.offset,
         ) {
-            Ok(status) => ok_text(status),
+            Ok(_) => match self.jobs.standalone_status(&reference.id, reference.node) {
+                Ok((_, status)) => ok_text(status),
+                Err(error) => tool_error(error),
+            },
             Err(error) => tool_error(error),
         }
     }
 
     #[tool(
-        description = "Request cancellation of a running Job. Pending native nodes are skipped; running shell nodes stop their contained command tree. Terminal Jobs are left unchanged and retained output remains pageable until acknowledged or expired.",
+        description = "Send typed live stdin to one explicit interactive Process Job/node. Process supports mode=auto only; input is exactly {text} or {eof:true}. Current launcher/sandbox/tool authority is rechecked before delivery.",
+        annotations(
+            title = "Send Job input",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn jobs_send(&self, Parameters(args): Parameters<JobsSendArgs>) -> CallToolResult {
+        if !matches!(args.mode, SendMode::Auto) {
+            return tool_error("standalone Process jobs_send supports only mode=auto");
+        }
+        let reference = match parse_ref(&args.reference) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
+        let input = match args.input.into_process() {
+            Ok(input) => input,
+            Err(error) => return tool_error(error),
+        };
+        match self
+            .send_process_input_checked(&reference.id, reference.node, args.rev, input)
+            .await
+        {
+            Ok(revision) => ok_text(format!(
+                "{} rev={revision} ok",
+                crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
+            )),
+            Err(error) => tool_error(error),
+        }
+    }
+
+    #[tool(
+        description = "Idempotently request cancellation of one explicit standalone Process/Graph Job. rev is an optional compare-and-act precondition; Graph-node cancellation is not exposed initially.",
         annotations(
             title = "Cancel Job",
             read_only_hint = false,
@@ -475,9 +581,30 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn job_cancel(&self, Parameters(args): Parameters<JobIdArgs>) -> CallToolResult {
-        match self.jobs.cancel(&args.id) {
-            Ok(status) => ok_text(status),
+    async fn jobs_cancel(&self, Parameters(args): Parameters<JobsCancelArgs>) -> CallToolResult {
+        let reference = match parse_ref(&args.reference) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
+        if reference.node.is_some() {
+            return tool_error("standalone jobs_cancel targets a Job root, not a Graph node");
+        }
+        if let Some(expected) = args.rev {
+            let (current, _) = match self.jobs.standalone_status(&reference.id, None) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return tool_error(error),
+            };
+            if expected != current {
+                return tool_error(format!(
+                    "stale Job revision: expected {expected}, current {current}"
+                ));
+            }
+        }
+        match self.jobs.cancel(&reference.id) {
+            Ok(_) => match self.jobs.standalone_status(&reference.id, None) {
+                Ok((_, status)) => ok_text(status),
+                Err(error) => tool_error(error),
+            },
             Err(error) => tool_error(error),
         }
     }
@@ -488,8 +615,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_list_schema_rejects_zero_and_caps_pages() {
-        let mut list = LocalMachine::all_tools().get("job_list").cloned().unwrap();
+    fn standalone_refs_are_explicit_and_node_coordinates_are_canonical() {
+        assert_eq!(
+            parse_ref("j:abc-123").unwrap(),
+            StandaloneRef {
+                id: "abc-123".into(),
+                node: None
+            }
+        );
+        assert_eq!(
+            parse_ref("j:abc-123/n:4").unwrap(),
+            StandaloneRef {
+                id: "abc-123".into(),
+                node: Some(4)
+            }
+        );
+        for invalid in ["", ".", "^", "abc", "j:", "j:x/n:0", "j:x/n:01", "j:x/x:1"] {
+            assert!(parse_ref(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn jobs_list_schema_rejects_zero_and_caps_pages() {
+        let mut list = LocalMachine::all_tools().get("jobs_list").cloned().unwrap();
         with_job_limits(&mut list, 3600, 8 * 1024 * 1024);
         let limit = &list.input_schema["properties"]["limit"];
         assert_eq!(limit["minimum"], 1);
@@ -497,19 +645,33 @@ mod tests {
     }
 
     #[test]
-    fn job_output_schema_uses_profile_result_ceiling() {
-        let mut output = LocalMachine::all_tools()
-            .get("job_output")
-            .cloned()
-            .unwrap();
-        with_job_limits(&mut output, 3600, 8 * 1024 * 1024);
-        let output_limit = &output.input_schema["properties"]["max_output_bytes"];
+    fn standalone_constructors_expose_background_without_wake_or_legacy_start() {
+        let router = LocalMachine::all_tools();
+        let batch = router.get("batch").expect("batch");
+        let batch_props = batch.input_schema["properties"].as_object().unwrap();
+        assert!(batch_props.contains_key("background"));
+        assert!(!batch_props.contains_key("wake"));
+        assert!(router.get("job_start").is_none());
+        assert!(router.get("job_restart").is_none());
+
+        if let Some(shell) = router.get(crate::mcp::shell_tool_name()) {
+            let shell_props = shell.input_schema["properties"].as_object().unwrap();
+            assert!(shell_props.contains_key("background"));
+            assert!(!shell_props.contains_key("wake"));
+        }
+    }
+
+    #[test]
+    fn jobs_read_schema_uses_profile_result_ceiling_and_has_no_filter() {
+        let mut read = LocalMachine::all_tools().get("jobs_read").cloned().unwrap();
+        with_job_limits(&mut read, 3600, 8 * 1024 * 1024);
+        let output_limit = &read.input_schema["properties"]["limit"];
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
         assert!(
-            output_limit["description"]
-                .as_str()
+            !read.input_schema["properties"]
+                .as_object()
                 .unwrap()
-                .contains("8388608")
+                .contains_key("filter")
         );
     }
 }

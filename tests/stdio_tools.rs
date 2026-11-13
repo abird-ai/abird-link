@@ -323,13 +323,11 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
             "edit",
             "find",
             "grep",
-            "job_ack",
-            "job_cancel",
-            "job_get",
-            "job_list",
-            "job_output",
-            "job_restart",
-            "job_start",
+            "jobs_ack",
+            "jobs_cancel",
+            "jobs_get",
+            "jobs_list",
+            "jobs_read",
             "ls",
             "mv",
             "patch",
@@ -412,26 +410,33 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
 
     let started = call(
         17,
-        "job_start",
-        json!({"ops": [["read", {"path": "nested/a.txt", "numbered": false}]]}),
+        "batch",
+        json!({
+            "ops": [["read", {"path": "nested/a.txt", "numbered": false}]],
+            "background": true
+        }),
     );
-    let started: Value = serde_json::from_str(text_of(&started)).unwrap();
-    let job_id = started["job_id"].as_str().unwrap().to_owned();
+    let job_ref = text_of(&started)
+        .split_whitespace()
+        .next()
+        .expect("background batch returns compact Job ref")
+        .to_owned();
+    assert!(job_ref.starts_with("j:"), "{job_ref}");
 
     let terminal = loop {
-        let status = call(18, "job_get", json!({"id": job_id}));
-        let status: Value = serde_json::from_str(text_of(&status)).unwrap();
-        if status["status"] != "working" {
+        let status = call(18, "jobs_get", json!({"ref": job_ref, "wait_ms": 100}));
+        let status = text_of(&status).to_owned();
+        if status.contains(" settled ") || status.contains(" cancelled ") {
             break status;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
     };
-    assert_eq!(terminal["status"], "completed", "{terminal}");
+    assert!(terminal.contains(" outcome=ok"), "{terminal}");
 
+    let node_ref = format!("{job_ref}/n:1");
     let output = call(
         19,
-        "job_output",
-        json!({"id": job_id, "node": 1, "stream": "result", "encoding": "text"}),
+        "jobs_read",
+        json!({"ref": node_ref, "view": "result", "encoding": "text"}),
     );
     let output: Value = serde_json::from_str(text_of(&output)).unwrap();
     assert!(
@@ -443,25 +448,27 @@ fn stdio_advertises_the_tool_surface_and_serves_every_tool() {
     let acknowledged = output["next_offset"].as_u64().unwrap();
     call(
         20,
-        "job_ack",
-        json!({"id": job_id, "node": 1, "stream": "result", "offset": acknowledged}),
+        "jobs_ack",
+        json!({"ref": node_ref, "view": "result", "offset": acknowledged}),
     );
 
-    let listed_jobs = call(21, "job_list", json!({"offset": 0, "limit": 64}));
-    let listed_jobs: Value = serde_json::from_str(text_of(&listed_jobs)).unwrap();
-    assert!(
-        listed_jobs["jobs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|job| job["job_id"] == job_id),
-        "{listed_jobs}"
-    );
-    call(22, "job_cancel", json!({"id": job_id}));
+    let listed_jobs = call(21, "jobs_list", json!({"limit": 64}));
+    assert!(text_of(&listed_jobs).contains(&job_ref), "{listed_jobs}");
+    call(22, "jobs_cancel", json!({"ref": job_ref}));
 
-    let restarted = call(23, "job_restart", json!({"id": job_id}));
-    let restarted: Value = serde_json::from_str(text_of(&restarted)).unwrap();
-    assert_ne!(restarted["job_id"], job_id);
+    let fresh = call(
+        23,
+        "batch",
+        json!({
+            "ops": [["read", {"path": "nested/a.txt", "numbered": false}]],
+            "background": true
+        }),
+    );
+    let fresh_ref = text_of(&fresh)
+        .split_whitespace()
+        .next()
+        .expect("fresh batch returns compact Job ref");
+    assert_ne!(fresh_ref, job_ref);
     probe.finish();
 
     assert_eq!(

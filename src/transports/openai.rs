@@ -3230,7 +3230,7 @@ fn annotate_response_context(
     }
     let name = jsonrpc.pointer("/params/name").and_then(Value::as_str);
     let shell = tools_call && name.is_some_and(crate::mcp::is_shell_tool);
-    let durable_shell = shell || (tools_call && name == Some("job_start"));
+    let durable_shell = shell || (tools_call && name == Some("batch"));
     // Missing and null metadata are both valid MCP representations. Normalize
     // either to an object before adding authenticated transport constraints.
     let Some(params) = jsonrpc.get_mut("params").and_then(Value::as_object_mut) else {
@@ -3386,8 +3386,7 @@ fn replay_protected_tool_call(jsonrpc: &Value) -> bool {
 }
 
 fn durable_shell_tool_call(jsonrpc: &Value) -> bool {
-    tool_call_name(jsonrpc)
-        .is_some_and(|name| crate::mcp::is_shell_tool(name) || name == "job_start")
+    tool_call_name(jsonrpc).is_some_and(|name| crate::mcp::is_shell_tool(name) || name == "batch")
 }
 
 fn verbose_request_label(jsonrpc: &Value) -> String {
@@ -3933,6 +3932,7 @@ mod tests {
                 shell_args.clone(),
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 Some(request_key.clone()),
+                false,
             )
             .unwrap();
         drop(original);
@@ -3954,6 +3954,7 @@ mod tests {
                     },
                     aw_tools::filesystem::batch::NodeTool::Bash,
                     None,
+                    false,
                 ) {
                     Ok(started) => {
                         // An abandoned local response is deliberately exposed as
@@ -5616,6 +5617,7 @@ mod tests {
                 },
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 Some(request_key.clone()),
+                false,
             )
             .unwrap();
         let job_id = started.id.clone();
@@ -5690,7 +5692,7 @@ mod tests {
                 &BTreeMap::new(),
                 &json!({
                     "jsonrpc":"2.0", "id":1, "method":"tools/call",
-                    "params":{"name":"job_list","arguments":{}}
+                    "params":{"name":"jobs_list","arguments":{}}
                 }),
             )
             .await
@@ -5700,7 +5702,7 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.to_string().contains(&job_id)),
-            "retired shell execution must remain discoverable through job_list"
+            "retired shell execution must remain discoverable through jobs_list"
         );
     }
 
@@ -7052,11 +7054,11 @@ name"
         let background = json!({
             "jsonrpc":"2.0", "id":1, "method":"tools/call",
             "params": {
-                "name":"job_start",
+                "name":"batch",
                 "arguments": {"ops":[["bash", {
                     "command": format!("printf held > '{}'; sleep 1", marker.display()),
                     "timeout_secs": 3
-                }]]}
+                }]],"background":true}
             }
         });
         mcp.dispatch(&BTreeMap::new(), &background).await.unwrap();
@@ -7188,35 +7190,40 @@ name"
                 &headers,
                 &call(
                     1,
-                    "job_start",
-                    json!({"ops":[["bash", {"command":"printf started; sleep 5", "timeout_secs":8}]]}),
+                    "batch",
+                    json!({"ops":[["bash", {"command":"printf started; sleep 5", "timeout_secs":8}]],"background":true}),
                 ),
             )
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
         let created = terminal(&created, 1);
-        let receipt: Value =
-            serde_json::from_str(created["result"]["content"][0]["text"].as_str().unwrap())
-                .unwrap();
-        let job_id = receipt["job_id"].as_str().unwrap().to_owned();
+        let created_text = created["result"]["content"][0]["text"].as_str().unwrap();
+        let job_ref = created_text
+            .split_whitespace()
+            .next()
+            .expect("background Graph ref")
+            .to_owned();
+        assert!(job_ref.starts_with("j:"), "{created_text}");
 
         // The running job owns the serialize gate. Control tools must bypass
         // that gate or they would be unusable until the job had already ended.
         let polled_at = Instant::now();
         let polled = mcp
-            .dispatch(&headers, &call(2, "job_get", json!({"job_id":job_id})))
+            .dispatch(&headers, &call(2, "jobs_get", json!({"ref":job_ref})))
             .await
             .unwrap();
         assert!(polled_at.elapsed() < Duration::from_secs(1));
         let polled = terminal(&polled, 2);
-        let status: Value =
-            serde_json::from_str(polled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(status["status"], "working");
+        let status = polled["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            status.contains(" running ") || status.contains(" waiting "),
+            "{status}"
+        );
 
         let cancelled_at = Instant::now();
         let cancelled = mcp
-            .dispatch(&headers, &call(3, "job_cancel", json!({"job_id":job_id})))
+            .dispatch(&headers, &call(3, "jobs_cancel", json!({"ref":job_ref})))
             .await
             .unwrap();
         assert!(cancelled_at.elapsed() < Duration::from_secs(1));
@@ -7227,24 +7234,23 @@ name"
             let polled = mcp
                 .dispatch(
                     &headers,
-                    &call(10 + attempt, "job_get", json!({"job_id":job_id})),
+                    &call(10 + attempt, "jobs_get", json!({"ref":job_ref})),
                 )
                 .await
                 .unwrap();
             let polled = terminal(&polled, 10 + attempt);
-            let value: Value =
-                serde_json::from_str(polled["result"]["content"][0]["text"].as_str().unwrap())
-                    .unwrap();
-            if value["status"] != "working" {
-                final_status = value["status"].as_str().map(str::to_owned);
+            let value = polled["result"]["content"][0]["text"].as_str().unwrap();
+            if value.contains(" cancelled ") || value.contains(" settled ") {
+                final_status = Some(value.to_owned());
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        #[cfg(windows)]
-        assert_eq!(final_status.as_deref(), Some("cancelled"));
-        #[cfg(unix)]
-        assert_eq!(final_status.as_deref(), Some("unknown"));
+        let final_status = final_status.expect("cancelled Graph must settle");
+        assert!(
+            final_status.contains(" cancelled ") || final_status.contains(" outcome=unknown"),
+            "{final_status}"
+        );
     }
 
     #[test]
@@ -7688,13 +7694,22 @@ name"
 
         // Explicit background jobs carry request identity but no synchronous
         // wait budget because they return immediately by definition.
-        let mut job_start = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"job_start","arguments":{"command":"true"}}});
+        let mut background_batch = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"batch","arguments":{"ops":[["read",{"path":"a"}]],"background":true}}});
         assert_eq!(
-            annotate_response_context(&mut job_start, window, reserve, "job-request", "token"),
+            annotate_response_context(
+                &mut background_batch,
+                window,
+                reserve,
+                "job-request",
+                "token"
+            ),
             Ok(None)
         );
-        assert_eq!(request_meta(&job_start), Some("job-request".to_owned()));
-        assert_eq!(sync_meta(&job_start), None);
+        assert_eq!(
+            request_meta(&background_batch),
+            Some("job-request".to_owned())
+        );
+        assert_eq!(sync_meta(&background_batch), None);
 
         // Every tools/call gets the serialized result budget, while only
         // durable shell calls get request identity / synchronous-window metadata.
@@ -7888,10 +7903,12 @@ name"
         let receipt_text = message["result"]["content"][0]["text"]
             .as_str()
             .expect("durable shell receipt text");
-        let receipt: Value = serde_json::from_str(receipt_text).unwrap();
-        assert_eq!(receipt["async"], true, "{receipt}");
-        assert_eq!(receipt["timeout_secs"], 600, "{receipt}");
-        assert!(receipt["job_id"].as_str().is_some(), "{receipt}");
+        assert!(
+            receipt_text.starts_with("j:")
+                && receipt_text.contains(" process ")
+                && (receipt_text.contains(" running ") || receipt_text.contains(" waiting ")),
+            "{receipt_text}"
+        );
     }
 
     #[test]

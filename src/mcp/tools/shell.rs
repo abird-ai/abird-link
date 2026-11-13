@@ -35,7 +35,7 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken as DrainStop, task::AbortOnDropHandle};
 
-use super::{LocalMachine, dot, resolve_capped, tool_error};
+use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
 #[cfg(target_os = "linux")]
 use crate::mcp::{
     AccessPolicy, ShellGuards, guard_identities, validate_host_mount_policy, validate_shell_guards,
@@ -43,7 +43,7 @@ use crate::mcp::{
 use crate::{
     jobs::{
         JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobStatus, JobWait,
-        SharedShellWriters, SpoolWriterGuard, StreamSummary,
+        ProcessInput, ProcessInputRequest, SharedShellWriters, SpoolWriterGuard, StreamSummary,
     },
     mcp::RuntimeConfig,
 };
@@ -91,6 +91,53 @@ pub(crate) struct ShellArgs {
     /// [] means the caller expects no writes. Never filesystem authority.
     #[serde(default)]
     pub(crate) writes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShellCallArgs {
+    pub(crate) command: String,
+    #[serde(default = "dot")]
+    pub(crate) dir: String,
+    #[serde(default)]
+    pub(crate) stdin: Option<String>,
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub(crate) max_output_bytes: Option<usize>,
+    #[serde(default)]
+    pub(crate) writes: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) interactive: bool,
+    #[serde(default)]
+    pub(crate) background: bool,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+}
+
+pub(crate) struct ShellJobRun {
+    pub(crate) command: Command,
+    pub(crate) stdin_text: Option<String>,
+    pub(crate) interactive: bool,
+    pub(crate) deadline: Instant,
+    pub(crate) job: JobHandle,
+    pub(crate) coordinate: usize,
+    pub(crate) shared_writers: SharedShellWriters,
+    pub(crate) result_context: JobResultContext,
+}
+
+impl ShellCallArgs {
+    fn execution_args(&self) -> ShellArgs {
+        let _display_title = &self.title;
+        ShellArgs {
+            command: self.command.clone(),
+            dir: self.dir.clone(),
+            stdin: self.stdin.clone(),
+            timeout_secs: self.timeout_secs,
+            max_output_bytes: self.max_output_bytes,
+            writes: self.writes.clone(),
+        }
+    }
 }
 
 /// Shell progress is a bare heartbeat: the caller cannot know how much of an
@@ -164,7 +211,7 @@ fn shell_timeout_description(max_secs: u64) -> String {
 
 fn shell_output_description(max_bytes: usize) -> String {
     format!(
-        "Ordinary shell-result byte limit per stream. Defaults to {max_bytes} and is capped there. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output."
+        "Ordinary shell-result byte limit per stream. Defaults to {max_bytes} and is capped there. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same j:<handle> and retained output is paged with jobs_read."
     )
 }
 
@@ -255,6 +302,7 @@ async fn spool_shared_job_output<R>(
     mut reader: R,
     writer: aw_tools::filesystem::job_manager::OutputWriter,
     writer_guard: SpoolWriterGuard,
+    job: JobHandle,
     stop: DrainStop,
 ) -> std::io::Result<()>
 where
@@ -295,9 +343,12 @@ where
             failed = Some(std::io::Error::other(format!(
                 "shared output append failed: {error:?}"
             )));
+        } else {
+            job.notify_output_changed();
         }
     }
     let finish = sink.finish();
+    job.notify_output_changed();
     if let Some(error) = failed {
         return Err(error);
     }
@@ -2013,7 +2064,7 @@ impl LocalMachine {
         shell_tool: aw_tools::filesystem::batch::NodeTool,
         heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<CallToolResult, McpError> {
-        let started = match self.start_shell_job(args, shell_tool, None) {
+        let started = match self.start_shell_job(args, shell_tool, None, false) {
             Ok(started) => started,
             Err(error) => return Ok(tool_error(error)),
         };
@@ -2084,7 +2135,13 @@ impl LocalMachine {
                     })?;
                 Ok(CallToolResponse::Complete(result))
             }
-            JobHandoff::Compatibility(receipt) => Ok(CallToolResponse::Complete(receipt)),
+            JobHandoff::Compatibility(_) => {
+                let (_, status) = self
+                    .jobs
+                    .standalone_status(id, None)
+                    .map_err(crate::jobs::JobError::into_mcp)?;
+                Ok(CallToolResponse::Complete(ok_text(status)))
+            }
             JobHandoff::NativeTask(task) => Ok(CallToolResponse::Task(CreateTaskResult::new(task))),
         }
     }
@@ -2169,6 +2226,36 @@ impl LocalMachine {
         })
     }
 
+    pub(crate) async fn send_process_input_checked(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        revision: Option<u64>,
+        input: crate::jobs::ProcessInput,
+    ) -> crate::jobs::JobResult<u64> {
+        if !self.has_tool_for_policy("jobs_send") {
+            return Err(crate::jobs::JobError::Unknown(
+                "jobs_send is no longer granted by current policy".into(),
+            ));
+        }
+        let tool = self.jobs.standalone_process_tool(id, node)?;
+        if !self.has_tool_for_policy(tool.name()) {
+            return Err(crate::jobs::JobError::Unknown(format!(
+                "Process interpreter {} is no longer granted",
+                tool.name()
+            )));
+        }
+        let expected_guard = self.jobs.standalone_shell_guard_generation(id)?;
+        if !self.shell_guard_generation_is_current(expected_guard) {
+            return Err(crate::jobs::JobError::Unknown(
+                "Process launcher/sandbox authority changed; live stdin is revoked".into(),
+            ));
+        }
+        self.jobs
+            .standalone_send_process_input(id, node, revision, input)
+            .await
+    }
+
     pub(crate) fn job_request_delivery_state(
         &self,
         request_key: &str,
@@ -2224,8 +2311,11 @@ impl LocalMachine {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
-        let args = serde_json::from_value::<ShellArgs>(Value::Object(arguments))
+        let call_args = serde_json::from_value::<ShellCallArgs>(Value::Object(arguments))
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let background = call_args.background;
+        let interactive = call_args.interactive;
+        let args = call_args.execution_args();
         let shell_tool = crate::mcp::shell_node_tool(name)
             .ok_or_else(|| McpError::invalid_params("unknown shell tool", None))?;
 
@@ -2235,7 +2325,7 @@ impl LocalMachine {
         // its requested timeout is long; a slow command keeps running after the
         // synchronous response window closes.
         let started = self
-            .start_shell_job(args, shell_tool, request_key)
+            .start_shell_job(args, shell_tool, request_key, interactive)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
         if !started.is_new
@@ -2247,6 +2337,18 @@ impl LocalMachine {
             return self
                 .response_from_handoff(&started.id, handoff, result_budget)
                 .map(Some);
+        }
+
+        if background {
+            let _ = self
+                .jobs
+                .expose_compatibility(&started.id)
+                .map_err(crate::jobs::JobError::into_mcp)?;
+            let (_, status) = self
+                .jobs
+                .standalone_status(&started.id, None)
+                .map_err(crate::jobs::JobError::into_mcp)?;
+            return Ok(Some(ok_text(status).into()));
         }
 
         let deadline = sync_budget_millis
@@ -2313,6 +2415,7 @@ impl LocalMachine {
         args: ShellArgs,
         shell_tool: aw_tools::filesystem::batch::NodeTool,
         request_key: Option<String>,
+        interactive: bool,
     ) -> Result<crate::jobs::JobStart> {
         if args.command.trim().is_empty() {
             anyhow::bail!("command must not be empty");
@@ -2338,6 +2441,7 @@ impl LocalMachine {
             "timeout_secs": timeout_secs,
             "max_output_bytes": output_limit,
             "writes": args.writes.clone(),
+            "interactive": interactive,
         });
         crate::blocking::run(|| {
             self.jobs.spawn(
@@ -2408,7 +2512,7 @@ impl LocalMachine {
                     };
                     crate::shell_process::configure(&mut command);
                     crate::credentials::hide_from_child(&mut command)
-                        .stdin(if args.stdin.is_some() {
+                        .stdin(if args.stdin.is_some() || interactive {
                             Stdio::piped()
                         } else {
                             Stdio::null()
@@ -2422,15 +2526,16 @@ impl LocalMachine {
                         network: runtime.config.allow_network,
                         timeout_secs,
                     };
-                    let completion = LocalMachine::run_shell_job(
+                    let completion = LocalMachine::run_shell_job(ShellJobRun {
                         command,
-                        args.stdin,
+                        stdin_text: args.stdin,
+                        interactive,
                         deadline,
                         job,
-                        1,
+                        coordinate: 1,
                         shared_writers,
                         result_context,
-                    )
+                    })
                     .await;
                     drop(operation_guard);
                     completion
@@ -2464,15 +2569,17 @@ impl LocalMachine {
         }
     }
 
-    pub(crate) async fn run_shell_job(
-        mut command: Command,
-        stdin_text: Option<String>,
-        deadline: Instant,
-        job: JobHandle,
-        coordinate: usize,
-        shared_writers: SharedShellWriters,
-        result_context: JobResultContext,
-    ) -> JobCompletion {
+    pub(crate) async fn run_shell_job(run: ShellJobRun) -> JobCompletion {
+        let ShellJobRun {
+            mut command,
+            stdin_text,
+            interactive,
+            deadline,
+            job,
+            coordinate,
+            shared_writers,
+            result_context,
+        } = run;
         if job.cancel.is_cancelled() {
             job.settle_node_unlaunched(coordinate);
             return JobCompletion::cancelled(StreamSummary::default(), StreamSummary::default())
@@ -2549,34 +2656,89 @@ impl LocalMachine {
             stdout,
             shared_writers.stdout,
             stdout_writer,
+            job.clone(),
             drain_stop.clone(),
         )));
         let mut stderr_task = AbortOnDropHandle::new(tokio::spawn(spool_shared_job_output(
             stderr,
             shared_writers.stderr,
             stderr_writer,
+            job.clone(),
             drain_stop.clone(),
         )));
 
-        let (mut stdin_task, mut stdin_rx) = match stdin_text {
-            Some(stdin_text) => match child.stdin.take() {
-                Some(mut stdin) => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let task = AbortOnDropHandle::new(tokio::spawn(async move {
-                        let result = stdin.write_all(stdin_text.as_bytes()).await;
-                        let _ = tx.send(result);
-                    }));
-                    (Some(task), Some(rx))
-                }
-                None => {
+        let mut stdin_task = if stdin_text.is_some() || interactive {
+            let Some(stdin) = child.stdin.take() else {
+                let _ = process_tree.terminate();
+                Self::terminate_child(&mut child).await;
+                stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
+                return JobCompletion::failed("failed to capture child stdin")
+                    .with_context(result_context);
+            };
+            if interactive {
+                let (sender, mut receiver) = tokio::sync::mpsc::channel::<ProcessInputRequest>(16);
+                if let Err(error) = job.install_process_input(coordinate, sender) {
                     let _ = process_tree.terminate();
                     Self::terminate_child(&mut child).await;
                     stop_and_quiesce_spool_tasks(&job, &drain_stop).await;
-                    return JobCompletion::failed("failed to capture child stdin")
-                        .with_context(result_context);
+                    return JobCompletion::failed(format!(
+                        "failed to retain interactive stdin custody: {error}"
+                    ))
+                    .with_context(result_context);
                 }
-            },
-            None => (None, None),
+                Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                    let mut stdin = Some(stdin);
+                    if let Some(initial) = stdin_text
+                        && let Some(writer) = stdin.as_mut()
+                    {
+                        match writer.write_all(initial.as_bytes()).await {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                                stdin.take();
+                                return Ok::<(), String>(());
+                            }
+                            Err(error) => {
+                                return Err(format!("failed writing initial stdin: {error}"));
+                            }
+                        }
+                    }
+                    while let Some(request) = receiver.recv().await {
+                        let result = match request.input {
+                            ProcessInput::Text(bytes) => match stdin.as_mut() {
+                                Some(writer) => writer
+                                    .write_all(&bytes)
+                                    .await
+                                    .map_err(|error| format!("failed writing stdin: {error}")),
+                                None => Err("Process stdin is already closed".to_owned()),
+                            },
+                            ProcessInput::Eof => {
+                                stdin.take();
+                                Ok(())
+                            }
+                        };
+                        let eof = stdin.is_none();
+                        let _ = request.response.send(result.clone());
+                        if result.is_err() || eof {
+                            break;
+                        }
+                    }
+                    Ok::<(), String>(())
+                })))
+            } else {
+                Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                    let mut stdin = stdin;
+                    let Some(initial) = stdin_text else {
+                        return Ok::<(), String>(());
+                    };
+                    match stdin.write_all(initial.as_bytes()).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                        Err(error) => Err(format!("failed writing stdin: {error}")),
+                    }
+                })))
+            }
+        } else {
+            None
         };
 
         enum WaitOutcome {
@@ -2595,26 +2757,24 @@ impl LocalMachine {
                     _ = sleep_until(deadline) => break WaitOutcome::Timeout,
                     result = &mut wait => break WaitOutcome::Child(result),
                     result = async {
-                        match stdin_rx.as_mut() {
-                            Some(rx) => rx.await,
+                        match stdin_task.as_mut() {
+                            Some(task) => task.await,
                             None => std::future::pending().await,
                         }
-                    }, if stdin_rx.is_some() => {
+                    }, if stdin_task.is_some() => {
                         match result {
                             Ok(Ok(())) => {
-                                stdin_rx = None;
                                 stdin_task.take();
+                                job.retire_process_input(coordinate);
                             }
-                            Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                                // Closing stdin early is a valid child behavior: the
-                                // supplied bytes are input, not a delivery contract.
-                                // Stop feeding the pipe and let the command's own exit
-                                // status decide success/failure.
-                                stdin_rx = None;
-                                stdin_task.take();
+                            Ok(Err(error)) => {
+                                job.retire_process_input(coordinate);
+                                break WaitOutcome::StdinFailure(error);
                             }
-                            Ok(Err(error)) => break WaitOutcome::StdinFailure(format!("failed writing stdin: {error}")),
-                            Err(_) => break WaitOutcome::StdinFailure("stdin writer task failed".to_owned()),
+                            Err(_) => {
+                                job.retire_process_input(coordinate);
+                                break WaitOutcome::StdinFailure("stdin writer task failed".to_owned());
+                            }
                         }
                     }
                 }
@@ -2660,6 +2820,7 @@ impl LocalMachine {
                 Self::terminate_child(&mut child).await;
             }
         }
+        job.retire_process_input(coordinate);
         if let Some(task) = stdin_task.take() {
             task.abort();
         }
@@ -2979,11 +3140,11 @@ impl LocalMachine {
     )]
     async fn bash(
         &self,
-        Parameters(args): Parameters<ShellArgs>,
+        Parameters(args): Parameters<ShellCallArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.run_shell_to_completion(
-            args,
+            args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Bash,
             ProgressHeartbeat::for_request(&context),
         )
@@ -3002,11 +3163,11 @@ impl LocalMachine {
     )]
     async fn pwsh(
         &self,
-        Parameters(args): Parameters<ShellArgs>,
+        Parameters(args): Parameters<ShellCallArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.run_shell_to_completion(
-            args,
+            args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Pwsh,
             ProgressHeartbeat::for_request(&context),
         )
@@ -3025,11 +3186,11 @@ impl LocalMachine {
     )]
     async fn powershell(
         &self,
-        Parameters(args): Parameters<ShellArgs>,
+        Parameters(args): Parameters<ShellCallArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         self.run_shell_to_completion(
-            args,
+            args.execution_args(),
             aw_tools::filesystem::batch::NodeTool::Powershell,
             ProgressHeartbeat::for_request(&context),
         )
@@ -3062,6 +3223,14 @@ mod tests {
         AccessNeed, AccessPolicy, AccessSpec, LocalMachine, MachineConfig, PreparedLaunchers,
         RuntimeConfig, SandboxCacheMount, TransportContextToken,
     };
+
+    fn compact_job_id(receipt: &str) -> &str {
+        receipt
+            .split_whitespace()
+            .next()
+            .and_then(|reference| reference.strip_prefix("j:"))
+            .expect("compact standalone Job receipt")
+    }
 
     #[cfg(unix)]
     fn direct_shell_machine(root: PathBuf, bash: PathBuf, max_bytes: usize) -> LocalMachine {
@@ -3671,6 +3840,7 @@ mod tests {
                 },
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
+                false,
             )
             .unwrap()
             .id;
@@ -3712,6 +3882,7 @@ mod tests {
                 },
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
+                false,
             )
             .unwrap();
         drop(third);
@@ -3749,6 +3920,7 @@ mod tests {
                 },
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
+                false,
             )
             .unwrap()
             .id;
@@ -3776,6 +3948,7 @@ mod tests {
                 },
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
+                false,
             )
             .unwrap()
             .id;
@@ -3896,10 +4069,10 @@ mod tests {
         assert!(output.contains("2048"), "{output}");
         // Non-shell product routes keep their static schemas. Canonical
         // filesystem routes are merged separately from aw-tools.
-        let job_get = LocalMachine::all_tools().get("job_get").cloned().unwrap();
+        let jobs_get = LocalMachine::all_tools().get("jobs_get").cloned().unwrap();
         assert_eq!(
-            with_profile_limits(job_get.clone(), 42, 2048).input_schema,
-            job_get.input_schema
+            with_profile_limits(jobs_get.clone(), 42, 2048).input_schema,
+            jobs_get.input_schema
         );
     }
 
@@ -4007,10 +4180,7 @@ mod tests {
             CallToolResponse::Complete(result) => {
                 let value = serde_json::to_value(result).unwrap();
                 let text = value["content"][0]["text"].as_str().unwrap();
-                serde_json::from_str::<Value>(text).unwrap()["job_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
+                compact_job_id(text).to_owned()
             }
             other => panic!("expected compatibility job receipt, got {other:?}"),
         };
@@ -4031,10 +4201,7 @@ mod tests {
             CallToolResponse::Complete(result) => {
                 let value = serde_json::to_value(result).unwrap();
                 let text = value["content"][0]["text"].as_str().unwrap();
-                serde_json::from_str::<Value>(text).unwrap()["job_id"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
+                compact_job_id(text).to_owned()
             }
             other => panic!("expected replayed compatibility receipt, got {other:?}"),
         };
@@ -4155,6 +4322,54 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shell_background_constructor_returns_same_standalone_job_ref() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command":"sleep 0.08; printf background",
+                "dir":".",
+                "timeout_secs":3,
+                "max_output_bytes":4096,
+                "background":true
+            }))
+            .unwrap(),
+        );
+        let response = machine
+            .handle_shell_call_with(
+                &request,
+                Some(5_000),
+                false,
+                Some("background-constructor".to_owned()),
+                Some(16 * 1024),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("shell interception");
+        let CallToolResponse::Complete(result) = response else {
+            panic!("background shell must return standalone Job receipt")
+        };
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        let reference = text.split_whitespace().next().expect("compact Job ref");
+        let id = reference
+            .strip_prefix("j:")
+            .expect("standalone Process ref");
+        assert!(!id.is_empty(), "{text}");
+        assert!(text.contains(" rev="), "{text}");
+        assert!(machine.jobs.standalone_status(id, None).is_ok());
+        assert!(matches!(
+            machine.jobs.wait_until(id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn completed_shell_result_that_cannot_fit_hands_off_the_same_job() {
         let Some(bash) = resolve_executable("bash") else {
             return;
@@ -4187,10 +4402,9 @@ mod tests {
             panic!("compatibility client should receive a compact job receipt")
         };
         let receipt_text = receipt.content[0].as_text().unwrap().text.as_str();
-        let receipt: Value = serde_json::from_str(receipt_text).unwrap();
-        assert_eq!(receipt["status"], "completed", "{receipt}");
-        assert_eq!(receipt["async"], true, "{receipt}");
-        let job_id = receipt["job_id"].as_str().unwrap();
+        assert!(receipt_text.contains(" process settled "), "{receipt_text}");
+        assert!(receipt_text.contains(" outcome=ok"), "{receipt_text}");
+        let job_id = compact_job_id(receipt_text);
         let page: Value = serde_json::from_str(
             &machine
                 .jobs
@@ -4237,9 +4451,8 @@ mod tests {
         let value = serde_json::to_value(receipt).unwrap();
         assert_ne!(value["isError"], true);
         let text = value["content"][0]["text"].as_str().unwrap();
-        let receipt: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(receipt["async"], true, "{receipt}");
-        let job_id = receipt["job_id"].as_str().unwrap();
+        assert!(text.contains(" process settled "), "{text}");
+        let job_id = compact_job_id(text);
         let status: Value = serde_json::from_str(&machine.jobs.status(job_id).unwrap()).unwrap();
         assert_eq!(status["status"], "completed");
         let output: Value = serde_json::from_str(
@@ -4403,9 +4616,8 @@ mod tests {
             panic!("unsafe native task result ceiling must use compatibility handoff")
         };
         let text = receipt.content[0].as_text().unwrap().text.as_str();
-        let receipt: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(receipt["async"], true);
-        assert!(receipt["job_id"].as_str().is_some());
+        assert!(text.starts_with("j:"), "{text}");
+        assert!(!compact_job_id(text).is_empty());
     }
 
     #[cfg(unix)]
@@ -4478,6 +4690,179 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_process_stdin_advances_revision_and_revocation_fences_before_bytes() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let started = machine
+            .start_shell_job(
+                ShellArgs {
+                    command: "cat".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(4096),
+                    writes: None,
+                },
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                None,
+                true,
+            )
+            .unwrap();
+        machine.jobs.expose_compatibility(&started.id).unwrap();
+
+        let (before, after) = {
+            let mut accepted = None;
+            for _ in 0..100 {
+                let (revision, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+                match machine
+                    .send_process_input_checked(
+                        &started.id,
+                        None,
+                        Some(revision),
+                        crate::jobs::ProcessInput::Text(b"allowed\n".to_vec()),
+                    )
+                    .await
+                {
+                    Ok(after) => {
+                        accepted = Some((revision, after));
+                        break;
+                    }
+                    Err(error) if error.to_string().contains("stdin is not interactive") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("interactive stdin setup failed: {error}"),
+                }
+            }
+            accepted.expect("interactive stdin custody became ready")
+        };
+        assert!(after > before, "accepted stdin must advance public Job rev");
+
+        let stale = machine
+            .send_process_input_checked(
+                &started.id,
+                None,
+                Some(before),
+                crate::jobs::ProcessInput::Text(b"stale\n".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale Job revision"), "{stale}");
+
+        machine
+            .jobs
+            .set_shell_guard_generation_for_test(&started.id, Some([9; 32]));
+        let (revoked_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let revoked = machine
+            .send_process_input_checked(
+                &started.id,
+                None,
+                Some(revoked_rev),
+                crate::jobs::ProcessInput::Text(b"blocked\n".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            revoked.to_string().contains("live stdin is revoked"),
+            "{revoked}"
+        );
+
+        machine
+            .jobs
+            .set_shell_guard_generation_for_test(&started.id, None);
+        let (eof_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let eof_after = machine
+            .send_process_input_checked(
+                &started.id,
+                None,
+                Some(eof_rev),
+                crate::jobs::ProcessInput::Eof,
+            )
+            .await
+            .unwrap();
+        assert!(eof_after > eof_rev);
+
+        assert!(matches!(
+            machine.jobs.wait_until(&started.id, None).await.unwrap(),
+            JobWait::Terminal
+        ));
+        let page: Value = serde_json::from_str(
+            &machine
+                .jobs
+                .output_node_page(
+                    &started.id,
+                    crate::jobs::OutputPageRequest {
+                        node: None,
+                        stream: Some(crate::jobs::JobOutputStream::Stdout),
+                        offset: 0,
+                        requested_bytes: 4096,
+                        response_ceiling: 16 * 1024,
+                        base64: false,
+                    },
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let data = page["data"].as_str().unwrap();
+        assert!(data.contains("allowed"), "{data}");
+        assert!(!data.contains("stale"), "{data}");
+        assert!(!data.contains("blocked"), "{data}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_read_wait_wakes_on_retained_bytes_without_polling_gap() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let started = machine
+            .start_shell_job(
+                ShellArgs {
+                    command: "sleep 0.08; printf delayed".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(4096),
+                    writes: None,
+                },
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                None,
+                false,
+            )
+            .unwrap();
+        machine.jobs.expose_compatibility(&started.id).unwrap();
+        let started_wait = Instant::now();
+        let page: Value = serde_json::from_str(
+            &machine
+                .jobs
+                .output_node_page_wait(
+                    &started.id,
+                    crate::jobs::OutputPageRequest {
+                        node: None,
+                        stream: Some(crate::jobs::JobOutputStream::Stdout),
+                        offset: 0,
+                        requested_bytes: 4096,
+                        response_ceiling: 16 * 1024,
+                        base64: false,
+                    },
+                    1_000,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(started_wait.elapsed() >= Duration::from_millis(40));
+        assert!(page["data"].as_str().unwrap().contains("delayed"), "{page}");
+    }
+
     #[tokio::test]
     async fn background_job_keeps_containment_until_inherited_pipes_finish() {
         let Some(bash) = resolve_executable("bash") else {
@@ -4499,6 +4884,7 @@ mod tests {
                 },
                 aw_tools::filesystem::batch::NodeTool::Bash,
                 None,
+                false,
             )
             .unwrap()
             .id;

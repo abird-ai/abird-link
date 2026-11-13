@@ -42,6 +42,7 @@ use aw_tools::filesystem::{
     },
     status::Primary as SharedPrimary,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::FutureExt as _;
 use rmcp::{
     ErrorData as McpError,
@@ -50,8 +51,9 @@ use rmcp::{
     },
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{Notify, RwLock, mpsc, oneshot},
     task::JoinHandle,
     time::Instant as TokioInstant,
 };
@@ -480,6 +482,16 @@ impl Drop for SharedJobLease {
 }
 
 #[derive(Debug)]
+pub(crate) enum ProcessInput {
+    Text(Vec<u8>),
+    Eof,
+}
+
+pub(crate) struct ProcessInputRequest {
+    pub(crate) input: ProcessInput,
+    pub(crate) response: oneshot::Sender<std::result::Result<(), String>>,
+}
+
 struct JobEntry {
     id: String,
     created: Instant,
@@ -521,6 +533,14 @@ struct JobEntry {
     /// Exact live Linux sandbox guard generation used to prepare this command.
     /// None for unsandboxed/non-Linux commands and pre-execution failures.
     shell_guard_generation: Option<[u8; 32]>,
+    /// Runner-owned live stdin command channels keyed by exact Process/Graph
+    /// coordinate. The ChildStdin itself never leaves the runner.
+    process_inputs: HashMap<usize, mpsc::Sender<ProcessInputRequest>>,
+    /// Highest raw offset actually returned through this host's standalone
+    /// jobs_read projection for each exact retained output owner. This is an
+    /// authorization fence for jobs_ack only; bytes remain owned by the shared
+    /// JobManager.
+    delivered_through: HashMap<(usize, JobOutputStream), u64>,
     /// RAII owner of the canonical shared lifecycle projection.
     shared_job: Option<SharedJobLease>,
     /// Serializes only sequence allocation + canonical shared lifecycle
@@ -534,6 +554,14 @@ struct JobEntry {
     /// rebased on positive delivery acknowledgement; execution completion stays
     /// independently represented by `terminal_at`.
     retention_anchor: Option<Instant>,
+    /// Immutable standalone list-exposure sequence. Assigned exactly once when
+    /// this execution first becomes user-visible; lifecycle activity never
+    /// changes it.
+    exposure_sequence: Option<u64>,
+    /// Monotonic public compare-and-act/observation token. Canonical lifecycle
+    /// and output truth stay in SharedJobManager; this projection also advances
+    /// for accepted Process input/control events.
+    public_revision: u64,
     notify: Arc<Notify>,
 }
 
@@ -559,6 +587,7 @@ struct JobState {
     closed: bool,
     jobs: HashMap<String, JobEntry>,
     request_jobs: HashMap<String, String>,
+    next_exposure_sequence: u64,
 }
 
 impl JobState {
@@ -1334,7 +1363,16 @@ impl JobHandle {
             .inner
             .upgrade()
             .ok_or_else(|| anyhow!("job session disappeared"))?;
-        transition(&inner.shared_jobs)
+        let outcome = transition(&inner.shared_jobs);
+        if outcome.is_ok() {
+            let mut state = inner.state.lock().expect("job manager lock");
+            if let Some(entry) = state.jobs.get_mut(&self.id) {
+                entry.public_revision = entry.public_revision.saturating_add(1);
+                entry.updated_at = chrono::Utc::now().to_rfc3339();
+                entry.notify.notify_waiters();
+            }
+        }
+        outcome
     }
 
     #[cfg(test)]
@@ -1431,6 +1469,59 @@ impl JobHandle {
         }
     }
 
+    pub(crate) fn install_process_input(
+        &self,
+        coordinate: usize,
+        sender: mpsc::Sender<ProcessInputRequest>,
+    ) -> Result<()> {
+        if coordinate == 0 {
+            bail!("Process input coordinate must be positive");
+        }
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("job session disappeared before stdin custody"))?;
+        let mut state = inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available_mut(&self.id)
+            .ok_or_else(|| anyhow!("job disappeared before stdin custody"))?;
+        if entry.completion.is_some() {
+            bail!("job settled before stdin custody");
+        }
+        if entry.process_inputs.insert(coordinate, sender).is_some() {
+            bail!("Process stdin custody already installed for node {coordinate}");
+        }
+        entry.public_revision = entry.public_revision.saturating_add(1);
+        entry.updated_at = chrono::Utc::now().to_rfc3339();
+        entry.notify.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn notify_output_changed(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if let Ok(state) = inner.state.lock()
+            && let Some(entry) = state.jobs.get(&self.id)
+        {
+            entry.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn retire_process_input(&self, coordinate: usize) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut state = inner.state.lock().expect("job manager lock");
+        if let Some(entry) = state.jobs.get_mut(&self.id)
+            && entry.process_inputs.remove(&coordinate).is_some()
+        {
+            entry.public_revision = entry.public_revision.saturating_add(1);
+            entry.updated_at = chrono::Utc::now().to_rfc3339();
+            entry.notify.notify_waiters();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_running(&self, shell_guard_generation: Option<[u8; 32]>) -> bool {
         let Some(inner) = self.inner.upgrade() else {
@@ -1448,6 +1539,7 @@ impl JobHandle {
         }
         entry.phase = JobPhase::Running;
         entry.shell_guard_generation = shell_guard_generation;
+        entry.public_revision = entry.public_revision.saturating_add(1);
         entry.updated_at = chrono::Utc::now().to_rfc3339();
         entry.notify.notify_waiters();
         true
@@ -1538,7 +1630,7 @@ impl JobStream {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum JobOutputStream {
     Result,
     Stdout,
@@ -1666,7 +1758,7 @@ impl From<anyhow::Error> for JobError {
     }
 }
 
-type JobResult<T> = std::result::Result<T, JobError>;
+pub(crate) type JobResult<T> = std::result::Result<T, JobError>;
 
 #[derive(Debug, Serialize)]
 struct JobOutputPage<'a> {
@@ -2005,10 +2097,14 @@ impl JobManager {
                 retention: RetentionClass::Ordinary,
                 request_key: request_key.clone(),
                 shell_guard_generation: None,
+                process_inputs: HashMap::new(),
+                delivered_through: HashMap::new(),
                 shared_job: None,
                 shared_transition_gate: shared_transition_gate.clone(),
                 shared_graph_authoritative: false,
                 retention_anchor: None,
+                exposure_sequence: None,
+                public_revision: 1,
                 notify,
             },
         );
@@ -2140,10 +2236,14 @@ impl JobManager {
                 retention: RetentionClass::Ordinary,
                 request_key: None,
                 shell_guard_generation: None,
+                process_inputs: HashMap::new(),
+                delivered_through: HashMap::new(),
                 shared_job: None,
                 shared_transition_gate: shared_transition_gate.clone(),
                 shared_graph_authoritative: false,
                 retention_anchor: None,
+                exposure_sequence: None,
+                public_revision: 1,
                 notify: Arc::new(Notify::new()),
             },
         );
@@ -2236,6 +2336,7 @@ impl JobManager {
             .ok_or_else(|| anyhow!("job execution policy is not bound"))
     }
 
+    #[cfg(test)]
     fn ensure_exposed_graph(&self, id: &str) -> Result<()> {
         let state = self.inner.state.lock().expect("job manager lock");
         let entry = state
@@ -2248,6 +2349,7 @@ impl JobManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_graph(&self, id: &str) -> Result<SharedGraph> {
         self.ensure_exposed_graph(id)?;
         self.inner
@@ -2256,6 +2358,7 @@ impl JobManager {
             .map_err(|error| anyhow!("shared Graph is unavailable: {error:?}"))
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_snapshot(&self, id: &str) -> Result<SharedSnapshot> {
         self.ensure_exposed_graph(id)?;
         self.inner
@@ -2387,6 +2490,471 @@ impl JobManager {
         Duration::from_secs(self.inner.retention_secs.load(Ordering::Relaxed))
     }
 
+    /// Authenticated live-runtime generation consumed by the D2 remote Start bridge.
+    #[allow(dead_code)]
+    pub(crate) fn runtime_generation_fingerprint(&self) -> [u8; 32] {
+        self.inner.session_fingerprint
+    }
+
+    fn standalone_list_cursor(&self, before_exposure: u64) -> String {
+        let mut bytes = before_exposure.to_be_bytes().to_vec();
+        let mut hash = Sha256::new();
+        hash.update(b"dotlink-jobs-list-cursor-v1\0");
+        hash.update(self.inner.session_fingerprint);
+        hash.update(before_exposure.to_be_bytes());
+        bytes.extend_from_slice(&hash.finalize()[..16]);
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn parse_standalone_list_cursor(&self, cursor: &str) -> JobResult<u64> {
+        if cursor.is_empty() || cursor.len() > 128 {
+            return Err(JobError::Unknown("invalid jobs_list cursor".into()));
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(cursor)
+            .map_err(|_| JobError::Unknown("invalid jobs_list cursor".into()))?;
+        if bytes.len() != 24 {
+            return Err(JobError::Unknown("invalid jobs_list cursor".into()));
+        }
+        let mut sequence = [0u8; 8];
+        sequence.copy_from_slice(&bytes[..8]);
+        let sequence = u64::from_be_bytes(sequence);
+        let mut hash = Sha256::new();
+        hash.update(b"dotlink-jobs-list-cursor-v1\0");
+        hash.update(self.inner.session_fingerprint);
+        hash.update(sequence.to_be_bytes());
+        if hash.finalize()[..16] != bytes[8..] {
+            return Err(JobError::Unknown(
+                "stale or unauthorized jobs_list cursor".into(),
+            ));
+        }
+        Ok(sequence)
+    }
+
+    pub(crate) fn standalone_ref(id: &str, node: Option<usize>) -> String {
+        match node {
+            Some(node) => format!("j:{id}/n:{node}"),
+            None => format!("j:{id}"),
+        }
+    }
+
+    fn compact_root_status(&self, entry: &JobEntry) -> JobResult<String> {
+        let reference = Self::standalone_ref(&entry.id, None);
+        let kind = if entry.shared_graph_authoritative {
+            "graph"
+        } else {
+            "process"
+        };
+        match self.inner.shared_jobs.runtime_snapshot(&entry.id) {
+            Ok(snapshot) => {
+                let state = match snapshot.lifecycle {
+                    SharedLifecycle::Running => {
+                        if entry.phase == JobPhase::Queued {
+                            "waiting"
+                        } else {
+                            "running"
+                        }
+                    }
+                    SharedLifecycle::Cancelling | SharedLifecycle::Revoking => "cancelling",
+                    SharedLifecycle::Terminal if snapshot.stop_reason.is_some() => "cancelled",
+                    SharedLifecycle::Terminal => "settled",
+                };
+                let mut row = format!("{reference} {kind} {state} rev={}", entry.public_revision);
+                if kind == "graph" && snapshot.total > 1 {
+                    row.push_str(&format!(" {}/{}", snapshot.finished, snapshot.total));
+                }
+                if snapshot.lifecycle == SharedLifecycle::Terminal {
+                    let outcome = snapshot
+                        .summary
+                        .map(|(primary, _, _)| primary.as_str())
+                        .unwrap_or("unknown");
+                    row.push_str(&format!(" outcome={outcome}"));
+                }
+                Ok(row)
+            }
+            Err(aw_tools::filesystem::job_manager::Error::NotFound)
+                if entry.shared_job.is_none() =>
+            {
+                let state = match (entry.phase, entry.status()) {
+                    (JobPhase::Queued, JobStatus::Working) => "waiting",
+                    (JobPhase::Running, JobStatus::Working) => {
+                        if entry.cancel.is_cancelled() {
+                            "cancelling"
+                        } else {
+                            "running"
+                        }
+                    }
+                    (_, JobStatus::Cancelled) => "cancelled",
+                    (_, _) => "settled",
+                };
+                let outcome = if entry.status().terminal() {
+                    Some(match entry.status() {
+                        JobStatus::Completed
+                            if entry.completion.as_ref().is_some_and(|c| c.success) =>
+                        {
+                            "ok"
+                        }
+                        JobStatus::Cancelled => "cancelled",
+                        JobStatus::Unknown => "unknown",
+                        JobStatus::Working => unreachable!(),
+                        _ => "fail",
+                    })
+                } else {
+                    None
+                };
+                let mut row = format!("{reference} {kind} {state} rev={}", entry.public_revision);
+                if let Some(outcome) = outcome {
+                    row.push_str(&format!(" outcome={outcome}"));
+                }
+                Ok(row)
+            }
+            Err(error) => Err(JobError::Internal(anyhow!(
+                "cannot inspect shared Job status: {error:?}"
+            ))),
+        }
+    }
+
+    fn standalone_status_locked(
+        &self,
+        entry: &JobEntry,
+        node: Option<usize>,
+    ) -> JobResult<(u64, String)> {
+        let id = entry.id.as_str();
+        if let Some(node) = node {
+            if !entry.shared_graph_authoritative {
+                return Err(JobError::Unknown(
+                    "Process Job ref cannot contain a Graph node".into(),
+                ));
+            }
+            let node_state = self
+                .inner
+                .shared_jobs
+                .node_state(id, node)
+                .map_err(|error| JobError::Unknown(format!("unavailable Graph node: {error:?}")))?;
+            let (state_label, outcome) = match node_state {
+                SharedNodeState::Pending => ("waiting", None),
+                SharedNodeState::Claimed { .. } | SharedNodeState::Running { .. } => {
+                    ("running", None)
+                }
+                SharedNodeState::Terminal { status, .. } => {
+                    ("settled", Some(status.primary.as_str()))
+                }
+            };
+            let revision = entry.public_revision;
+            let reference = Self::standalone_ref(id, Some(node));
+            let mut rendered = format!("{reference} node {state_label} rev={revision}");
+            if let Some(outcome) = outcome {
+                rendered.push_str(&format!(" outcome={outcome}"));
+            }
+            return Ok((revision, rendered));
+        }
+        let rendered = self.compact_root_status(entry)?;
+        Ok((entry.public_revision, rendered))
+    }
+
+    pub(crate) fn standalone_status(
+        &self,
+        id: &str,
+        node: Option<usize>,
+    ) -> JobResult<(u64, String)> {
+        sweep_expired(&self.inner);
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        self.standalone_status_locked(entry, node)
+    }
+
+    pub(crate) async fn standalone_get(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        observed_revision: Option<u64>,
+        wait_ms: u64,
+    ) -> JobResult<String> {
+        const MAX_WAIT_MS: u64 = 30_000;
+        if wait_ms > MAX_WAIT_MS {
+            return Err(JobError::Unknown(format!(
+                "jobs_get wait_ms exceeds {MAX_WAIT_MS}"
+            )));
+        }
+        let deadline = TokioInstant::now()
+            .checked_add(Duration::from_millis(wait_ms))
+            .ok_or_else(|| JobError::Unknown("jobs_get wait window overflow".into()))?;
+        loop {
+            let (revision, rendered, notify, terminal) = {
+                sweep_expired(&self.inner);
+                let state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .available(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                let (revision, rendered) = self.standalone_status_locked(entry, node)?;
+                (
+                    revision,
+                    rendered,
+                    entry.notify.clone(),
+                    entry.status().terminal(),
+                )
+            };
+            let should_wait = wait_ms > 0
+                && !terminal
+                && observed_revision.is_none_or(|observed| observed == revision);
+            if !should_wait {
+                return Ok(rendered);
+            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (latest, _) = self.standalone_status(id, node)?;
+            if latest != revision {
+                continue;
+            }
+            if TokioInstant::now() >= deadline {
+                return Ok(rendered);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Ok(rendered);
+            }
+        }
+    }
+
+    pub(crate) fn standalone_list_fitted(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        fits: impl Fn(&str) -> bool,
+    ) -> JobResult<String> {
+        if !(1..=256).contains(&limit) {
+            return Err(JobError::Unknown(
+                "jobs_list limit must be within 1..=256".into(),
+            ));
+        }
+        sweep_expired(&self.inner);
+        let before = cursor
+            .map(|cursor| self.parse_standalone_list_cursor(cursor))
+            .transpose()?;
+        let state = self.inner.state.lock().expect("job manager lock");
+        let mut jobs = state
+            .jobs
+            .values()
+            .filter(|entry| {
+                entry.exposure_sequence.is_some()
+                    && !entry.expiration_pending
+                    && before.is_none_or(|before| entry.exposure_sequence.unwrap() < before)
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            right
+                .exposure_sequence
+                .cmp(&left.exposure_sequence)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let available = jobs.len();
+        let selected = jobs.into_iter().take(limit).collect::<Vec<_>>();
+        let render = |count: usize| -> JobResult<String> {
+            let mut rows = Vec::with_capacity(count + 1);
+            for entry in selected.iter().take(count) {
+                rows.push(self.compact_root_status(entry)?);
+            }
+            if count < available {
+                let boundary = selected
+                    .get(count.saturating_sub(1))
+                    .and_then(|entry| entry.exposure_sequence)
+                    .or(before)
+                    .unwrap_or(u64::MAX);
+                rows.push(format!(
+                    "more cursor={}",
+                    self.standalone_list_cursor(boundary)
+                ));
+            }
+            Ok(rows.join("\n"))
+        };
+        if selected.is_empty() {
+            let text = render(0)?;
+            return fits(&text).then_some(text).ok_or_else(|| {
+                JobError::Unknown("jobs_list response budget is too small for page metadata".into())
+            });
+        }
+        let mut best = None;
+        for count in 1..=selected.len() {
+            let candidate = render(count)?;
+            if fits(&candidate) {
+                best = Some(candidate);
+            } else {
+                break;
+            }
+        }
+        best.ok_or_else(|| {
+            JobError::Unknown(
+                "jobs_list response budget is too small for one complete Job row".into(),
+            )
+        })
+    }
+
+    pub(crate) fn standalone_process_tool(
+        &self,
+        id: &str,
+        node: Option<usize>,
+    ) -> JobResult<SharedNodeTool> {
+        sweep_expired(&self.inner);
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let coordinate = match (entry.shared_graph_authoritative, node) {
+            (false, None) => 1,
+            (false, Some(_)) => {
+                return Err(JobError::Unknown(
+                    "Process Job ref cannot contain a Graph node".into(),
+                ));
+            }
+            (true, Some(node)) if node > 0 => node,
+            (true, None) => {
+                return Err(JobError::Unknown(
+                    "Graph Process input requires an exact node ref".into(),
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(JobError::Unknown(
+                    "Graph node coordinate must be positive".into(),
+                ));
+            }
+        };
+        let shared = entry.shared_job.as_ref().ok_or_else(|| {
+            JobError::Unknown(
+                "Process stdin is not interactive, not ready, closed, or already settled".into(),
+            )
+        })?;
+        let graph = shared
+            .manager
+            .graph(id)
+            .map_err(|error| JobError::Unknown(format!("Process graph unavailable: {error:?}")))?;
+        let tool = graph
+            .steps()
+            .get(coordinate.saturating_sub(1))
+            .map(|step| step.tool)
+            .ok_or_else(|| JobError::Unknown(format!("unknown Graph node {coordinate}")))?;
+        if !tool.is_shell() {
+            return Err(JobError::Unknown(
+                "jobs_send target is not an interactive Process node".into(),
+            ));
+        }
+        Ok(tool)
+    }
+
+    pub(crate) fn standalone_shell_guard_generation(
+        &self,
+        id: &str,
+    ) -> JobResult<Option<[u8; 32]>> {
+        sweep_expired(&self.inner);
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        Ok(entry.shell_guard_generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_shell_guard_generation_for_test(
+        &self,
+        id: &str,
+        generation: Option<[u8; 32]>,
+    ) {
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let entry = state.jobs.get_mut(id).expect("test Job exists");
+        entry.shell_guard_generation = generation;
+        entry.public_revision = entry.public_revision.saturating_add(1);
+        entry.notify.notify_waiters();
+    }
+
+    pub(crate) async fn standalone_send_process_input(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        expected_revision: Option<u64>,
+        input: ProcessInput,
+    ) -> JobResult<u64> {
+        const MAX_INPUT_BYTES: usize = 64 * 1024;
+        if let ProcessInput::Text(bytes) = &input
+            && bytes.len() > MAX_INPUT_BYTES
+        {
+            return Err(JobError::Unknown(format!(
+                "jobs_send text exceeds {MAX_INPUT_BYTES} bytes"
+            )));
+        }
+        let (sender, revision) = {
+            sweep_expired(&self.inner);
+            let state = self.inner.state.lock().expect("job manager lock");
+            let entry = state
+                .available(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            if entry.status().terminal() {
+                return Err(JobError::Unknown(format!("job {id} is already terminal")));
+            }
+            let coordinate = match (entry.shared_graph_authoritative, node) {
+                (false, None) => 1,
+                (false, Some(_)) => {
+                    return Err(JobError::Unknown(
+                        "Process Job ref cannot contain a Graph node".into(),
+                    ));
+                }
+                (true, Some(node)) if node > 0 => node,
+                (true, None) => {
+                    return Err(JobError::Unknown(
+                        "Graph jobs_send requires an exact interactive node ref".into(),
+                    ));
+                }
+                (true, Some(_)) => {
+                    return Err(JobError::Unknown(
+                        "Graph node coordinate must be positive".into(),
+                    ));
+                }
+            };
+            let (revision, _) = self.standalone_status_locked(entry, node)?;
+            if expected_revision.is_some_and(|expected| expected != revision) {
+                return Err(JobError::Unknown(format!(
+                    "stale Job revision: expected {expected_revision:?}, current {revision}"
+                )));
+            }
+            let sender = entry
+                .process_inputs
+                .get(&coordinate)
+                .cloned()
+                .ok_or_else(|| {
+                    JobError::Unknown(
+                        "Process stdin is not interactive, not ready, closed, or already settled"
+                            .into(),
+                    )
+                })?;
+            (sender, revision)
+        };
+        let (response, received) = oneshot::channel();
+        sender
+            .send(ProcessInputRequest { input, response })
+            .await
+            .map_err(|_| {
+                JobError::Unknown(
+                    "Process stdin owner disappeared before delivery; inspect before retry".into(),
+                )
+            })?;
+        match received.await {
+            Ok(Ok(())) => {
+                let mut state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .available_mut(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                entry.public_revision = entry.public_revision.saturating_add(1);
+                entry.updated_at = chrono::Utc::now().to_rfc3339();
+                entry.notify.notify_waiters();
+                Ok(entry.public_revision.max(revision))
+            }
+            Ok(Err(message)) => Err(JobError::Unknown(message)),
+            Err(_) => Err(JobError::Unknown(
+                "Process stdin outcome is unknown; do not retry blindly".into(),
+            )),
+        }
+    }
+
     pub(crate) fn cancel(&self, id: &str) -> JobResult<String> {
         sweep_expired(&self.inner);
         let (should_cancel, transition_gate) = {
@@ -2447,11 +3015,14 @@ impl JobManager {
             .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
         if !entry.status().terminal() {
             entry.cancel.cancel();
+            entry.public_revision = entry.public_revision.saturating_add(1);
             entry.updated_at = chrono::Utc::now().to_rfc3339();
+            entry.notify.notify_waiters();
         }
         Ok(render_status_locked(&self.inner, entry))
     }
 
+    #[cfg(test)]
     pub(crate) fn status(&self, id: &str) -> JobResult<String> {
         sweep_expired(&self.inner);
         let state = self.inner.state.lock().expect("job manager lock");
@@ -2465,6 +3036,7 @@ impl JobManager {
     /// rendered page fits the host projection. The fit callback is deliberately
     /// transport-neutral: MCP can measure its exact outer wire representation
     /// while other hosts can apply their own response envelope.
+    #[cfg(test)]
     pub(crate) fn list_fitted(
         &self,
         offset: usize,
@@ -2602,11 +3174,11 @@ impl JobManager {
                 reserve_exposure_slot(&mut state, id)?;
                 self.reserve_shared_exposure(id, shared_owned)?;
                 self.expose_shared_job(id, shared_owned)?;
+                commit_exposure(&mut state, id, JobDisposition::Compatibility)?;
                 let entry = state
                     .jobs
-                    .get_mut(id)
+                    .get(id)
                     .expect("job validated before exposure capacity reservation");
-                commit_exposure(entry, JobDisposition::Compatibility);
                 Ok(compatibility_receipt(&self.inner, entry))
             }
             JobDisposition::Compatibility => Ok(compatibility_receipt(
@@ -2649,11 +3221,11 @@ impl JobManager {
         reserve_exposure_slot(&mut state, id)?;
         self.reserve_shared_exposure(id, shared_owned)?;
         self.expose_shared_job(id, shared_owned)?;
+        commit_exposure(&mut state, id, JobDisposition::NativeTask)?;
         let entry = state
             .jobs
-            .get_mut(id)
+            .get(id)
             .expect("job validated before exposure capacity reservation");
-        commit_exposure(entry, JobDisposition::NativeTask);
         Ok(Some(task_from_entry(entry, self.retention())))
     }
 
@@ -2687,18 +3259,15 @@ impl JobManager {
             reserve_exposure_slot(&mut state, id)?;
             self.reserve_shared_exposure(id, shared_owned)?;
             self.expose_shared_job(id, shared_owned)?;
-            let entry = state
-                .jobs
-                .get_mut(id)
-                .expect("job validated before exposure capacity reservation");
             commit_exposure(
-                entry,
+                &mut state,
+                id,
                 if native {
                     JobDisposition::NativeTask
                 } else {
                     JobDisposition::Compatibility
                 },
-            );
+            )?;
         }
         let entry = state
             .jobs
@@ -3037,34 +3606,27 @@ impl JobManager {
             return RequestRetirement::Busy;
         }
 
+        let newly_exposed = matches!(
+            disposition,
+            JobDisposition::Pending | JobDisposition::Synchronous
+        );
+        if newly_exposed && commit_exposure(&mut state, &id, JobDisposition::Compatibility).is_err()
+        {
+            return RequestRetirement::Busy;
+        }
+
         state.request_jobs.remove(request_key);
         let entry = state
             .jobs
             .get_mut(&id)
             .expect("request mapping validated above");
         entry.request_key = None;
-        let now = Instant::now();
-        match entry.disposition {
-            JobDisposition::Pending | JobDisposition::Synchronous => {
-                // The original transport response is no longer reachable. Expose
-                // the same durable execution through the compatibility surface.
-                // Once the transport key is gone it is ordinary user-visible
-                // retained state and must participate in the shared 256-job cap.
-                entry.disposition = JobDisposition::Compatibility;
-                if !release_shared_task_owner(entry) {
-                    entry.output_cleanup_pending = true;
-                }
-                entry.retention = RetentionClass::Ordinary;
-                entry.retention_anchor = Some(now);
-                entry.expiration_pending = false;
-            }
-            JobDisposition::Compatibility | JobDisposition::NativeTask => {
-                // The handle already exists; retirement merely starts a fresh
-                // user-visible retention window from the point transport replay
-                // ceased to be possible.
-                entry.retention_anchor = Some(now);
-                entry.expiration_pending = false;
-            }
+        if !newly_exposed {
+            // The handle already existed; retirement merely starts a fresh
+            // user-visible retention window from the point transport replay
+            // ceased to be possible.
+            entry.retention_anchor = Some(Instant::now());
+            entry.expiration_pending = false;
         }
         RequestRetirement::Retired
     }
@@ -3343,6 +3905,319 @@ impl JobManager {
     /// Graph-aware output projection. Existing one-shell compatibility entries
     /// retain their old stdout/stderr behavior; shared Jobs use structural node
     /// selection and the canonical shared output streams.
+    fn standalone_output_ready(
+        &self,
+        id: &str,
+        node: Option<usize>,
+        stream: Option<JobOutputStream>,
+        offset: u64,
+    ) -> JobResult<bool> {
+        let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
+        if let Some(manager) = shared {
+            return match manager.output_summary(id, coordinate, selected.shared()) {
+                Ok((summary, writer_finished)) => {
+                    Ok(summary.retained_bytes > offset || summary.truncated || writer_finished)
+                }
+                Err(aw_tools::filesystem::job_manager::Error::OutputMissing) => {
+                    let state = self.inner.state.lock().expect("job manager lock");
+                    let terminal = state
+                        .available(id)
+                        .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
+                        .status()
+                        .terminal();
+                    Ok(terminal)
+                }
+                Err(aw_tools::filesystem::job_manager::Error::OutputReleased) => Ok(true),
+                Err(error) => Err(JobError::Internal(anyhow!(
+                    "cannot observe job {id} output before wait: {error:?}"
+                ))),
+            };
+        }
+
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let legacy = selected
+            .legacy()
+            .ok_or_else(|| JobError::Unknown("legacy Process has no result stream".into()))?;
+        let stored = entry.completion.as_ref().map_or_else(
+            || stored_len(stream_path(entry, legacy), None),
+            |completion| match legacy {
+                JobStream::Stdout => completion.stdout.stored_bytes,
+                JobStream::Stderr => completion.stderr.stored_bytes,
+            },
+        );
+        let truncated = entry
+            .completion
+            .as_ref()
+            .is_some_and(|completion| match legacy {
+                JobStream::Stdout => completion.stdout.truncated,
+                JobStream::Stderr => completion.stderr.truncated,
+            });
+        Ok(stored > offset || truncated || entry.status().terminal())
+    }
+
+    pub(crate) fn standalone_is_graph(&self, id: &str) -> JobResult<bool> {
+        sweep_expired(&self.inner);
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        Ok(entry.shared_graph_authoritative)
+    }
+
+    fn record_standalone_delivery(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: JobOutputStream,
+        rendered: &str,
+    ) -> JobResult<()> {
+        let page: serde_json::Value = serde_json::from_str(rendered).map_err(|error| {
+            JobError::Internal(anyhow!(
+                "cannot inspect rendered jobs_read page for delivery fence: {error}"
+            ))
+        })?;
+        let through = page
+            .get("next_offset")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                JobError::Internal(anyhow!(
+                    "jobs_read page is missing next_offset delivery evidence"
+                ))
+            })?;
+        let mut state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available_mut(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let delivered = entry
+            .delivered_through
+            .entry((coordinate, stream))
+            .or_default();
+        *delivered = (*delivered).max(through);
+        Ok(())
+    }
+
+    fn require_standalone_delivery(
+        &self,
+        id: &str,
+        coordinate: usize,
+        stream: JobOutputStream,
+        through: u64,
+    ) -> JobResult<()> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let entry = state
+            .available(id)
+            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+        let delivered = entry
+            .delivered_through
+            .get(&(coordinate, stream))
+            .copied()
+            .unwrap_or(0);
+        if through > delivered {
+            return Err(JobError::Unknown(format!(
+                "jobs_ack offset {through} exceeds bytes delivered by jobs_read ({delivered})"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn standalone_graph_result_page(
+        &self,
+        id: &str,
+        offset: u64,
+        requested_bytes: usize,
+        response_ceiling: usize,
+        base64: bool,
+    ) -> JobResult<String> {
+        sweep_expired(&self.inner);
+        {
+            let state = self.inner.state.lock().expect("job manager lock");
+            let entry = state
+                .available(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            if !entry.shared_graph_authoritative {
+                return Err(JobError::Unknown(
+                    "Process Job root has no synthesized Graph result".into(),
+                ));
+            }
+        }
+        let render_limit = 16 * 1024 * 1024;
+        let rendered = self
+            .inner
+            .shared_jobs
+            .render_graph_result(id, render_limit)
+            .map_err(|error| match error {
+                aw_tools::filesystem::job_manager::Error::Busy => {
+                    JobError::Unknown("Graph result is not terminal".into())
+                }
+                other => JobError::Internal(anyhow!("Graph result projection failed: {other:?}")),
+            })?
+            .ok_or_else(|| {
+                JobError::Unknown(
+                    "Graph aggregate result is too large; read exact n:<coordinate> refs".into(),
+                )
+            })?;
+        let bytes = rendered.as_bytes();
+        let start = usize::try_from(offset)
+            .ok()
+            .filter(|offset| *offset <= bytes.len())
+            .ok_or_else(|| JobError::Unknown("jobs_read offset is past Graph result".into()))?;
+        let payload_ceiling =
+            job_output_payload_ceiling(response_ceiling).map_err(JobError::Internal)?;
+        let requested = requested_bytes.max(1);
+        let end = start.saturating_add(requested).min(bytes.len());
+        let snapshot = OutputSnapshot {
+            path: PathBuf::new(),
+            terminal: true,
+            stored: bytes.len() as u64,
+            total: Some(bytes.len() as u64),
+            truncated: false,
+            released: false,
+        };
+        let render = OutputPageRender {
+            id,
+            node: None,
+            stream: JobOutputStream::Result.label(),
+            offset,
+            stored_bytes: snapshot.stored,
+            total_bytes: snapshot.total,
+            truncated: false,
+            released: false,
+            base64,
+        };
+        fit_shared_output_page(&render, &bytes[start..end], &snapshot, payload_ceiling)
+            .map_err(JobError::Internal)
+    }
+
+    pub(crate) async fn standalone_graph_result_page_wait(
+        &self,
+        id: &str,
+        offset: u64,
+        requested_bytes: usize,
+        response_ceiling: usize,
+        base64: bool,
+        wait_ms: u64,
+    ) -> JobResult<String> {
+        const MAX_WAIT_MS: u64 = 30_000;
+        if wait_ms > MAX_WAIT_MS {
+            return Err(JobError::Unknown(format!(
+                "jobs_read wait_ms exceeds {MAX_WAIT_MS}"
+            )));
+        }
+        if wait_ms == 0 {
+            return self.standalone_graph_result_page(
+                id,
+                offset,
+                requested_bytes,
+                response_ceiling,
+                base64,
+            );
+        }
+        let deadline = TokioInstant::now()
+            .checked_add(Duration::from_millis(wait_ms))
+            .ok_or_else(|| JobError::Unknown("jobs_read wait window overflow".into()))?;
+        loop {
+            let (notify, terminal) = {
+                sweep_expired(&self.inner);
+                let state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .available(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                if !entry.shared_graph_authoritative {
+                    return Err(JobError::Unknown(
+                        "Process Job root has no synthesized Graph result".into(),
+                    ));
+                }
+                (entry.notify.clone(), entry.status().terminal())
+            };
+            if terminal {
+                return self.standalone_graph_result_page(
+                    id,
+                    offset,
+                    requested_bytes,
+                    response_ceiling,
+                    base64,
+                );
+            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let terminal_after_subscribe = {
+                let state = self.inner.state.lock().expect("job manager lock");
+                state
+                    .available(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
+                    .status()
+                    .terminal()
+            };
+            if terminal_after_subscribe {
+                continue;
+            }
+            if TokioInstant::now() >= deadline
+                || tokio::time::timeout_at(deadline, notified.as_mut())
+                    .await
+                    .is_err()
+            {
+                return self.standalone_graph_result_page(
+                    id,
+                    offset,
+                    requested_bytes,
+                    response_ceiling,
+                    base64,
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn output_node_page_wait(
+        &self,
+        id: &str,
+        request: OutputPageRequest,
+        wait_ms: u64,
+    ) -> JobResult<String> {
+        const MAX_WAIT_MS: u64 = 30_000;
+        if wait_ms > MAX_WAIT_MS {
+            return Err(JobError::Unknown(format!(
+                "jobs_read wait_ms exceeds {MAX_WAIT_MS}"
+            )));
+        }
+        if wait_ms == 0 {
+            return self.output_node_page(id, request);
+        }
+        let deadline = TokioInstant::now()
+            .checked_add(Duration::from_millis(wait_ms))
+            .ok_or_else(|| JobError::Unknown("jobs_read wait window overflow".into()))?;
+        loop {
+            let notify = {
+                sweep_expired(&self.inner);
+                let state = self.inner.state.lock().expect("job manager lock");
+                state
+                    .available(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
+                    .notify
+                    .clone()
+            };
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.standalone_output_ready(id, request.node, request.stream, request.offset)? {
+                return self.output_node_page(id, request);
+            }
+            if TokioInstant::now() >= deadline {
+                return self.output_node_page(id, request);
+            }
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                return self.output_node_page(id, request);
+            }
+        }
+    }
+
     pub(crate) fn output_node_page(
         &self,
         id: &str,
@@ -3359,14 +4234,16 @@ impl JobManager {
         sweep_expired(&self.inner);
         let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
         let Some(manager) = shared else {
-            return self.output_page(
+            let rendered = self.output_page(
                 id,
                 selected.legacy().expect("legacy target validated"),
                 offset,
                 requested_bytes,
                 response_ceiling,
                 base64,
-            );
+            )?;
+            self.record_standalone_delivery(id, coordinate, selected, &rendered)?;
+            return Ok(rendered);
         };
         let payload_ceiling =
             job_output_payload_ceiling(response_ceiling).map_err(JobError::Internal)?;
@@ -3460,8 +4337,10 @@ impl JobManager {
             released: snapshot.released,
             base64,
         };
-        fit_shared_output_page(&render, &page.bytes, &snapshot, payload_ceiling)
-            .map_err(JobError::Internal)
+        let rendered = fit_shared_output_page(&render, &page.bytes, &snapshot, payload_ceiling)
+            .map_err(JobError::Internal)?;
+        self.record_standalone_delivery(id, coordinate, selected, &rendered)?;
+        Ok(rendered)
     }
 
     pub(crate) fn acknowledge_node_output(
@@ -3472,7 +4351,13 @@ impl JobManager {
         offset: u64,
     ) -> JobResult<String> {
         sweep_expired(&self.inner);
+        if node.is_none() && self.standalone_is_graph(id)? {
+            return Err(JobError::Unknown(
+                "Graph root result is a synthesized aggregate; ACK an exact j:<handle>/n:<coordinate> retained result instead".into(),
+            ));
+        }
         let (shared, coordinate, selected) = self.resolve_output_target(id, node, stream)?;
+        self.require_standalone_delivery(id, coordinate, selected, offset)?;
         let Some(manager) = shared else {
             return self.acknowledge_output(
                 id,
@@ -3741,7 +4626,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         completion.error.clone()
     } else if completion.status == JobStatus::TimedOut {
         Some(format!(
-            "command timed out after {} seconds and was terminated; use job_start for explicitly background execution or retry with a different timeout when the caller and transport permit it",
+            "command timed out after {} seconds and was terminated; use the shell constructor with background:true for explicit durable background execution or retry with a different timeout when the caller and transport permit it",
             snapshot.timeout_secs
         ))
     } else {
@@ -4326,15 +5211,39 @@ fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
                 return;
             }
         }
-        commit_exposure(entry, JobDisposition::Compatibility);
+        let id = entry.id.clone();
+        let _ = entry;
+        let _ = commit_exposure(&mut state, &id, JobDisposition::Compatibility);
     }
 }
 
-fn commit_exposure(entry: &mut JobEntry, disposition: JobDisposition) {
+fn commit_exposure(state: &mut JobState, id: &str, disposition: JobDisposition) -> JobResult<()> {
     debug_assert!(matches!(
         disposition,
         JobDisposition::Compatibility | JobDisposition::NativeTask
     ));
+    let needs_sequence = state
+        .jobs
+        .get(id)
+        .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?
+        .exposure_sequence
+        .is_none();
+    let sequence = if needs_sequence {
+        state.next_exposure_sequence = state
+            .next_exposure_sequence
+            .checked_add(1)
+            .ok_or_else(|| JobError::Internal(anyhow!("job exposure sequence exhausted")))?;
+        Some(state.next_exposure_sequence)
+    } else {
+        None
+    };
+    let entry = state
+        .jobs
+        .get_mut(id)
+        .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+    if let Some(sequence) = sequence {
+        entry.exposure_sequence = Some(sequence);
+    }
     entry.disposition = disposition;
     if disposition == JobDisposition::Compatibility && !release_shared_task_owner(entry) {
         entry.output_cleanup_pending = true;
@@ -4342,6 +5251,7 @@ fn commit_exposure(entry: &mut JobEntry, disposition: JobDisposition) {
     entry.retention = RetentionClass::Ordinary;
     entry.retention_anchor = Some(Instant::now());
     entry.expiration_pending = false;
+    Ok(())
 }
 
 fn handoff_from_entry(
@@ -4624,6 +5534,7 @@ fn finish_inner(inner: &JobManagerInner, id: &str, completion: JobCompletion) {
             entry.stderr_retained = completion.stderr.stored_bytes;
         }
         entry.completion = Some(completion);
+        entry.public_revision = entry.public_revision.saturating_add(1);
         if !release_shared_task_owner(entry) {
             entry.output_cleanup_pending = true;
         }
@@ -9197,6 +10108,47 @@ mod tests {
             terminal.stop_reason,
             Some(aw_tools::filesystem::job::StopReason::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn standalone_cursor_is_runtime_generation_bound_and_job_ids_are_not_reused() {
+        let first = JobManager::new(Duration::from_secs(60)).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let job = first.create_for_test(30).unwrap();
+            first.finish(
+                &job.id,
+                JobCompletion::completed(
+                    Some(0),
+                    true,
+                    StreamSummary::default(),
+                    StreamSummary::default(),
+                ),
+            );
+            first.expose_compatibility(&job.id).unwrap();
+            ids.push(job.id.clone());
+        }
+        let page = first.standalone_list_fitted(None, 1, |_| true).unwrap();
+        let cursor = page
+            .lines()
+            .find_map(|line| line.strip_prefix("more cursor="))
+            .expect("strictly older cursor")
+            .to_owned();
+
+        let second = JobManager::new(Duration::from_secs(60)).unwrap();
+        let fresh = second.create_for_test(30).unwrap();
+        assert!(
+            !ids.contains(&fresh.id),
+            "new live runtime generation must never reuse a prior Job handle"
+        );
+        assert!(
+            second
+                .standalone_list_fitted(Some(&cursor), 1, |_| true)
+                .is_err(),
+            "cursor from another runtime generation must fail closed"
+        );
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
     }
 
     #[test]
