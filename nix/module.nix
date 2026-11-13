@@ -302,15 +302,53 @@
     # DOTLINK_CONFIG is a *base* path. With DOTLINK_PROFILE set, the loader
     # selects its sibling config.NAME.jsonc, which keeps credentials and
     # OAuth state independent for named declarative instances too.
+    ownsSettings = instance.settings != null;
+    # Policy the module itself declares. Each value is expressed in exactly one
+    # layer: inside the profile when the module writes one, otherwise in the
+    # environment. That keeps the usual order (CLI > environment > profile >
+    # default) meaningful instead of letting the module silently override the
+    # profile it just wrote.
+    grantedPermissions =
+      lib.filterAttrs (_: enabled: enabled) {
+        allow_shell = hostEnabled || instance.cacheAccess != {};
+        allow_nix_daemon = instance.hostAccess.nixDaemon;
+        allow_nix_config = instance.hostAccess.nixConfig;
+        allow_ssh_agent = instance.hostAccess.sshAgent;
+        allow_git_config = instance.hostAccess.gitConfig;
+        allow_kvm = instance.hostAccess.kvm;
+      }
+      // lib.optionalAttrs (instance.hostAccess.gpu != []) {
+        allow_gpu = instance.hostAccess.gpu;
+      };
+    # Only opt-in values are written: an option left at its default never
+    # overrides a profile the user set by hand.
+    declaredSettings =
+      instance.settings
+      // {
+        transports = (instance.settings.transports or {}) // {stdio = false;};
+      }
+      // lib.optionalAttrs (grantedPermissions != {}) {
+        permissions =
+          (instance.settings.permissions or {})
+          // grantedPermissions;
+      }
+      // lib.optionalAttrs instance.serialize {
+        serialize = true;
+      }
+      // lib.optionalAttrs (instance.logging.verbosity != "lifecycle") {
+        logging =
+          (instance.settings.logging or {})
+          // {verbosity = instance.logging.verbosity;};
+      };
     configPath =
-      if instance.settings != null
+      if ownsSettings
       then "${pkgs.writeTextDir
         (
           if profile == null
           then "config.jsonc"
           else "config.${profile}.jsonc"
         )
-        (builtins.toJSON (instance.settings // {version = 11;}))}/config.jsonc"
+        (builtins.toJSON (declaredSettings // {version = 11;}))}/config.jsonc"
       else instance.configFile;
     hostEnabled =
       instance.hostAccess.nixDaemon
@@ -327,29 +365,31 @@
     serviceEnv =
       instance.environment
       // {DOTLINK_SUPERVISOR = "systemd";}
-      // {
+      // {DOTLINK_COLOR = "never";}
+      # Profile policy is already in the profile this unit writes; repeating it
+      # in the environment would override the user's own settings.
+      // lib.optionalAttrs (!ownsSettings) {
         DOTLINK_STDIO = "0";
-        DOTLINK_COLOR = "never";
       }
-      // lib.optionalAttrs (hostEnabled || instance.cacheAccess != {}) {
+      // lib.optionalAttrs (!ownsSettings && (hostEnabled || instance.cacheAccess != {})) {
         DOTLINK_ALLOW_SHELL = "1";
       }
-      // lib.optionalAttrs instance.hostAccess.nixDaemon {
+      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.nixDaemon) {
         DOTLINK_ALLOW_NIX_DAEMON = "1";
       }
-      // lib.optionalAttrs instance.hostAccess.nixConfig {
+      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.nixConfig) {
         DOTLINK_ALLOW_NIX_CONFIG = "1";
       }
-      // lib.optionalAttrs instance.hostAccess.sshAgent {
+      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.sshAgent) {
         DOTLINK_ALLOW_SSH_AGENT = "1";
       }
-      // lib.optionalAttrs instance.hostAccess.gitConfig {
+      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.gitConfig) {
         DOTLINK_ALLOW_GIT_CONFIG = "1";
       }
-      // lib.optionalAttrs instance.hostAccess.kvm {
+      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.kvm) {
         DOTLINK_ALLOW_KVM = "1";
       }
-      // lib.optionalAttrs (instance.hostAccess.gpu != []) {
+      // lib.optionalAttrs (!ownsSettings && instance.hostAccess.gpu != []) {
         DOTLINK_ALLOW_GPU = lib.concatStringsSep "," instance.hostAccess.gpu;
       }
       // lib.optionalAttrs (instance.cacheAccess != {}) {
@@ -357,13 +397,13 @@
           lib.mapAttrsToList (name: mode: "${name}:${mode}") instance.cacheAccess
         );
       }
-      // lib.optionalAttrs instance.serialize {
+      // lib.optionalAttrs (!ownsSettings && instance.serialize) {
         DOTLINK_SERIALIZE = "1";
       }
       // lib.optionalAttrs (profile != null) {
         DOTLINK_PROFILE = profile;
       }
-      // lib.optionalAttrs (instance.logging.verbosity != "lifecycle") {
+      // lib.optionalAttrs (!ownsSettings && instance.logging.verbosity != "lifecycle") {
         DOTLINK_VERBOSITY = instance.logging.verbosity;
       }
       // lib.optionalAttrs (instance.sshAgentSocket != null) {

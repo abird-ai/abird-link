@@ -357,8 +357,9 @@ override the setting. See the README for the non-Linux fallback.
 | `"tools"` | Above + tool names, paths / command summaries, outcomes and timings |
 | `"requests"` | Above + MCP request diagnostics |
 
-These map to normal CLI output, `-v`, and `-vv`, and are passed as
-`DOTLINK_VERBOSITY` so a drop-in can override the level without touching the
+These map to normal CLI output, `-v`, and `-vv`. The module states the level
+once: inside the profile when it renders one (`settings`), otherwise as
+`DOTLINK_VERBOSITY`. Either way a drop-in can override it without touching the
 unit's command line. `RUST_LOG` is separately configurable using
 `environment.RUST_LOG`. Logs may include filesystem paths,
 tunnel IDs, public MCP URLs and bounded request metadata. Bulk payloads such as

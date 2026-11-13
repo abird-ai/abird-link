@@ -140,6 +140,9 @@
   };
 
   managedUnitText = managed.config.systemd.units."dotlink.service".text;
+  managedProfile =
+    builtins.fromJSON
+    (builtins.readFile "${managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG}");
 
   valid = cfg:
     lib.all
@@ -212,20 +215,27 @@
     (managed.config.systemd.services.dotlink.serviceConfig.SupplementaryGroups == ["kvm" "render" "video"])
     (lib.hasInfix "cargo-registry:ro" managed.config.systemd.services.dotlink.environment.DOTLINK_CACHES)
     (lib.hasInfix "go-mod:rw" managed.config.systemd.services.dotlink.environment.DOTLINK_CACHES)
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_ALLOW_KVM == "1")
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_ALLOW_GPU == "amd,nvidia")
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_ALLOW_NIX_DAEMON == "1")
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_ALLOW_SHELL == "1")
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_SERIALIZE == "1")
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_STDIO == "0")
+    # The module writes the profile, so policy lives there and not in the
+    # environment, which would otherwise override the user's own settings.
+    (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_ALLOW_KVM))
+    (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_SERIALIZE))
+    (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_STDIO))
+    (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_VERBOSITY))
     (managed.config.systemd.services.dotlink.environment.DOTLINK_COLOR == "never")
+    managedProfile.permissions.allow_kvm
+    managedProfile.permissions.allow_nix_daemon
+    managedProfile.permissions.allow_ssh_agent
+    managedProfile.permissions.allow_shell
+    (managedProfile.permissions.allow_gpu == ["amd" "nvidia"])
+    managedProfile.serialize
+    (!managedProfile.transports.stdio)
+    (managedProfile.logging.verbosity == "tools")
     (!(managed.config.systemd.services.dotlink.environment ? DOTLINK_PROFILE))
     (managed.config.systemd.services.dotlink-work.environment.DOTLINK_PROFILE == "work")
     (managed.config.systemd.services.dotlink.environment.DOTLINK_SSH_AGENT_SOCKET == "/run/user/1000/gcr/ssh")
     (lib.elem pkgs.nix managed.config.systemd.services.dotlink.path)
     (lib.elem pkgs.git managed.config.systemd.services.dotlink.path)
     (lib.elem pkgs.openssh managed.config.systemd.services.dotlink.path)
-    (managed.config.systemd.services.dotlink.environment.DOTLINK_VERBOSITY == "tools")
     (!(lib.hasInfix " -v" managed.config.systemd.services.dotlink.serviceConfig.ExecStart))
     (managed.config.systemd.services.dotlink-work.environment.DOTLINK_VERBOSITY == "requests")
     (!(lib.hasInfix " -vv" managed.config.systemd.services.dotlink-work.serviceConfig.ExecStart))

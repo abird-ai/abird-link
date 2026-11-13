@@ -1016,8 +1016,9 @@ async fn run_main(supervisor: &Supervisor) -> Result<()> {
     let (verbose, quiet) = resolve_verbosity(args.verbose, args.quiet, verbosity_env.as_deref())
         .map_err(recovery::config_failure)?;
     // An explicit `--color` wins; otherwise the environment may choose one.
+    let env_color = ColorMode::from_env().map_err(recovery::config_failure)?;
     let color = if args.color == ColorMode::Auto {
-        ColorMode::from_env().unwrap_or(args.color)
+        env_color.unwrap_or(args.color)
     } else {
         args.color
     };
@@ -1361,6 +1362,9 @@ async fn plan_runtime(
     }
 
     let policy = Policy::from_args(args, launch_dir.to_path_buf(), &setup.config.permissions)?;
+    // Validate the environment cache list here: its only consumer is the
+    // sandboxed shell, but a typo must fail closed even when that shell is off.
+    setup::env_cache_requests()?;
 
     let local_transports = resolve_local_transports(args, &setup.config.transports)?;
 

@@ -184,9 +184,33 @@ impl OutputBudget {
 
 enum SearchRead {
     Text(Vec<u8>, usize),
-    Skipped(usize),
+    /// Excluded by policy. The reason travels with the skip so an explicitly
+    /// named file can be explained instead of silently returning no matches.
+    Skipped(usize, SkipReason),
     Unreadable(usize),
     WorkBudgetExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SkipReason {
+    /// Over the per-file search ceiling.
+    TooLarge,
+    /// Binary control bytes or invalid UTF-8.
+    NotText,
+}
+
+impl SkipReason {
+    fn describe(self, path: &str) -> String {
+        match self {
+            Self::TooLarge => format!(
+                "{path} is larger than the {} byte search ceiling; use bread to inspect it",
+                MAX_GREP_FILE_BYTES
+            ),
+            Self::NotText => format!(
+                "{path} is binary or invalid UTF-8, which the text search skips; use bread to inspect it"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -244,7 +268,7 @@ impl LocalMachine {
         };
         let expected_len = match classify_search_size(before.len(), remaining) {
             SearchSize::Read(bytes) => bytes,
-            SearchSize::Skip => return SearchRead::Skipped(0),
+            SearchSize::Skip => return SearchRead::Skipped(0, SkipReason::TooLarge),
             SearchSize::WorkBudgetExceeded => return SearchRead::WorkBudgetExceeded,
         };
         let (bytes, complete) = read_declared_bytes(&mut file, expected_len).await;
@@ -257,7 +281,7 @@ impl LocalMachine {
             Ok(_) | Err(_) => return SearchRead::Unreadable(scanned),
         };
         match verify_search_size(before.len(), after.len(), remaining) {
-            Some(SearchSize::Skip) => return SearchRead::Skipped(scanned),
+            Some(SearchSize::Skip) => return SearchRead::Skipped(scanned, SkipReason::TooLarge),
             Some(SearchSize::WorkBudgetExceeded) => {
                 return SearchRead::WorkBudgetExceeded;
             }
@@ -266,7 +290,7 @@ impl LocalMachine {
         }
         match super::text_bytes(&bytes) {
             Some(_) => SearchRead::Text(bytes, scanned),
-            None => SearchRead::Skipped(scanned),
+            None => SearchRead::Skipped(scanned, SkipReason::NotText),
         }
     }
 
@@ -428,12 +452,20 @@ impl LocalMachine {
                     remaining_bytes -= scanned;
                     text
                 }
-                SearchRead::Skipped(scanned) => {
+                SearchRead::Skipped(scanned, reason) => {
                     remaining_bytes -= scanned;
+                    if single_file {
+                        let display = self.config.access.relative_text_display(path);
+                        anyhow::bail!("{}", reason.describe(&display));
+                    }
                     continue;
                 }
                 SearchRead::Unreadable(scanned) => {
                     remaining_bytes -= scanned;
+                    if single_file {
+                        let display = self.config.access.relative_text_display(path);
+                        anyhow::bail!("{display} could not be read as a text file");
+                    }
                     unreadable_files = true;
                     continue;
                 }
@@ -838,7 +870,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text files. `path` may be a directory (searched recursively) or a single file.  `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry explicit text markers or JSON `scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons` with every concurrent cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
+        description = "Search UTF-8 text files. `path` may be a directory (searched recursively) or a single file; for a file, `glob`, `gitignore` and `skip_hidden` do not apply and the file is searched directly. `pattern` is regex unless `literal`; `glob` shares the `ls` grammar. `output_mode`: content (matches and context), files, count (per-file counts; `page_total` is page-scoped). Paging uses `offset`/`limit` (up to 200); `gitignore`/`skip_hidden` are opt-in. Directory discovery visits up to 100000 entries; per-call file scanning reads at most 32 MiB across up to 4096 candidates. Incomplete results carry explicit text markers or JSON `scan_incomplete`, compatibility `incomplete_reason`, and `incomplete_reasons` with every concurrent cause (directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Narrow `path`/`glob` for complete results. Replies obey the profile output byte ceiling and only contain whole hit lines. Files over 1 MiB, files with binary control bytes, invalid UTF-8 files and symlinks are skipped.",
         annotations(
             title = "Search files",
             read_only_hint = true,
@@ -1574,9 +1606,11 @@ mod walk_tests {
         assert!(both.contains("one.rs"), "{both}");
         assert!(both.contains("two.rs"), "{both}");
 
-        // Naming one file searches only that file, even if a glob would exclude it.
+        // Naming one file searches only that file, and a non-matching `glob` is
+        // ignored rather than silently producing an empty result.
         let mut args = grep_args("alpha");
         args.path = "one.rs".to_owned();
+        args.glob = Some("*.py".to_owned());
         args.output_mode = GrepOutputMode::Files;
         let files: Value = serde_json::from_str(&machine.grep_impl(args.clone()).await.unwrap())
             .expect("single-file files search");
@@ -1590,6 +1624,20 @@ mod walk_tests {
         let content = machine.grep_impl(args).await.unwrap();
         assert!(content.contains("alpha"), "{content}");
         assert!(!content.contains("two.rs"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_file_that_is_skipped_says_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("binary.bin"), b"alpha\x00beta").unwrap();
+        let machine = test_machine(root.clone());
+
+        let mut args = grep_args("alpha");
+        args.path = "binary.bin".to_owned();
+        let error = machine.grep_impl(args).await.expect_err("binary file");
+        assert!(error.to_string().contains("binary"), "{error}");
+        assert!(error.to_string().contains("bread"), "{error}");
     }
 
     #[cfg(unix)]

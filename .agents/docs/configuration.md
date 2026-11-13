@@ -285,7 +285,11 @@ The environment layer covers every setting the NixOS module can express, so a de
 - `DOTLINK_CACHES` — `cargo-registry:rw,go-mod:ro`
 - `DOTLINK_COLOR` — `auto`, `always` or `never` (used when no `--color` is given)
 
-Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value is an operator configuration error that names the accepted spellings for that variable. Environment grants merge exactly like their CLI counterparts: allows are additive, denies still win, so an override can add a grant but revocation stays a deny rule or a profile edit.
+Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` is parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
+
+The NixOS module expresses each setting in exactly one layer: policy goes into the profile it renders when `settings` is set, and into the environment when it reuses a user-owned profile. That keeps the order meaningful — the module never overrides the profile it just wrote, while a drop-in can still override either mode from the environment.
+
+Environment assignments replace the saved value (`DOTLINK_ALLOW_KVM=0` clears a profile grant), whereas CLI grants are additive and cannot revoke. Revocation without the environment stays a deny rule or a profile edit. `DOTLINK_PROFILE` resolves `<stem>.<profile>.<ext>` beside `DOTLINK_CONFIG`, so a hand-written override must keep the base named `config.jsonc`.
 
 ## Runtime terminal controls
 

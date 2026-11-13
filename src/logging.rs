@@ -23,12 +23,19 @@ pub enum ColorMode {
 
 impl ColorMode {
     /// `DOTLINK_COLOR=auto|always|never`, for services and drop-ins.
-    pub fn from_env() -> Option<Self> {
-        match std::env::var("DOTLINK_COLOR").ok()?.trim() {
-            "auto" => Some(Self::Auto),
-            "always" => Some(Self::Always),
-            "never" => Some(Self::Never),
-            _ => None,
+    ///
+    /// An unrecognized value is an error rather than a silent fall back to
+    /// `auto`: a typo must not look like colour detection that is simply off.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let Ok(raw) = std::env::var("DOTLINK_COLOR") else {
+            return Ok(None);
+        };
+        match raw.trim() {
+            "" => Ok(None),
+            "auto" => Ok(Some(Self::Auto)),
+            "always" => Ok(Some(Self::Always)),
+            "never" => Ok(Some(Self::Never)),
+            other => anyhow::bail!("DOTLINK_COLOR must be auto, always or never, not {other:?}"),
         }
     }
 
