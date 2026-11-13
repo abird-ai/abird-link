@@ -404,6 +404,11 @@ The flake exports a `nixos-module` check for Linux which evaluates real
 NixOS configurations for user-profile fallback, declarative config,
 credentials, named services, enable/disable, and option validation.
 
-The `nixos-service` VM check starts default and named declarative services,
-calls real MCP shell/file tools, checks config/credential protection, and verifies
-restart refresh and stop cleanup.
+The separate `nixosTests.dotlink-service` VM test (x86_64-linux only) starts
+default and named declarative services, calls real MCP shell/file tools, checks
+config/credential protection, and verifies restart refresh and stop cleanup.
+It is intentionally excluded from `nix flake check`; run it explicitly with:
+
+```sh
+nix build .#nixosTests.dotlink-service -L
+```
