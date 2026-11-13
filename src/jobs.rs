@@ -152,6 +152,11 @@ pub(crate) struct JobResultContext {
 
 #[derive(Clone, Debug)]
 pub(crate) struct JobCompletion {
+    /// Wall-clock second this completion was produced. Rendered into the tool
+    /// result so a replayed or task-inlined copy is byte-identical: a
+    /// render-time stamp would make `tasks/get` disagree with the original
+    /// `tools/call` result.
+    pub(crate) completed_unix: u64,
     pub(crate) status: JobStatus,
     pub(crate) exit_code: Option<i32>,
     pub(crate) success: bool,
@@ -171,6 +176,7 @@ impl JobCompletion {
     ) -> Self {
         Self {
             status: JobStatus::Completed,
+            completed_unix: crate::mcp::now_unix(),
             exit_code,
             success,
             error: None,
@@ -184,6 +190,7 @@ impl JobCompletion {
     pub(crate) fn timed_out(stdout: StreamSummary, stderr: StreamSummary) -> Self {
         Self {
             status: JobStatus::TimedOut,
+            completed_unix: crate::mcp::now_unix(),
             exit_code: None,
             success: false,
             error: Some("shell job reached its requested timeout".to_owned()),
@@ -197,6 +204,7 @@ impl JobCompletion {
     pub(crate) fn cancelled(stdout: StreamSummary, stderr: StreamSummary) -> Self {
         Self {
             status: JobStatus::Cancelled,
+            completed_unix: crate::mcp::now_unix(),
             exit_code: None,
             success: false,
             error: Some("shell job was cancelled".to_owned()),
@@ -218,6 +226,7 @@ impl JobCompletion {
     ) -> Self {
         Self {
             status: JobStatus::Failed,
+            completed_unix: crate::mcp::now_unix(),
             exit_code: None,
             success: false,
             error: Some(bounded_job_error(message)),
@@ -236,6 +245,7 @@ impl JobCompletion {
         let message = bounded_job_error(message);
         Self {
             status: JobStatus::Failed,
+            completed_unix: crate::mcp::now_unix(),
             exit_code: None,
             success: false,
             error: Some(message.clone()),
@@ -1626,7 +1636,10 @@ impl JobManager {
         deadline: TokioInstant,
     ) -> JobResult<()> {
         loop {
-            {
+            // Take the spool path under the lock and stat it without: the manager
+            // mutex serializes every job operation, so filesystem IO must not
+            // happen while it is held, however cheap one stat looks.
+            let path = {
                 let state = self.inner.state.lock().expect("job manager lock");
                 let entry = state
                     .jobs
@@ -1635,13 +1648,13 @@ impl JobManager {
                 if entry.status().terminal() {
                     return Ok(());
                 }
-                let stored = match stream {
-                    JobStream::Stdout => stored_len(&entry.stdout_path, None),
-                    JobStream::Stderr => stored_len(&entry.stderr_path, None),
-                };
-                if stored > offset {
-                    return Ok(());
+                match stream {
+                    JobStream::Stdout => entry.stdout_path.clone(),
+                    JobStream::Stderr => entry.stderr_path.clone(),
                 }
+            };
+            if stored_len(&path, None) > offset {
+                return Ok(());
             }
             let now = TokioInstant::now();
             if now >= deadline {
@@ -2166,7 +2179,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             )]));
         }
         let text = serde_json::json!({
-            "ts": crate::mcp::now_unix(),
+            "ts": completion.completed_unix,
             "exit_code": completion.exit_code,
             "success": completion.success,
             "timed_out": false,
@@ -2189,7 +2202,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
     let next = timed_out
         .then_some("job_start starts it in the background, or retry with a larger timeout_secs");
     let text = serde_json::json!({
-        "ts": crate::mcp::now_unix(),
+        "ts": completion.completed_unix,
         "exit_code": completion.exit_code,
         "success": completion.success,
         "timed_out": completion.status == JobStatus::TimedOut,

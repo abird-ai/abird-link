@@ -2770,7 +2770,7 @@ impl TunnelClient {
                     request_id = %request_id_label,
                     window_secs = remaining.as_secs_f32(),
                     sync_budget_secs = secs,
-                    "annotated shell call with durable request identity and synchronous budget"
+                    "annotated call with durable request identity and synchronous budget"
                 );
             }
         }
