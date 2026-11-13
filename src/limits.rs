@@ -23,6 +23,11 @@ const _: () = assert!(
     OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
         < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()
 );
+/// Default bounded wait for one `job_get`/`job_output` poll. The transport
+/// clamps it to the caller's remaining response budget, so a wait never outlives
+/// the response it is attached to.
+pub(crate) const DEFAULT_JOB_WAIT_MS: u64 = 90_000;
+
 /// Advisory checkpoint horizon for one conversation turn. Guidance only: dotlink
 /// never infers a turn boundary, it stamps `ts` and the caller keeps its own.
 pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 40;

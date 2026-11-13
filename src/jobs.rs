@@ -80,6 +80,9 @@ fn bounded_job_error(message: impl Into<String>) -> String {
 /// `<tool>(<arg>) to <purpose>`, joined with commas, with one leading `call`
 /// supplied by the renderer. The tool key lets a caller reading one payload
 /// skip the call it already made.
+/// How often a bounded job wait re-reads the retained spool length.
+const JOB_WAIT_POLL: Duration = Duration::from_millis(200);
+
 const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
     ("job_get", "job_get for status"),
     ("job_output", "job_output(offset) to read output"),
@@ -1606,6 +1609,45 @@ impl JobManager {
                 }
                 None => notify.await,
             }
+        }
+    }
+
+    /// Wait until the selected stream has bytes past `offset`, the job is
+    /// terminal, or `deadline` arrives.
+    ///
+    /// Progress is re-read from the retained spool length rather than notified
+    /// per write: the drain writers are the hot path and should not wake every
+    /// waiter for each chunk. The poll is bounded by the caller's deadline.
+    pub(crate) async fn wait_for_output(
+        &self,
+        id: &str,
+        stream: JobStream,
+        offset: u64,
+        deadline: TokioInstant,
+    ) -> JobResult<()> {
+        loop {
+            {
+                let state = self.inner.state.lock().expect("job manager lock");
+                let entry = state
+                    .jobs
+                    .get(id)
+                    .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+                if entry.status().terminal() {
+                    return Ok(());
+                }
+                let stored = match stream {
+                    JobStream::Stdout => stored_len(&entry.stdout_path, None),
+                    JobStream::Stderr => stored_len(&entry.stderr_path, None),
+                };
+                if stored > offset {
+                    return Ok(());
+                }
+            }
+            let now = TokioInstant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep_until((now + JOB_WAIT_POLL).min(deadline)).await;
         }
     }
 

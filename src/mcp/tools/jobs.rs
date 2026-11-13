@@ -15,6 +15,8 @@ use serde::Deserialize;
 
 use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
 use crate::jobs::JobStream;
+use std::time::Duration;
+use tokio::time::Instant as TokioInstant;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +133,35 @@ enum OutputEncoding {
     Base64,
 }
 
+/// Wait for one job poll.
+///
+/// The 90 s default only applies where a transport supplies a response window:
+/// that is where waiting saves round trips. Without one (stdio, local HTTP, the
+/// test harness) a status read stays immediate unless the caller asks explicitly,
+/// and an explicit wait is always clamped to the remaining window so it can never
+/// outlive the response it belongs to.
+fn resolve_wait_ms(requested: Option<u64>, budget_ms: Option<u64>) -> u64 {
+    match (requested, budget_ms) {
+        (Some(wait), Some(budget)) => wait.min(budget),
+        (Some(wait), None) => wait,
+        (None, Some(budget)) => crate::limits::DEFAULT_JOB_WAIT_MS.min(budget),
+        (None, None) => 0,
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct JobGetArgs {
+    /// Job/task identifier.
+    job_id: String,
+    /// Wait up to this many milliseconds for the job to finish before returning
+    /// its status. Defaults to 90000 and is clamped to the caller's remaining
+    /// response budget, so a wait can never outlive the response. 0 returns
+    /// immediately, which is what an interactive status check wants.
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobOutputArgs {
@@ -148,6 +179,11 @@ struct JobOutputArgs {
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
     #[serde(default)]
     encoding: OutputEncoding,
+    /// Wait up to this many milliseconds for output past `offset` (or for the
+    /// job to finish) before paging. Defaults to 90000 and is clamped to the
+    /// caller's remaining response budget. 0 returns immediately.
+    #[serde(default)]
+    wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -207,7 +243,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Get the current state of a long-running shell job. Returns status, elapsed time, exit state and durable stdout/stderr byte counts. The job id is also the native MCP task id when Tasks are supported.",
+        description = "Get the current state of a long-running shell job. Returns status, elapsed time, exit state and durable stdout/stderr byte counts. The job id is also the native MCP task id when Tasks are supported. `wait_ms` (default 90000, clamped to the response budget) waits for the job to finish before answering; 0 returns its current state at once.",
         annotations(
             title = "Get shell job status",
             read_only_hint = true,
@@ -216,7 +252,18 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn job_get(&self, Parameters(args): Parameters<JobIdArgs>) -> CallToolResult {
+    async fn job_get(
+        &self,
+        Parameters(args): Parameters<JobGetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let wait = resolve_wait_ms(args.wait_ms, self.request_sync_budget_millis(&context));
+        if wait > 0 {
+            let deadline = TokioInstant::now() + Duration::from_millis(wait);
+            if let Err(error) = self.jobs.wait_until(&args.job_id, Some(deadline)).await {
+                return tool_error(error);
+            }
+        }
         match self.jobs.status(&args.job_id) {
             Ok(status) => ok_text(status),
             Err(error) => tool_error(error),
@@ -224,7 +271,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read one durable page of a shell job's stdout or stderr by raw byte offset. This operation is pure and replayable: it never acknowledges or deletes output. Pages are bounded by max_output_bytes; continue from next_offset until complete=true, then call job_ack with the highest safely received offset. Each stream retains at most 64 MiB and reports truncation beyond that. After both terminal streams are fully acknowledged, compatibility-job spools are released; native MCP Tasks compact them to the ordinary-result prefix needed for exact `tasks/get` replay and remove that prefix when task retention expires.",
+        description = "Read one durable page of a shell job's stdout or stderr by raw byte offset. This operation is pure and replayable: it never acknowledges or deletes output. Pages are bounded by max_output_bytes; continue from next_offset until complete=true, then call job_ack with the highest safely received offset. `wait_ms` (default 90000, clamped to the response budget) waits for new output past `offset` or for the job to finish; 0 pages whatever is retained now. Each stream retains at most 64 MiB and reports truncation beyond that. After both terminal streams are fully acknowledged, compatibility-job spools are released; native MCP Tasks compact them to the ordinary-result prefix needed for exact `tasks/get` replay and remove that prefix when task retention expires.",
         annotations(
             title = "Read shell job output",
             read_only_hint = true,
@@ -243,6 +290,17 @@ impl LocalMachine {
         let stream = args.stream.into();
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
+        let wait = resolve_wait_ms(args.wait_ms, self.request_sync_budget_millis(&context));
+        if wait > 0 {
+            let deadline = TokioInstant::now() + Duration::from_millis(wait);
+            if let Err(error) = self
+                .jobs
+                .wait_for_output(&args.job_id, stream, offset, deadline)
+                .await
+            {
+                return tool_error(error);
+            }
+        }
         match crate::blocking::run(|| {
             self.jobs.output_page(
                 &args.job_id,
@@ -327,5 +385,25 @@ mod tests {
 
         let start_description = start.description.as_deref().unwrap();
         assert!(start_description.contains("64 MiB"));
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::resolve_wait_ms;
+
+    #[test]
+    fn job_wait_defaults_only_where_a_response_window_exists() {
+        // Hosted transport: wait by default, capped by the remaining budget.
+        assert_eq!(resolve_wait_ms(None, Some(60_000)), 60_000);
+        assert_eq!(resolve_wait_ms(None, Some(200_000)), 90_000);
+        // No window (stdio, local HTTP, tests): stay immediate.
+        assert_eq!(resolve_wait_ms(None, None), 0);
+        // An explicit wait is honoured and clamped, never lengthened.
+        assert_eq!(resolve_wait_ms(Some(10_000), Some(60_000)), 10_000);
+        assert_eq!(resolve_wait_ms(Some(200_000), Some(60_000)), 60_000);
+        assert_eq!(resolve_wait_ms(Some(5_000), None), 5_000);
+        // 0 always means "answer now".
+        assert_eq!(resolve_wait_ms(Some(0), Some(60_000)), 0);
     }
 }
