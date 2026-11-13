@@ -10,7 +10,7 @@ const EXIT_NOTCONFIGURED: i32 = 6;
 const SUPERVISOR_HINT: &str = "systemd leaves this service stopped";
 const UNCONFIGURED_HINT: &str = "systemd stops this unit cleanly";
 
-/// A command with no saved profile and no `DOTLINK_CONFIG`, so setup is pending.
+/// A command with no saved profile and no `DOTLINK_CONFIG_FILE`, so setup is pending.
 fn unconfigured(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dotlink"));
     command
@@ -19,7 +19,7 @@ fn unconfigured(home: &Path) -> Command {
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CACHE_HOME", home.join("cache"))
-        .env_remove("DOTLINK_CONFIG")
+        .env_remove("DOTLINK_CONFIG_FILE")
         .env_remove("DOTLINK_SUPERVISOR")
         .env_remove("NOTIFY_SOCKET")
         .env_remove("DOTLINK_API_KEY")
@@ -36,7 +36,7 @@ fn dotlink(home: &Path, profile: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dotlink"));
     command
         .current_dir(home)
-        .env("DOTLINK_CONFIG", &config)
+        .env("DOTLINK_CONFIG_FILE", &config)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_DATA_HOME", home.join("data"))

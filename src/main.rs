@@ -1478,8 +1478,27 @@ async fn prepare_runtime(
     #[cfg(target_os = "linux")]
     hardware::add_to_shell(&mut host_shell, policy.allow_kvm, &policy.allow_gpu)?;
     if policy.allow_shell && policy.sandbox_shell {
-        let mut caches = setup.config.caches.clone();
-        let mut requests = setup::env_cache_requests()?;
+        // Saved grants with an explicit path are used as written. Path-less
+        // saved grants are requests for discovery, so they join the environment
+        // and CLI layers and are resolved together, later layers winning.
+        let mut caches: Vec<setup::CacheGrant> = setup
+            .config
+            .caches
+            .iter()
+            .filter(|grant| grant.path.is_some())
+            .cloned()
+            .collect();
+        let mut requests: Vec<(setup::CacheKind, setup::CacheMode)> = setup
+            .config
+            .caches
+            .iter()
+            .filter(|grant| grant.path.is_none())
+            .map(|grant| (grant.kind, grant.mode))
+            .collect();
+        for (kind, mode) in setup::env_cache_requests()? {
+            requests.retain(|(existing, _)| *existing != kind);
+            requests.push((kind, mode));
+        }
         for (kind, mode) in args.cache_flags.requested() {
             requests.retain(|(existing, _)| *existing != kind);
             requests.push((kind, mode));
@@ -1489,15 +1508,18 @@ async fn prepare_runtime(
             caches.push(override_cache);
         }
         for cache in &caches {
-            if !cache.path.is_dir() {
+            let Some(source) = cache.path.as_ref() else {
+                continue;
+            };
+            if !source.is_dir() {
                 continue;
             }
-            let target = cache.sandbox_path()?;
+            let target = cache.sandbox_path(source)?;
             if let Some((name, value)) = cache.shell_env(&target) {
                 shell_env.insert(name, value);
             }
             cache_mounts.push(SandboxCacheMount {
-                source: cache.path.clone(),
+                source: source.clone(),
                 target,
                 writable: cache.mode.writable(),
             });

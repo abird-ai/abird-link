@@ -80,7 +80,7 @@
       default = null;
       example = "/etc/dotlink/config.jsonc";
       description = ''
-        Optional explicit JSONC file used as DOTLINK_CONFIG. Null reuses the
+        Optional explicit JSONC config file, passed as DOTLINK_CONFIG_FILE. Null reuses the
         selected user's XDG default. Mutually exclusive with settings.
       '';
     };
@@ -285,6 +285,61 @@
     else if builtins.isList value
     then lib.any containsSecretKey value
     else false;
+  # Permissions the module itself declares for an instance.
+  moduleGrantedPermissions = instance: let
+    hostEnabled =
+      instance.hostAccess.nixDaemon
+      || instance.hostAccess.nixConfig
+      || instance.hostAccess.sshAgent
+      || instance.hostAccess.gitConfig
+      || instance.hostAccess.kvm
+      || instance.hostAccess.gpu != [];
+  in
+    lib.filterAttrs (_: enabled: enabled) {
+      allow_shell = hostEnabled || instance.cacheAccess != {};
+      allow_nix_daemon = instance.hostAccess.nixDaemon;
+      allow_nix_config = instance.hostAccess.nixConfig;
+      allow_ssh_agent = instance.hostAccess.sshAgent;
+      allow_git_config = instance.hostAccess.gitConfig;
+      allow_kvm = instance.hostAccess.kvm;
+    }
+    // lib.optionalAttrs (instance.hostAccess.gpu != []) {
+      allow_gpu = instance.hostAccess.gpu;
+    };
+
+  # Fields where a typed option would silently overwrite a contradictory value
+  # the user already wrote into `settings`. Redundant-but-equal values are fine;
+  # only real disagreement is an error.
+  settingsConflicts = instance: let
+    grants = moduleGrantedPermissions instance;
+    declaredPermissions =
+      lib.filterAttrs (field: _: instance.settings.permissions or {} ? ${field}) grants;
+    permissionConflicts = lib.concatMap (
+      field: let
+        written = instance.settings.permissions.${field};
+      in
+        lib.optional (written != grants.${field}) "permissions.${field}"
+    ) (lib.attrNames declaredPermissions);
+    serializeConflict =
+      lib.optional
+      (instance.serialize && (instance.settings.serialize or true) == false)
+      "serialize";
+    verbosityConflict =
+      lib.optional
+      (
+        instance.logging.verbosity
+        != "lifecycle"
+        && (instance.settings.logging.verbosity or instance.logging.verbosity)
+        != instance.logging.verbosity
+      )
+      "logging.verbosity";
+    stdioConflict =
+      lib.optional (instance.settings.transports.stdio or false) "transports.stdio";
+  in
+    if instance.settings == null
+    then []
+    else permissionConflicts ++ serializeConflict ++ verbosityConflict ++ stdioConflict;
+
   effectiveProfile = name: instance:
     if instance.profile != null
     then
@@ -299,7 +354,7 @@
 
   makeService = name: instance: let
     profile = effectiveProfile name instance;
-    # DOTLINK_CONFIG is a *base* path. With DOTLINK_PROFILE set, the loader
+    # The config-file override is a *base* path. With DOTLINK_PROFILE set, the loader
     # selects its sibling config.NAME.jsonc, which keeps credentials and
     # OAuth state independent for named declarative instances too.
     ownsSettings = instance.settings != null;
@@ -308,18 +363,7 @@
     # environment. That keeps the usual order (CLI > environment > profile >
     # default) meaningful instead of letting the module silently override the
     # profile it just wrote.
-    grantedPermissions =
-      lib.filterAttrs (_: enabled: enabled) {
-        allow_shell = hostEnabled || instance.cacheAccess != {};
-        allow_nix_daemon = instance.hostAccess.nixDaemon;
-        allow_nix_config = instance.hostAccess.nixConfig;
-        allow_ssh_agent = instance.hostAccess.sshAgent;
-        allow_git_config = instance.hostAccess.gitConfig;
-        allow_kvm = instance.hostAccess.kvm;
-      }
-      // lib.optionalAttrs (instance.hostAccess.gpu != []) {
-        allow_gpu = instance.hostAccess.gpu;
-      };
+    grantedPermissions = moduleGrantedPermissions instance;
     # Only opt-in values are written: an option left at its default never
     # overrides a profile the user set by hand.
     declaredSettings =
@@ -410,7 +454,7 @@
         DOTLINK_SSH_AGENT_SOCKET = instance.sshAgentSocket;
       }
       // lib.optionalAttrs (configPath != null) {
-        DOTLINK_CONFIG = toString configPath;
+        DOTLINK_CONFIG_FILE = toString configPath;
       }
       // lib.optionalAttrs (instance.credentials.runtimeApiKeyFile != null) {
         DOTLINK_API_KEY_FILE = "%d/dotlink-api-key";
@@ -526,6 +570,11 @@ in {
       ++ (lib.mapAttrsToList (name: instance: {
           assertion = validProfile instance.profile;
           message = "dotlink ${name}: profile names may contain only letters, digits, '-' or '_'.";
+        })
+        active)
+      ++ (lib.mapAttrsToList (name: instance: {
+          assertion = settingsConflicts instance == [];
+          message = "dotlink ${name}: settings and the typed options disagree for ${lib.concatStringsSep ", " (settingsConflicts instance)}. Remove one side; the module will not overwrite a value written into settings.";
         })
         active)
       ++ (lib.mapAttrsToList (name: instance: {

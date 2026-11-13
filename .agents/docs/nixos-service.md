@@ -81,7 +81,7 @@ services.dotlink = {
 ```
 
 A read-only JSON document with schema version 10 is generated in the Nix store
-and passed to dotlink through `DOTLINK_CONFIG`. This *only* overrides the
+and passed to dotlink through `DOTLINK_CONFIG_FILE`. This *only* overrides the
 profile JSON; unless explicitly overridden, dotlink still loads the selected
 user's own saved `runtime.key` and OAuth state. The schema is dotlink's
 existing JSONC schema, not a second independently maintained config format.

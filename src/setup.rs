@@ -27,6 +27,7 @@ const DEFAULT_MAX_OUTPUT_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 const DEFAULT_MAX_FILE_BYTES: usize = crate::limits::DEFAULT_TRANSFER_BYTES;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportConfig {
     #[serde(default = "default_true")]
     pub openai: bool,
@@ -78,6 +79,7 @@ impl TransportConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionConfig {
     /// Read the directory where dotlink is launched unless disabled.
     #[serde(default = "default_true")]
@@ -214,6 +216,7 @@ impl LogVerbosity {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub verbosity: LogVerbosity,
@@ -222,14 +225,18 @@ pub struct LoggingConfig {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheKind {
+    #[serde(alias = "cargo-registry")]
     CargoRegistry,
+    #[serde(alias = "cargo-git")]
     CargoGit,
     Npm,
     Pnpm,
     Yarn,
     Pip,
     Uv,
+    #[serde(alias = "go-mod")]
     GoMod,
+    #[serde(alias = "go-build")]
     GoBuild,
     Maven,
     Gradle,
@@ -335,8 +342,10 @@ impl CacheKind {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
+    #[serde(alias = "ro", alias = "read-only")]
     #[value(name = "ro", alias = "read-only")]
     ReadOnly,
+    #[serde(alias = "rw", alias = "read-write")]
     #[value(name = "rw", alias = "read-write")]
     ReadWrite,
 }
@@ -355,9 +364,15 @@ impl CacheMode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CacheGrant {
     pub kind: CacheKind,
-    pub path: PathBuf,
+    /// Explicit cache directory. `None` asks dotlink to discover the standard
+    /// location for this kind, exactly like `--allow-cache-<name>` and
+    /// `DOTLINK_CACHES` do, so a config file can express a cache without
+    /// hard-coding a path that only the host knows.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     pub mode: CacheMode,
 }
 
@@ -385,10 +400,10 @@ fn sandbox_parent(sandbox_path: &Path) -> String {
 }
 
 impl CacheGrant {
-    pub fn sandbox_path(&self) -> Result<PathBuf> {
+    pub fn sandbox_path(&self, source: &Path) -> Result<PathBuf> {
         let home = home_dir()?;
         let home = fs::canonicalize(&home).unwrap_or(home);
-        let path = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let path = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
         if let Ok(relative) = path.strip_prefix(&home) {
             return Ok(sandbox_join(relative));
         }
@@ -425,6 +440,7 @@ struct DiscoveredCache {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub version: u32,
 
@@ -523,7 +539,7 @@ struct TunnelRecord {
 }
 
 fn config_version() -> u32 {
-    11
+    12
 }
 
 fn default_true() -> bool {
@@ -632,6 +648,9 @@ fn migrate_config(mut config: AppConfig) -> Result<AppConfig> {
             // v11 adds two additive/defaulted fields: serialize (false) and
             // logging.verbosity (lifecycle). Saved v10 values keep their meaning.
             10 => config.version = 11,
+            // v11 added serialize and logging.verbosity; v12 makes a cache
+            // entry's `path` optional so discovery can supply it.
+            11 => config.version = 12,
             version => {
                 bail!(
                     "profile uses schema version {version}; no automatic migration path to version {current} is defined. Back up the profile and migrate it with a compatible dotlink version before using this one"
@@ -1224,7 +1243,7 @@ fn cache_grants_from_discovery(
                 .find(|found| found.kind == *kind)
                 .map(|source| CacheGrant {
                     kind: *kind,
-                    path: source.path.clone(),
+                    path: Some(source.path.clone()),
                     mode: *mode,
                 })
         })
@@ -1294,7 +1313,9 @@ async fn setup_developer_caches(
         candidates.insert(cache.kind, cache.path);
     }
     for cache in existing {
-        candidates.insert(cache.kind, cache.path.clone());
+        if let Some(path) = cache.path.as_ref() {
+            candidates.insert(cache.kind, path.clone());
+        }
     }
 
     if candidates.is_empty() {
@@ -1345,7 +1366,7 @@ async fn setup_developer_caches(
         if let Some(mode) = prompt_cache_mode(&cache, existing_mode, color)? {
             grants.push(CacheGrant {
                 kind: cache.kind,
-                path: cache.path,
+                path: Some(cache.path),
                 mode,
             });
         }
@@ -1964,7 +1985,10 @@ async fn interactive_setup(
                 "      {:<18} {:<10} {}",
                 cache.kind.label(),
                 cache.mode.label(),
-                cache.path.display()
+                cache.path.as_ref().map_or_else(
+                    || "(discovered)".to_owned(),
+                    |path| path.display().to_string()
+                )
             );
         }
     }
@@ -2675,13 +2699,27 @@ fn ensure_dotlink_config_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Canonical name of the config-file override.
+///
+/// The file, not the profile, is what moves: `DOTLINK_PROFILE` still selects the
+/// slot and `profiled_path` derives `config.<profile>.jsonc` from this base.
+pub(crate) const CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG_FILE";
+/// Accepted for compatibility; superseded by [`CONFIG_FILE_ENV`].
+const LEGACY_CONFIG_FILE_ENV: &str = "DOTLINK_CONFIG";
+
+fn config_file_override() -> Option<PathBuf> {
+    env::var_os(CONFIG_FILE_ENV)
+        .or_else(|| env::var_os(LEGACY_CONFIG_FILE_ENV))
+        .map(PathBuf::from)
+}
+
 fn config_parent_is_dotlink_owned() -> bool {
-    env::var_os("DOTLINK_CONFIG").is_none()
+    config_file_override().is_none()
 }
 
 fn config_path(profile: Option<&str>) -> Result<PathBuf> {
-    let base = match env::var_os("DOTLINK_CONFIG") {
-        Some(path) => PathBuf::from(path),
+    let base = match config_file_override() {
+        Some(path) => path,
         None => dotlink_config_dir()?.join("config.jsonc"),
     };
     profiled_path(&base, profile)
@@ -2706,7 +2744,7 @@ fn control_plane_paths(
         .to_path_buf();
 
     // Standard config lives entirely inside dotlink's private directory. A
-    // custom DOTLINK_CONFIG is protected file-by-file, while all Runtime keys
+    // a custom config-file override is protected file-by-file, while Runtime keys
     // remain under the owned XDG directory and can be protected as one unit.
     let mut protected = if protect_config_parent {
         vec![config_parent]
@@ -3327,11 +3365,13 @@ fn validate_config_structure(config: &AppConfig) -> Result<()> {
 
     let mut cache_kinds = std::collections::BTreeSet::new();
     for cache in &config.caches {
-        if !cache.path.is_absolute() {
+        if let Some(path) = cache.path.as_ref()
+            && !path.is_absolute()
+        {
             bail!(
                 "cache path for {} must be absolute: {}",
                 cache.kind.label(),
-                cache.path.display()
+                path.display()
             );
         }
         if !cache_kinds.insert(cache.kind) {
@@ -3746,7 +3786,7 @@ mod tests {
             &detected,
         );
         assert_eq!(granted.len(), 1);
-        assert_eq!(granted[0].path, temp.path());
+        assert_eq!(granted[0].path.as_deref(), Some(temp.path()));
         assert_eq!(granted[0].mode, CacheMode::ReadOnly);
         let writable = cache_grants_from_discovery(
             &[(CacheKind::CargoRegistry, CacheMode::ReadWrite)],
@@ -3817,10 +3857,11 @@ mod tests {
         let home = home_dir().unwrap();
         let cargo = CacheGrant {
             kind: CacheKind::CargoRegistry,
-            path: home.join(".cargo/registry"),
+            path: Some(home.join(".cargo/registry")),
             mode: CacheMode::ReadOnly,
         };
-        let target = cargo.sandbox_path().unwrap();
+        let source = cargo.path.clone().unwrap();
+        let target = cargo.sandbox_path(&source).unwrap();
         assert_eq!(target, PathBuf::from("/tmp/home/.cargo/registry"));
         assert_eq!(
             cargo.shell_env(&target),
@@ -3829,10 +3870,11 @@ mod tests {
 
         let npm = CacheGrant {
             kind: CacheKind::Npm,
-            path: home.join(".npm"),
+            path: Some(home.join(".npm")),
             mode: CacheMode::ReadWrite,
         };
-        let target = npm.sandbox_path().unwrap();
+        let source = npm.path.clone().unwrap();
+        let target = npm.sandbox_path(&source).unwrap();
         assert_eq!(target, PathBuf::from("/tmp/home/.npm"));
         assert_eq!(
             npm.shell_env(&target),
@@ -3847,7 +3889,7 @@ mod tests {
         let mut config = example_config();
         config.caches = vec![CacheGrant {
             kind: CacheKind::Npm,
-            path: PathBuf::from(".npm"),
+            path: Some(PathBuf::from(".npm")),
             mode: CacheMode::ReadOnly,
         }];
         assert!(validate_config(&config).is_err());
@@ -3856,12 +3898,12 @@ mod tests {
         config.caches = vec![
             CacheGrant {
                 kind: CacheKind::Npm,
-                path: home.join(".npm"),
+                path: Some(home.join(".npm")),
                 mode: CacheMode::ReadOnly,
             },
             CacheGrant {
                 kind: CacheKind::Npm,
-                path: home.join(".npm-alt"),
+                path: Some(home.join(".npm-alt")),
                 mode: CacheMode::ReadWrite,
             },
         ];
@@ -4173,6 +4215,38 @@ mod tests {
     }
 
     #[test]
+    fn unknown_config_fields_are_rejected_not_ignored() {
+        // Raw `settings` relies on strictness rather than typed Nix options.
+        // Asserted at the serde layer: the wrapper's message is generic, while
+        // strictness itself lives in the derived Deserialize.
+        let error = serde_json::from_str::<AppConfig>(
+            r#"{ "version": 12, "permissions": { "allow_kvmm": true } }"#,
+        )
+        .map(|_| ())
+        .expect_err("unknown field must be rejected");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn cache_grant_may_omit_its_path() {
+        let config = parse_jsonc::<AppConfig>(
+            r#"{ "version": 12, "transports": { "openai": false }, "caches": [ { "kind": "cargo-registry", "mode": "read_write" } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(config.caches.len(), 1);
+        assert!(config.caches[0].path.is_none());
+        validate_config(&config).expect("a discovered cache path is valid");
+    }
+
+    #[test]
+    fn config_file_env_accepts_both_names() {
+        // The alias exists so a deployment that still sets DOTLINK_CONFIG keeps
+        // working; the canonical name is DOTLINK_CONFIG_FILE.
+        assert_eq!(CONFIG_FILE_ENV, "DOTLINK_CONFIG_FILE");
+        assert_eq!(LEGACY_CONFIG_FILE_ENV, "DOTLINK_CONFIG");
+    }
+
+    #[test]
     fn env_override_parsers_reject_typos_and_default_to_read_only() {
         assert_eq!(parse_env_flag("X", "1").unwrap(), Some(true));
         assert_eq!(parse_env_flag("X", " off ").unwrap(), Some(false));
@@ -4293,9 +4367,9 @@ mod tests {
         let error = migrate_config(config.clone()).err().unwrap();
         assert!(error.to_string().contains("no automatic migration path"));
 
-        config.version = 12;
+        config.version = 13;
         let error = migrate_config(config).err().unwrap();
-        assert!(error.to_string().contains("newer schema version 12"));
+        assert!(error.to_string().contains("newer schema version 13"));
 
         let missing =
             parse_jsonc::<AppConfig>(r#"{ "transports": { "openai": false }, "permissions": {} }"#);

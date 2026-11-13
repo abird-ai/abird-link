@@ -111,6 +111,26 @@
       hostAccess.sshAgent = true;
     };
   };
+  # A typed option must never silently overwrite a contradictory value the user
+  # already wrote into `settings`.
+  conflictingSettings = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      hostAccess.kvm = true;
+      settings.permissions.allow_kvm = false;
+    };
+  };
+  agreeingSettings = eval {
+    services.dotlink = {
+      enable = true;
+      user = "alice";
+      workingDirectory = "/home/alice/projects";
+      hostAccess.kvm = true;
+      settings.permissions.allow_kvm = true;
+    };
+  };
   invalidCache = eval {
     services.dotlink = {
       enable = true;
@@ -142,7 +162,7 @@
   managedUnitText = managed.config.systemd.units."dotlink.service".text;
   managedProfile =
     builtins.fromJSON
-    (builtins.readFile "${managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG}");
+    (builtins.readFile "${managed.config.systemd.services.dotlink.environment.DOTLINK_CONFIG_FILE}");
 
   valid = cfg:
     lib.all
@@ -170,7 +190,7 @@
     (valid normal)
     (normal.config.systemd.services.dotlink.serviceConfig.User == "alice")
     (normal.config.systemd.services.dotlink.serviceConfig.WorkingDirectory == "/home/alice/projects")
-    (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG))
+    (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG_FILE))
     (!(normal.config.systemd.services.dotlink.environment ? DOTLINK_API_KEY_FILE))
     (!(lib.hasInfix "--" normal.config.systemd.services.dotlink.serviceConfig.ExecStart))
     (normal.config.systemd.services.dotlink.environment.DOTLINK_STDIO == "0")
@@ -195,7 +215,7 @@
     (dotlinkWarnings systemd258 == [])
 
     (valid managed)
-    (managed.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG)
+    (managed.config.systemd.services.dotlink.environment ? DOTLINK_CONFIG_FILE)
     (managed.config.systemd.services.dotlink.environment.DOTLINK_API_KEY_FILE == "%d/dotlink-api-key")
     (managed.config.systemd.services.dotlink.environment.NGROK_AUTHTOKEN_FILE == "%d/ngrok-authtoken")
     (managed.config.systemd.services.dotlink.serviceConfig.LoadCredential
@@ -239,9 +259,9 @@
     (!(lib.hasInfix " -v" managed.config.systemd.services.dotlink.serviceConfig.ExecStart))
     (managed.config.systemd.services.dotlink-work.environment.DOTLINK_VERBOSITY == "requests")
     (!(lib.hasInfix " -vv" managed.config.systemd.services.dotlink-work.serviceConfig.ExecStart))
-    (!(managed.config.systemd.services.dotlink-work.environment ? DOTLINK_CONFIG))
+    (!(managed.config.systemd.services.dotlink-work.environment ? DOTLINK_CONFIG_FILE))
     (hasSupervisionPolicy managed.config.systemd.services.dotlink-work)
-    (managed.config.systemd.services.dotlink-test.environment ? DOTLINK_CONFIG)
+    (managed.config.systemd.services.dotlink-test.environment ? DOTLINK_CONFIG_FILE)
     (!(disabled.config.systemd.services ? dotlink))
     (!(disabled.config.systemd.services ? dotlink-work))
     (valid dedicated)
@@ -253,6 +273,8 @@
     (autoDetectedGcrAgent.config.systemd.services.dotlink.environment.DOTLINK_ALLOW_SSH_AGENT == "1")
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? DOTLINK_SSH_AGENT_SOCKET))
     (!(autoDetectedGcrAgent.config.systemd.services.dotlink.environment ? SSH_AUTH_SOCK))
+    (!valid conflictingSettings)
+    (valid agreeingSettings)
     (!valid invalidCache)
     (!valid invalidWorkingDirectory)
   ];

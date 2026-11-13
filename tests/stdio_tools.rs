@@ -79,7 +79,7 @@ impl Probe {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dotlink"))
             .arg("--stdio")
             .current_dir(workdir)
-            .env("DOTLINK_CONFIG", &config)
+            .env("DOTLINK_CONFIG", &config) // legacy alias coverage
             .env("XDG_CONFIG_HOME", config_dir.join("cfg"))
             .env(
                 "XDG_STATE_HOME",

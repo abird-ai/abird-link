@@ -374,7 +374,7 @@ The Runtime key is stored separately for each profile:
 ~/.config/abird/dotlink/runtime.work.key
 ~~~
 
-Canonical JSONC config files are `config.jsonc` or `config.<profile>.jsonc`. On Unix dotlink-owned config/key files are mode 0600 and the owned `~/.config/abird/dotlink` directory is mode 0700. `DOTLINK_CONFIG` may place JSONC elsewhere without chmod'ing its parent; Runtime keys still remain in the owned XDG directory.
+Canonical JSONC config files are `config.jsonc` or `config.<profile>.jsonc`. On Unix dotlink-owned config/key files are mode 0600 and the owned `~/.config/abird/dotlink` directory is mode 0700. `DOTLINK_CONFIG_FILE` may place JSONC elsewhere without chmod'ing its parent; Runtime keys still remain in the owned XDG directory.
 
 The Admin key used to create a tunnel is never persisted. A profile with OpenAI disabled does not require a runtime key.
 

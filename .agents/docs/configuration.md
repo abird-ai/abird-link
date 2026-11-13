@@ -45,7 +45,7 @@ Cache and host remapping cannot bypass protected or denied roots; cache deny-wri
 
 Profiles are JSONC: comments and trailing commas are allowed. OpenAI Runtime keys are stored separately and never serialized into the profile. The optional `runtime_key_revision` and `owner_password_revision` fields are opaque selectors: setup stages immutable credential generations before atomically selecting them with the JSONC rename. A crash before selection keeps the previous key and owner password live; legacy profiles without selectors keep using `runtime[.<profile>].key` and the original OAuth owner hash. After a durable credential rotation, obsolete generations are pruned, retaining the active and immediately preceding secrets; unrelated profile edits do not retire credentials potentially in use by running processes. Failed cleanup warns but never turns an already-committed edit into an error. Legacy profiles continue to load unchanged. A missing, empty, oversized, special or unreadable selected Runtime key fails closed when OpenAI executes, but profile inspection/mutation remains usable and can atomically replace it. Interrupted profile deletion is retryable even when only orphaned generated keys remain. OAuth owner-password hashes, approved DCR clients, and hashed refresh grants are stored in the private OAuth state file rather than JSONC. On Unix dotlink-owned config/state directories are mode `0700` and private files are `0600`.
 
-`DOTLINK_CONFIG` overrides only the JSONC location. Runtime keys and OAuth state remain inside dotlink's owned Abird XDG namespaces.
+`DOTLINK_CONFIG_FILE` overrides only the config-file location (`DOTLINK_CONFIG` is accepted as a deprecated alias). Runtime keys and OAuth state remain inside dotlink's owned Abird XDG namespaces.
 
 Local HTTP and stdio **intentionally have no shared admission budget**: the model/client controls concurrency. The OpenAI tunnel has a separate in-flight bound, and tool-specific file/output/timeout bounds still apply. This is a deliberate operator choice and should not be re-raised as an architectural defect without a concrete separate bug.
 
@@ -287,7 +287,11 @@ The environment layer covers every setting the NixOS module can express, so a de
 
 Booleans accept `1/0`, `true/false`, `yes/no` or `on/off`; an unrecognized value — including `DOTLINK_COLOR`, `DOTLINK_CACHES` or `DOTLINK_VERBOSITY` — is an operator configuration error that names the accepted spellings. `DOTLINK_CACHES` is parsed even when the sandboxed shell is disabled, so a typo never hides behind an inactive shell.
 
+A profile is a named slot; its config file is `config.jsonc` or `config.<profile>.jsonc`. `settings` and `configFile` author that file, while `profile` selects it — they are not separate layers, and an explicit `profile` cannot be combined with either authoring option.
+
 The NixOS module expresses each setting in exactly one layer: policy goes into the profile it renders when `settings` is set, and into the environment when it reuses a user-owned profile. That keeps the order meaningful — the module never overrides the profile it just wrote, while a drop-in can still override either mode from the environment.
+
+Typed module options (`hostAccess`, `logging`, `serialize`, `cacheAccess`) are ergonomic aliases for fields in that same config file, not a separate layer: `settings` remains the raw authoring path for fields with no typed option (`tunnel_id`, `transports`, `oauth`, limits). When both write the same field the module refuses to guess — writing `settings.permissions.allow_kvm = false` alongside `hostAccess.kvm = true` is an evaluation error naming the field, while redundant-but-equal values are accepted.
 
 Environment assignments replace the saved value (`DOTLINK_ALLOW_KVM=0` clears a profile grant), whereas CLI grants are additive and cannot revoke. Revocation without the environment stays a deny rule or a profile edit. `DOTLINK_PROFILE` resolves `<stem>.<profile>.<ext>` beside `DOTLINK_CONFIG`, so a hand-written override must keep the base named `config.jsonc`.
 
