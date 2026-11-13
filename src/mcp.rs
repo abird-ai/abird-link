@@ -559,6 +559,13 @@ pub fn shell_tool_name() -> &'static str {
 /// True for the shell tool this platform advertises. Tool visibility, the
 /// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
 /// this one question, so a new shell variant cannot be missed in one of them.
+/// Job tools whose request may wait for progress or completion. They receive the
+/// same remaining-window metadata the shell uses, so a wait cannot outlive the
+/// response it belongs to.
+pub fn is_waiting_job_tool(name: &str) -> bool {
+    matches!(name, "job_get" | "job_output")
+}
+
 pub fn is_shell_tool(name: &str) -> bool {
     name == shell_tool_name()
 }

@@ -26,7 +26,7 @@ const _: () = assert!(
 /// Default bounded wait for one `job_get`/`job_output` poll. The transport
 /// clamps it to the caller's remaining response budget, so a wait never outlives
 /// the response it is attached to.
-pub(crate) const DEFAULT_JOB_WAIT_MS: u64 = 90_000;
+pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(90);
 
 /// Advisory checkpoint horizon for one conversation turn. Guidance only: dotlink
 /// never infers a turn boundary, it stamps `ts` and the caller keeps its own.

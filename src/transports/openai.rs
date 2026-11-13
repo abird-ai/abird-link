@@ -3177,7 +3177,7 @@ fn annotate_response_context(
     let durable_shell = shell || (tools_call && name == Some("job_start"));
     // The job tools that can wait need the same remaining-window metadata the
     // shell uses, so a bounded wait can never outlive the response.
-    let waits_on_job = tools_call && matches!(name, Some("job_get" | "job_output"));
+    let waits_on_job = tools_call && name.is_some_and(crate::mcp::is_waiting_job_tool);
     // Missing and null metadata are both valid MCP representations. Normalize
     // either to an object before adding authenticated transport constraints.
     let Some(params) = jsonrpc.get_mut("params").and_then(Value::as_object_mut) else {
@@ -7489,6 +7489,23 @@ name"
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         };
+
+        // The job tools that can wait receive the same remaining-window
+        // metadata, which is what lets a bounded wait clamp itself; a job tool
+        // that never waits must not receive it.
+        let job_get = |arguments: Value| json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"job_get","arguments":arguments}});
+        let mut waiting = job_get(json!({"job_id":"x"}));
+        assert_eq!(
+            annotate_response_context(&mut waiting, window, reserve, "job-request", "token"),
+            Ok(Some(90))
+        );
+        assert_eq!(sync_meta(&waiting), Some(90_000));
+        let mut listing = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"job_list","arguments":{}}});
+        assert_eq!(
+            annotate_response_context(&mut listing, window, reserve, "job-request", "token"),
+            Ok(None)
+        );
+        assert_eq!(sync_meta(&listing), None);
 
         // A client that grants less than the hold keeps the reserve-only budget:
         // the clamp narrows an oversized window, it never lengthens a short one.

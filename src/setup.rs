@@ -2773,10 +2773,14 @@ fn resolve_config_override(
     canonical: Option<OsString>,
     legacy: Option<OsString>,
 ) -> (Option<PathBuf>, bool) {
-    if let Some(path) = canonical {
+    // An empty variable is absent, not a path: systemd and shells both export
+    // empty strings easily, and an empty override would silently redirect the
+    // whole profile lookup.
+    let set = |value: Option<OsString>| value.filter(|path| !path.is_empty());
+    if let Some(path) = set(canonical) {
         return (Some(PathBuf::from(path)), false);
     }
-    match legacy {
+    match set(legacy) {
         Some(path) => (Some(PathBuf::from(path)), true),
         None => (None, false),
     }
@@ -4443,6 +4447,15 @@ mod tests {
             (Some(PathBuf::from(&legacy)), true)
         );
         assert_eq!(resolve_config_override(None, None), (None, false));
+        // An empty value is absent, so a blank export cannot redirect the profile.
+        assert_eq!(
+            resolve_config_override(Some(OsString::new()), Some(legacy.clone())),
+            (Some(PathBuf::from(&legacy)), true)
+        );
+        assert_eq!(
+            resolve_config_override(Some(OsString::new()), None),
+            (None, false)
+        );
     }
 
     #[test]

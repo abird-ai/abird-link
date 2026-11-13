@@ -9,10 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - JSON results from shell and job tools carry `ts` (UTC epoch seconds), and the server instructions plus the shell description ask the caller to anchor a turn on its first `ts` and checkpoint a summary around `TURN_CHECKPOINT_MINUTES` (40). dotlink never infers a turn boundary: the anchor lives in the caller's context, and per-job `elapsed_ms` stays the anchor-free age of the longest-running piece.
-
-### Added
-
-- `job_get` and `job_output` accept `wait_ms`, so one request can wait for a job to finish or for output past `offset` instead of the caller polling every few seconds. The 90 s default applies only where a transport supplies a response window (`DEFAULT_JOB_WAIT_MS`), an explicit value is always clamped to the remaining window, and `0` still answers immediately — stdio, local HTTP and the test harness stay non-blocking.
+- `job_get` and `job_output` accept `wait_secs`, so one request can wait for a job to finish or for output past `offset` instead of the caller polling every few seconds. The 90 s default (`DEFAULT_JOB_WAIT`) applies only where a transport supplies a response window, an explicit value is always clamped to what remains of that window, and `0` answers immediately — stdio, local HTTP and the test harness stay non-blocking.
 
 ### Changed
 
