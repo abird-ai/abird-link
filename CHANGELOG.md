@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-11-13
+
+### Fixed
+
+- `grep` accepts a single file as `path`, not only a directory. Naming a file searched that file directly before reporting `not a directory: … (use read for a single file)`, which cost the caller a turn and often a much larger `read` than the search needed. Directory searches are unchanged; discovery, `glob` and `.gitignore` filtering are skipped for an explicit file, while the scan, file-size and result budgets still apply.
+
 ## [0.15.1] - 2026-11-13
 
 ### Added
@@ -552,6 +558,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Embedded rmcp server with local filesystem and Bash tools.
 
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
+[0.15.2]: https://github.com/abird-ai/dotlink/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/abird-ai/dotlink/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/abird-ai/dotlink/compare/v0.14.8...v0.15.0
 [0.14.8]: https://github.com/abird-ai/dotlink/compare/v0.14.7...v0.14.8
