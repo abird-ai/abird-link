@@ -4101,13 +4101,41 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
+        // The stored result must render identically every time: a render-time
+        // clock would drift here and break every replay. The task *envelope* is
+        // deliberately time-variable (`ttl_ms` re-anchors on late delivery), so
+        // the stable contract is the result payload, not the envelope.
+        let result_of = |task: &rmcp::model::DetailedTask| match &task.payload {
+            rmcp::model::TaskPayload::Completed { result } => serde_json::to_value(result).unwrap(),
+            other => panic!("expected a completed payload, got {other:?}"),
+        };
+        let rendered_again = machine.jobs.detailed_task(&task_id).unwrap();
+        assert_eq!(
+            result_of(&rendered_again),
+            result_of(&completed),
+            "a stored native-task result must be byte-identical across renders"
+        );
         let rmcp::model::TaskPayload::Completed { result } = completed.payload else {
             panic!("native task did not complete with a tool result")
         };
         let task_result: CallToolResult = serde_json::from_value(Value::Object(result)).unwrap();
+        // `expected` came from a separate execution of an equivalent command, so
+        // its wall-clock stamp legitimately differs; every other field is the
+        // contract this test is about.
+        let without_clock = |result: &CallToolResult| {
+            let mut value = serde_json::to_value(result).unwrap();
+            if let Some(text) = value["content"][0]["text"].as_str() {
+                let mut payload: Value = serde_json::from_str(text).unwrap();
+                if let Some(fields) = payload.as_object_mut() {
+                    fields.remove("ts");
+                }
+                value["content"][0]["text"] = Value::String(payload.to_string());
+            }
+            value
+        };
         assert_eq!(
-            serde_json::to_value(&task_result).unwrap(),
-            serde_json::to_value(&expected).unwrap(),
+            without_clock(&task_result),
+            without_clock(&expected),
             "SEP-2663 tasks/get must inline the original tools/call result"
         );
 
