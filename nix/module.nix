@@ -168,8 +168,14 @@
       type = types.enum ["lifecycle" "tools" "requests"];
       default = verbosityDefault;
       description = ''
-        Lifecycle status only, tool activity (-v), or MCP request diagnostics
-        (-vv). Tool logging may contain paths and command fragments.
+        Lifecycle status only, tool activity, or MCP request diagnostics.
+        Tool logging may contain paths and command fragments.
+
+        Passed as `DOTLINK_VERBOSITY`, not as a command-line flag, so the
+        deployment keeps the usual order: explicit CLI flag > `DOTLINK_*`
+        environment > saved profile > built-in default. A drop-in can therefore
+        override this without replacing `ExecStart`, and `lifecycle` emits
+        nothing so the built-in default applies.
       '';
     };
     extraPackages = mkOption {
@@ -322,9 +328,7 @@
       ++ map (vendor: "--allow-gpu=${vendor}") instance.hostAccess.gpu
       ++ lib.mapAttrsToList (name: mode: "--allow-cache-${name}=${mode}") instance.cacheAccess
       ++ lib.optionals instance.serialize ["--serialize"]
-      ++ lib.optionals (profile != null) ["--profile=${profile}"]
-      ++ lib.optionals (instance.logging.verbosity == "tools") ["-v"]
-      ++ lib.optionals (instance.logging.verbosity == "requests") ["-vv"];
+      ++ lib.optionals (profile != null) ["--profile=${profile}"];
     credentials =
       lib.optionals (instance.credentials.runtimeApiKeyFile != null)
       ["dotlink-api-key:${instance.credentials.runtimeApiKeyFile}"]
@@ -333,6 +337,9 @@
     serviceEnv =
       instance.environment
       // {DOTLINK_SUPERVISOR = "systemd";}
+      // lib.optionalAttrs (instance.logging.verbosity != "lifecycle") {
+        DOTLINK_VERBOSITY = instance.logging.verbosity;
+      }
       // lib.optionalAttrs (instance.sshAgentSocket != null) {
         DOTLINK_SSH_AGENT_SOCKET = instance.sshAgentSocket;
       }
