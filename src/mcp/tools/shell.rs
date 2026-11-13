@@ -163,12 +163,43 @@ fn shell_output_description(max_bytes: usize) -> String {
     )
 }
 
+/// Shell tool description. Both the window it states and the follow-up it
+/// recommends come from shared sources, so neither can drift from behaviour.
+fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
+    // The sentence is identical on every surface that hands back a handle.
+    let follow_up = format!(
+        "{}; {}",
+        crate::jobs::shell_job_follow_up(None),
+        crate::jobs::SHELL_JOB_DO_NOT_REPEAT
+    );
+    match sync_hold {
+        Some(hold) => format!(
+            "Run a {shell} command. If it is still running after {}s, this returns a job handle instead of output and the command keeps running; {follow_up}.",
+            hold.as_secs()
+        ),
+        None => format!(
+            "Run a {shell} command. This waits until the command finishes or timeout_secs expires; job_start runs it in the background and returns the same handle: {follow_up}."
+        ),
+    }
+}
+
 /// Tool schemas are static, the policy ceilings are not. Replace the limit
 /// arguments' descriptions with the numbers this profile actually enforces.
-pub(crate) fn with_profile_limits(mut tool: Tool, max_secs: u64, max_bytes: usize) -> Tool {
+pub(crate) fn with_profile_limits(
+    mut tool: Tool,
+    max_secs: u64,
+    max_bytes: usize,
+    sync_hold: Option<Duration>,
+) -> Tool {
     if !crate::mcp::is_shell_tool(tool.name.as_ref()) {
         return tool;
     }
+    let shell = if tool.name.as_ref() == "powershell" {
+        "PowerShell"
+    } else {
+        "Bash"
+    };
+    tool.description = Some(shell_tool_description(shell, sync_hold).into());
     let mut schema = (*tool.input_schema).clone();
     let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return tool;
@@ -2578,7 +2609,7 @@ impl LocalMachine {
                 stderr,
             )
             .with_context(result_context),
-            JobStatus::Working => unreachable!(),
+            JobStatus::Running => unreachable!(),
         }
     }
 
@@ -2780,6 +2811,8 @@ mod tests {
                 max_write_bytes: max_bytes,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), None),
@@ -3331,6 +3364,8 @@ mod tests {
             max_write_bytes: 16 * 1024,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: 60,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3363,7 +3398,7 @@ mod tests {
         assert!(Arc::ptr_eq(&gate, &second.operation_gate));
         for _ in 0..100 {
             let status: Value = serde_json::from_str(&second.jobs.status(&id).unwrap()).unwrap();
-            if status["status"] != "working" {
+            if status["status"] != "running" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3462,7 +3497,14 @@ mod tests {
             "queued job creation waited on the serialize gate"
         );
         let queued: Value = serde_json::from_str(&machine.jobs.status(&second).unwrap()).unwrap();
-        assert_eq!(queued["phase"], "queued", "{queued}");
+        assert_eq!(queued["status"], "running", "{queued}");
+        assert!(
+            machine
+                .jobs
+                .phase(&second)
+                .is_some_and(|phase| phase == crate::jobs::JobPhase::Queued),
+            "queued job must not have started yet"
+        );
         assert!(
             !late_dir.exists(),
             "test precondition: queued working directory must not exist yet"
@@ -3472,7 +3514,7 @@ mod tests {
         for _ in 0..200 {
             let status: Value =
                 serde_json::from_str(&machine.jobs.status(&second).unwrap()).unwrap();
-            if status["status"] != "working" {
+            if status["status"] != "running" {
                 assert_eq!(status["status"], "completed", "{status}");
                 break;
             }
@@ -3561,7 +3603,7 @@ mod tests {
             .get(crate::mcp::shell_tool_name())
             .cloned()
             .unwrap();
-        let patched = with_profile_limits(shell.clone(), 42, 2048);
+        let patched = with_profile_limits(shell.clone(), 42, 2048, None);
         let properties = patched.input_schema["properties"].as_object().unwrap();
         let timeout = properties["timeout_secs"]["description"].as_str().unwrap();
         let output = properties["max_output_bytes"]["description"]
@@ -3570,10 +3612,27 @@ mod tests {
         assert!(timeout.contains("42"), "{timeout}");
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
         assert!(output.contains("2048"), "{output}");
+        // The description states the real hold and the shared follow-up, so
+        // neither can drift from behaviour.
+        let description = patched.description.as_deref().unwrap();
+        assert!(
+            description.contains(&crate::jobs::shell_job_follow_up(None)),
+            "{description}"
+        );
+        assert!(description.contains("Bash"), "{description}");
+        let tunnel = with_profile_limits(shell.clone(), 42, 2048, Some(Duration::from_secs(30)));
+        let tunnel = tunnel.description.as_deref().unwrap();
+        assert!(tunnel.contains("after 30s"), "{tunnel}");
+        // A local transport never hands off early, and must not claim a window.
+        assert!(!description.contains("after "), "{description}");
+        assert!(
+            description.contains("waits until the command finishes"),
+            "{description}"
+        );
         // Non-shell tools keep their static schemas.
         let read = LocalMachine::all_tools().get("read").cloned().unwrap();
         assert_eq!(
-            with_profile_limits(read.clone(), 42, 2048).input_schema,
+            with_profile_limits(read.clone(), 42, 2048, None).input_schema,
             read.input_schema
         );
     }
@@ -3737,14 +3796,14 @@ mod tests {
         for _ in 0..100 {
             let status: Value =
                 serde_json::from_str(&machine.jobs.status(&compat_id).unwrap()).unwrap();
-            if status["status"] != "working" {
+            if status["status"] != "running" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let compat_status: Value =
             serde_json::from_str(&machine.jobs.status(&compat_id).unwrap()).unwrap();
-        assert_ne!(compat_status["status"], "working");
+        assert_ne!(compat_status["status"], "running");
         for _ in 0..100 {
             if machine
                 .jobs
@@ -3864,6 +3923,21 @@ mod tests {
         let receipt: Value = serde_json::from_str(receipt_text).unwrap();
         assert_eq!(receipt["status"], "completed", "{receipt}");
         assert_eq!(receipt["async"], true, "{receipt}");
+        // Instructions live in one prose field; pointers stay plain tool names,
+        // and the receipt proves progress so a model does not re-run the work.
+        assert!(
+            receipt["next"]
+                .as_str()
+                .is_some_and(|text| text.contains("don't re-run")),
+            "{receipt}"
+        );
+        assert!(receipt["elapsed_ms"].is_u64(), "{receipt}");
+        assert!(receipt["stdout_bytes"].is_u64(), "{receipt}");
+        // No duplicated pointer keys: the instructions field is the only place
+        // the follow-up tool names appear.
+        for absent in ["poll", "output", "ack", "cancel"] {
+            assert!(receipt.get(absent).is_none(), "{receipt}");
+        }
         let job_id = receipt["job_id"].as_str().unwrap();
         let page: Value = serde_json::from_str(
             &machine
@@ -3913,6 +3987,21 @@ mod tests {
         let text = value["content"][0]["text"].as_str().unwrap();
         let receipt: Value = serde_json::from_str(text).unwrap();
         assert_eq!(receipt["async"], true, "{receipt}");
+        // Instructions live in one prose field; pointers stay plain tool names,
+        // and the receipt proves progress so a model does not re-run the work.
+        assert!(
+            receipt["next"]
+                .as_str()
+                .is_some_and(|text| text.contains("don't re-run")),
+            "{receipt}"
+        );
+        assert!(receipt["elapsed_ms"].is_u64(), "{receipt}");
+        assert!(receipt["stdout_bytes"].is_u64(), "{receipt}");
+        // No duplicated pointer keys: the instructions field is the only place
+        // the follow-up tool names appear.
+        for absent in ["poll", "output", "ack", "cancel"] {
+            assert!(receipt.get(absent).is_none(), "{receipt}");
+        }
         let job_id = receipt["job_id"].as_str().unwrap();
         let status: Value = serde_json::from_str(&machine.jobs.status(job_id).unwrap()).unwrap();
         assert_eq!(status["status"], "completed");
@@ -4079,6 +4168,11 @@ mod tests {
         let receipt: Value = serde_json::from_str(text).unwrap();
         assert_eq!(receipt["async"], true);
         assert!(receipt["job_id"].as_str().is_some());
+        assert!(
+            receipt["next"]
+                .as_str()
+                .is_some_and(|text| text.contains("job_output"))
+        );
     }
 
     #[cfg(unix)]
@@ -4176,7 +4270,7 @@ mod tests {
 
         let status = loop {
             let status: Value = serde_json::from_str(&machine.jobs.status(&id).unwrap()).unwrap();
-            if status["status"] != "working" {
+            if status["status"] != "running" {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4474,6 +4568,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(
@@ -5047,6 +5143,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5116,6 +5214,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5165,6 +5265,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5219,6 +5321,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -5303,6 +5406,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(
@@ -5380,6 +5485,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(
@@ -5499,6 +5606,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), None),
@@ -5576,6 +5685,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), None),
@@ -5688,6 +5799,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5774,6 +5887,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5866,6 +5981,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -5969,6 +6086,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6056,6 +6175,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6122,6 +6243,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6243,6 +6366,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6300,6 +6425,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -6338,6 +6464,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6402,6 +6530,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6489,6 +6619,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6585,6 +6717,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6676,6 +6810,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6759,6 +6895,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 protected_paths: Vec::new(),
             },
             launchers: PreparedLaunchers::for_test(Some(bash), Some(bwrap)),

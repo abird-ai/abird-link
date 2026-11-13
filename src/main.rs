@@ -1232,6 +1232,7 @@ fn runtime_authority_intent(
         "protected_paths": setup.protected_paths,
         "transport_constraints": {
             "task_result_budget": constraints.task_result_budget,
+            "sync_hold_ms": constraints.sync_hold.map(|hold| hold.as_millis() as u64),
         },
     });
     #[cfg(target_os = "linux")]
@@ -1445,6 +1446,7 @@ async fn prepare_runtime(
         max_read_bytes: setup.config.max_read_bytes,
         max_write_bytes: setup.config.max_write_bytes,
         task_result_budget: transports.constraints().task_result_budget,
+        sync_hold: transports.constraints().sync_hold,
         job_retention_secs: setup.config.job_retention_secs,
         job_spool_bytes: setup.config.job_spool_bytes,
         protected_paths: setup.protected_paths.clone(),
@@ -2257,6 +2259,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: vec![protected_alias.clone()],
@@ -2315,6 +2318,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -2382,6 +2386,7 @@ mod tests {
                 max_read_bytes: 4096,
                 max_write_bytes: 4096,
                 task_result_budget: None,
+                sync_hold: None,
                 job_retention_secs: 60,
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
                 protected_paths: Vec::new(),
@@ -2433,6 +2438,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),

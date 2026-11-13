@@ -73,10 +73,45 @@ fn bounded_job_error(message: impl Into<String>) -> String {
     message
 }
 
+/// Canonical follow-up clauses, in order: (tool, clause).
+///
+/// Add or remove a job tool here and every surface follows: the handoff
+/// receipt, the status payload and the shell tool description. Phrasing rule:
+/// `<tool>(<arg>) to <purpose>`, joined with commas, with one leading `call`
+/// supplied by the renderer. The tool key lets a caller reading one payload
+/// skip the call it already made.
+const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
+    ("job_get", "job_get for status"),
+    ("job_output", "job_output(offset) to read output"),
+    ("job_ack", "job_ack(highest read) to release the spool"),
+    ("job_cancel", "job_cancel to stop it"),
+];
+
+/// The one prohibition that belongs wherever a handle is handed back.
+pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run the command";
+
+/// One follow-up sentence, dropping the tool whose result the caller is already
+/// reading: a `job_get` payload must not tell the caller to call `job_get`.
+pub(crate) fn shell_job_follow_up(already_used: Option<&str>) -> String {
+    let mut text = String::from("call ");
+    let mut first = true;
+    for (tool, clause) in SHELL_JOB_CLAUSES {
+        if Some(*tool) == already_used {
+            continue;
+        }
+        if !first {
+            text.push_str(", ");
+        }
+        first = false;
+        text.push_str(clause);
+    }
+    text
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobStatus {
-    Working,
+    Running,
     Completed,
     TimedOut,
     Failed,
@@ -85,7 +120,7 @@ pub(crate) enum JobStatus {
 
 impl JobStatus {
     fn terminal(self) -> bool {
-        self != Self::Working
+        self != Self::Running
     }
 }
 
@@ -327,10 +362,15 @@ struct JobEntry {
 }
 
 impl JobEntry {
+    #[cfg(test)]
+    fn phase(&self) -> JobPhase {
+        self.phase
+    }
+
     fn status(&self) -> JobStatus {
         self.completion
             .as_ref()
-            .map_or(JobStatus::Working, |completion| completion.status)
+            .map_or(JobStatus::Running, |completion| completion.status)
     }
 
     fn stream_released(&self, stream: JobStream) -> bool {
@@ -1363,6 +1403,14 @@ impl JobManager {
         Ok(render_status_locked(&self.inner, entry))
     }
 
+    /// Lifecycle stage only; tool payloads expose the single normalized
+    /// `status` instead, so this stays test-facing.
+    #[cfg(test)]
+    pub(crate) fn phase(&self, id: &str) -> Option<JobPhase> {
+        let state = self.inner.state.lock().expect("job manager lock");
+        state.jobs.get(id).map(JobEntry::phase)
+    }
+
     pub(crate) fn status(&self, id: &str) -> JobResult<String> {
         sweep_expired(&self.inner);
         let state = self.inner.state.lock().expect("job manager lock");
@@ -1385,7 +1433,6 @@ impl JobManager {
             "jobs": jobs.into_iter().take(limit).map(|entry| serde_json::json!({
                 "job_id": entry.id,
                 "status": entry.status(),
-                "phase": entry.phase,
                 "created_at": entry.created_at,
                 "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             })).collect::<Vec<_>>(),
@@ -1991,7 +2038,7 @@ impl JobManager {
             (task, status, internal_error, snapshot)
         };
         let payload = match status {
-            JobStatus::Working => TaskPayload::Working,
+            JobStatus::Running => TaskPayload::Working,
             JobStatus::Cancelled => TaskPayload::Cancelled,
             JobStatus::Completed | JobStatus::TimedOut | JobStatus::Failed => {
                 if let Some(message) = internal_error {
@@ -2087,12 +2134,15 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
     };
 
-    let error = (completion.status == JobStatus::TimedOut).then(|| {
+    let timed_out = completion.status == JobStatus::TimedOut;
+    let error = timed_out.then(|| {
         format!(
-            "command timed out after {} seconds and was terminated; use job_start for explicitly background execution or retry with a different timeout when the caller and transport permit it",
+            "command timed out after {} seconds and was terminated",
             snapshot.timeout_secs
         )
     });
+    let next = timed_out
+        .then_some("job_start starts it in the background, or retry with a larger timeout_secs");
     let text = serde_json::json!({
         "exit_code": completion.exit_code,
         "success": completion.success,
@@ -2105,6 +2155,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "error": error.as_deref().or(completion.error.as_deref()),
+        "next": next,
     })
     .to_string();
     Ok(if completion.status == JobStatus::Completed {
@@ -2317,7 +2368,6 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
         "job_id": entry.id,
         "task_id": entry.id,
         "status": entry.status(),
-        "phase": entry.phase,
         "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         "timeout_secs": entry.timeout_secs,
         "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
@@ -2341,8 +2391,7 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
             "truncated": completion.is_some_and(|value| value.stderr.truncated),
             "released": entry.stderr_released,
         },
-        "output": "use job_output to read; job_ack explicitly advances cleanup watermarks",
-        "cancel": "use job_cancel while status=working",
+        "next": shell_job_follow_up(Some("job_get")),
     })
     .to_string()
 }
@@ -2422,18 +2471,22 @@ fn task_retention_anchor(entry: &JobEntry) -> Option<Instant> {
 fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
+            // One short field carries the follow-up. The rest of the payload is
+            // data: repeating tool names as pointer keys only invites drift.
+            "next": format!(
+                "no output in this reply; {}; {SHELL_JOB_DO_NOT_REPEAT}",
+                shell_job_follow_up(None)
+            ),
             "job_id": entry.id,
             "task_id": entry.id,
             "status": entry.status(),
-            "phase": entry.phase,
+            "async": true,
+            "elapsed_ms": u64::try_from(entry.created.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "stdout_bytes": entry.stdout_retained,
+            "stderr_bytes": entry.stderr_retained,
             "timeout_secs": entry.timeout_secs,
             "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
             "spool_session_limit_bytes": inner.spool_limit_bytes.load(Ordering::Relaxed),
-            "async": true,
-            "poll": "job_get",
-            "output": "job_output",
-            "ack": "job_ack",
-            "cancel": "job_cancel",
         })
         .to_string(),
     )])
@@ -2964,7 +3017,7 @@ fn sweep_expired(inner: &JobManagerInner) {
 
 fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
     let status = match entry.status() {
-        JobStatus::Working => TaskStatus::Working,
+        JobStatus::Running => TaskStatus::Working,
         JobStatus::Cancelled => TaskStatus::Cancelled,
         JobStatus::Completed | JobStatus::TimedOut => TaskStatus::Completed,
         JobStatus::Failed
@@ -3011,6 +3064,24 @@ pub(crate) fn spool_limit() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_up_names_every_job_tool_once() {
+        let all = shell_job_follow_up(None);
+        assert_eq!(
+            all,
+            "call job_get for status, job_output(offset) to read output, job_ack(highest read) to release the spool, job_cancel to stop it",
+            "{all}"
+        );
+        // A payload from one job tool never tells the caller to call it again.
+        let from_status = shell_job_follow_up(Some("job_get"));
+        assert_eq!(
+            from_status,
+            "call job_output(offset) to read output, job_ack(highest read) to release the spool, job_cancel to stop it",
+            "{from_status}"
+        );
+        assert!(!from_status.contains("job_get"), "{from_status}");
+    }
 
     #[test]
     fn working_task_ttl_is_unlimited_until_queue_and_execution_finish() {
@@ -4956,7 +5027,7 @@ mod tests {
         for _ in 0..100 {
             let status: serde_json::Value =
                 serde_json::from_str(&manager.status(&first.id).unwrap()).unwrap();
-            if status["status"] != "working" {
+            if status["status"] != "running" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

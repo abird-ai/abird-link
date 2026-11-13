@@ -18,7 +18,7 @@ pub(crate) const OPENAI_TUNNEL_DELIVERY_RESERVE: Duration = Duration::from_secs(
 /// here. Consuming the remaining window in full therefore races the caller's own
 /// timeout and loses the response, and durable execution makes those last
 /// seconds worth nothing. Past this point the same job handle is returned.
-pub(crate) const OPENAI_TUNNEL_SYNC_HOLD: Duration = Duration::from_secs(90);
+pub(crate) const OPENAI_TUNNEL_SYNC_HOLD: Duration = Duration::from_secs(30);
 const _: () = assert!(
     OPENAI_TUNNEL_SYNC_HOLD.as_secs() + OPENAI_TUNNEL_DELIVERY_RESERVE.as_secs()
         < OPENAI_TUNNEL_REQUEST_DEADLINE.as_secs()

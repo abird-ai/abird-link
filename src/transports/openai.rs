@@ -3486,6 +3486,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -3636,6 +3637,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -4321,6 +4323,8 @@ mod tests {
             max_write_bytes: 1024,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -4568,6 +4572,8 @@ mod tests {
                     max_write_bytes: 1024,
 
                     task_result_budget: None,
+
+                    sync_hold: None,
                     job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
                     job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -4672,6 +4678,8 @@ mod tests {
             max_write_bytes: 1024 * 1024,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -5677,6 +5685,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -6409,6 +6418,8 @@ name"
             max_write_bytes: 1024,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -6896,6 +6907,7 @@ name"
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: 60,
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
             protected_paths: Vec::new(),
@@ -7012,6 +7024,8 @@ name"
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: 60,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7066,7 +7080,7 @@ name"
         let polled = terminal(&polled, 2);
         let status: Value =
             serde_json::from_str(polled["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(status["status"], "working");
+        assert_eq!(status["status"], "running");
 
         let cancelled_at = Instant::now();
         let cancelled = mcp
@@ -7089,7 +7103,7 @@ name"
             let value: Value =
                 serde_json::from_str(polled["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
-            if value["status"] != "working" {
+            if value["status"] != "running" {
                 final_status = value["status"].as_str().map(str::to_owned);
                 break;
             }
@@ -7479,14 +7493,14 @@ name"
         assert_eq!(
             annotate_response_context(
                 &mut short,
-                Duration::from_secs(60),
+                Duration::from_secs(20),
                 reserve,
                 "request",
                 "token",
             ),
-            Ok(Some(55))
+            Ok(Some(15))
         );
-        assert_eq!(sync_meta(&short), Some(55_000));
+        assert_eq!(sync_meta(&short), Some(15_000));
 
         // Omitted execution timeout stays omitted: the durable runner uses the
         // profile ceiling. The transport budget controls only how long this
@@ -7501,10 +7515,10 @@ name"
         });
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(90))
+            Ok(Some(30))
         );
         assert_eq!(call.pointer("/params/arguments/timeout_secs"), None);
-        assert_eq!(sync_meta(&call), Some(90_000));
+        assert_eq!(sync_meta(&call), Some(30_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
         let meta = call["params"]["_meta"].as_object().unwrap();
         assert!(!meta.contains_key("io.abird.dotlink/futureField"));
@@ -7529,13 +7543,13 @@ name"
             let mut call = shell(json!({"command":"true","timeout_secs":value}));
             assert_eq!(
                 annotate_response_context(&mut call, window, reserve, "request", "token"),
-                Ok(Some(90))
+                Ok(Some(30))
             );
             assert_eq!(
                 call.pointer("/params/arguments/timeout_secs"),
                 Some(&json!(value))
             );
-            assert_eq!(sync_meta(&call), Some(90_000));
+            assert_eq!(sync_meta(&call), Some(30_000));
         }
 
         // Invalid argument types are also left untouched for schema validation;
@@ -7543,13 +7557,13 @@ name"
         let mut call = shell(json!({"command":"true","timeout_secs":"600"}));
         assert_eq!(
             annotate_response_context(&mut call, window, reserve, "request", "token"),
-            Ok(Some(90))
+            Ok(Some(30))
         );
         assert_eq!(
             call.pointer("/params/arguments/timeout_secs"),
             Some(&json!("600"))
         );
-        assert_eq!(sync_meta(&call), Some(90_000));
+        assert_eq!(sync_meta(&call), Some(30_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
 
         // Explicit background jobs carry request identity but no synchronous
@@ -7620,6 +7634,8 @@ name"
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -7721,6 +7737,8 @@ name"
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,

@@ -58,6 +58,7 @@ pub(crate) fn test_machine_with(
         max_output_bytes: 65536,
         max_read_bytes: 65536,
         max_write_bytes: 65536,
+        sync_hold: None,
 
         task_result_budget: None,
         protected_paths: Vec::new(),

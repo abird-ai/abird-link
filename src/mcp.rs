@@ -75,6 +75,9 @@ pub struct MachineConfig {
     /// transports sharing this runtime. None means every active transport is
     /// effectively unbounded for task results.
     pub task_result_budget: Option<usize>,
+    /// Longest synchronous hold the active transports impose; None waits for
+    /// the command to finish. Drives the advertised shell description.
+    pub sync_hold: Option<std::time::Duration>,
     pub job_retention_secs: u64,
     pub job_spool_bytes: u64,
     pub protected_paths: Vec<PathBuf>,
@@ -177,6 +180,7 @@ struct RuntimeConfig {
     max_read_bytes: usize,
     max_write_bytes: usize,
     task_result_budget: Option<usize>,
+    sync_hold: Option<std::time::Duration>,
     protected_paths: Vec<PathBuf>,
 }
 
@@ -1900,6 +1904,7 @@ impl LocalMachine {
             max_read_bytes,
             max_write_bytes,
             task_result_budget: args.task_result_budget,
+            sync_hold: args.sync_hold,
             protected_paths,
         };
         let authority = prepared_authority_value(
@@ -2560,6 +2565,7 @@ impl rmcp::ServerHandler for LocalMachine {
                         tool,
                         self.config.max_shell_timeout_secs,
                         self.config.max_output_bytes,
+                        self.config.sync_hold,
                     );
                     tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
                     tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
@@ -2584,6 +2590,7 @@ impl rmcp::ServerHandler for LocalMachine {
                 tool,
                 self.config.max_shell_timeout_secs,
                 self.config.max_output_bytes,
+                self.config.sync_hold,
             );
             tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
             tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
@@ -2972,6 +2979,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3017,6 +3026,8 @@ mod tests {
                 max_write_bytes: 4096,
 
                 task_result_budget: None,
+
+                sync_hold: None,
                 job_retention_secs: 60,
 
                 job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3067,6 +3078,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3119,6 +3132,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3187,6 +3202,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3247,6 +3264,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3592,6 +3611,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes: 4096,
             task_result_budget: None,
+            sync_hold: None,
             protected_paths: Vec::new(),
         };
         let secure_fs = crate::secure_fs::SecureFs::new(
@@ -3653,6 +3673,7 @@ mod tests {
             max_read_bytes: 4096,
             max_write_bytes,
             task_result_budget: None,
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3770,6 +3791,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
@@ -3903,6 +3926,8 @@ mod tests {
             max_write_bytes: 4096,
 
             task_result_budget: None,
+
+            sync_hold: None,
             job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
 
             job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,

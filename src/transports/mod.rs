@@ -247,6 +247,10 @@ pub(crate) struct TransportConstraints {
     /// transport sharing one LocalMachine. None means all active transports can
     /// carry the profile-derived exact task result.
     pub(crate) task_result_budget: Option<usize>,
+    /// Longest synchronous hold the active transports impose on a shell call.
+    /// None means no transport stops waiting early: the call waits for the
+    /// command. Advertised to the model so it knows when a handle is expected.
+    pub(crate) sync_hold: Option<std::time::Duration>,
 }
 
 pub struct ActiveTransports {
@@ -258,10 +262,15 @@ pub struct ActiveTransports {
 impl ActiveTransports {
     pub(crate) fn constraints(&self) -> TransportConstraints {
         let mut task_result_budget = None;
+        let mut sync_hold = None;
         if self.openai.is_some() {
             task_result_budget = Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES);
+            sync_hold = Some(crate::limits::OPENAI_TUNNEL_SYNC_HOLD);
         }
-        TransportConstraints { task_result_budget }
+        TransportConstraints {
+            task_result_budget,
+            sync_hold,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
