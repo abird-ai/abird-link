@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-11-13
+
+### Added
+
+- Advertised limits now interpolate the constants that enforce them: `{spool}`, `{retention}`, `{grep_scan}`, `{grep_file}`, `{grep_hits}`, `{grep_files}`, `{walk_visits}`, `{read_scan}`, `{patch_files}`, `{patch_hunks}`, `{bedit_ranges}`, `{edit_files}` and `{edit_ops}` resolve at `tools/list` from `MAX_JOB_SPOOL_BYTES_PER_STREAM`, the live `job_retention_secs`, the grep/read/patch/bedit/edit ceilings. Changing a constant or a configured retention now changes what the model reads; a test fails on an unknown or unused placeholder.
+- `job_get`'s `next` is state-driven: a finished job that still holds output asks for `job_ack`, a fully released job omits the field, and `job_cancel` is no longer suggested for a finished job. The instructions and `job_ack` state the consequence — unacked output holds the session spool budget until retention.
+
+### Changed
+
+- Tool descriptions are ~19% shorter (7 902 → 6 422 characters across 16 tools) with every advertised behaviour kept: the job follow-up chain drops to `job_get=status, job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop`, which also shrinks the `next` receipt through the shared clause list.
+- `job_list` no longer claims caller scoping: the manager is process-wide, so entries may belong to another client of the same bridge.
+- `job_ack` names its input — `job_output`'s `next_offset` for the same `stream`.
+
 ## [0.16.3] - 2026-11-13
 
 ### Added
@@ -638,6 +651,7 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
+[0.16.4]: https://github.com/abird-ai/dotlink/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/abird-ai/dotlink/compare/v0.16.2...v0.16.3
 [Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
 [0.16.2]: https://github.com/abird-ai/dotlink/compare/v0.16.1...v0.16.2
