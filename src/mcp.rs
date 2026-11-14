@@ -2471,15 +2471,7 @@ impl LocalMachine {
         tools
             .into_iter()
             .map(|tool| {
-                // A title is an annotation, never the raw description: that text
-                // carries limit placeholders and is rendered only by
-                // `describe_tool`, which this inspection path deliberately skips.
-                let title = tool
-                    .title
-                    .as_deref()
-                    .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
-                    .unwrap_or_default()
-                    .to_owned();
+                let title = tool_title(&tool).unwrap_or_default().to_owned();
                 (tool.name.to_string(), title)
             })
             .collect()
@@ -2541,6 +2533,19 @@ fn tool_call_log_outcome(
         Ok(_) => LogOutcome::neutral("response"),
         Err(_) => LogOutcome::error("protocol-error"),
     }
+}
+
+/// The title a tool advertises: the top-level field, else its annotation.
+///
+/// This is exactly what `--list-tools` prints. It is deliberately never the raw
+/// description, which carries limit placeholders and is rendered only by
+/// `describe_tool` — a path the inspection-only CLI skips.
+fn tool_title(tool: &Tool) -> Option<&str> {
+    tool.title.as_deref().or_else(|| {
+        tool.annotations
+            .as_ref()
+            .and_then(|annotations| annotations.title.as_deref())
+    })
 }
 
 impl LocalMachine {

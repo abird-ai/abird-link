@@ -252,7 +252,8 @@ pub(crate) fn substitute_description_tokens(
     });
 }
 
-/// Every description one tool advertises, in the order it is written.
+/// Every description one tool advertises: its own text, then the input schema
+/// in map order (sorted, since `serde_json` keeps no insertion order).
 #[cfg(test)]
 pub(crate) fn advertised_descriptions(tool: &rmcp::model::Tool) -> Vec<String> {
     let mut descriptions = Vec::new();
@@ -262,6 +263,57 @@ pub(crate) fn advertised_descriptions(tool: &rmcp::model::Tool) -> Vec<String> {
         text
     });
     descriptions
+}
+
+/// Property paths whose schema carries no description. The model reads
+/// arguments from these, so each one must say what it accepts.
+#[cfg(test)]
+pub(crate) fn undocumented_properties(
+    schema: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    fn walk(value: &serde_json::Value, path: &str, missing: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(object) => walk_schema(object, path, missing),
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    walk(child, path, missing);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_schema(
+        schema: &serde_json::Map<String, serde_json::Value>,
+        path: &str,
+        missing: &mut Vec<String>,
+    ) {
+        if let Some(properties) = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (name, property) in properties {
+                let documented = property
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty());
+                let path = format!("{path}.{name}");
+                if !documented {
+                    missing.push(path.clone());
+                }
+                walk(property, &path, missing);
+            }
+        }
+        for (key, child) in schema {
+            if key != "properties" && !DATA_KEYWORDS.contains(&key.as_str()) {
+                walk(child, path, missing);
+            }
+        }
+    }
+
+    let mut missing = Vec::new();
+    walk_schema(schema, "inputSchema", &mut missing);
+    missing
 }
 
 #[cfg(test)]
@@ -1561,11 +1613,13 @@ mod tests {
         for tool in crate::mcp::LocalMachine::all_tools().list_all() {
             let name = tool.name.to_string();
             assert!(
-                tool.annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.title.as_deref())
-                    .is_some(),
-                "{name} needs an annotation title: --list-tools prints titles, never raw description text"
+                crate::mcp::tool_title(&tool).is_some(),
+                "{name} needs a title: --list-tools prints titles, never raw description text"
+            );
+            let undocumented = super::undocumented_properties(&tool.input_schema);
+            assert!(
+                undocumented.is_empty(),
+                "{name} documents no description for {undocumented:?}"
             );
             // Authored text: single line, and every placeholder it uses counts.
             for text in super::advertised_descriptions(&tool) {

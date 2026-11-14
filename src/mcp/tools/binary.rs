@@ -165,21 +165,32 @@ pub(crate) fn with_read_limit(tool: &mut Tool, max_bytes: usize) {
         .and_then(|properties| properties.get_mut("limit"))
         .and_then(serde_json::Value::as_object_mut)
     {
+        let base64 = binary_raw_response_ceiling(
+            BreadFormat::Base64,
+            max_bytes,
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+        );
+        let hex = binary_raw_response_ceiling(
+            BreadFormat::Hex,
+            max_bytes,
+            Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
+        );
+        // One clause when the profile ceiling binds both encodings, two when the
+        // encoded response budget binds them differently.
+        let fits = if base64 == hex {
+            format!("up to {}", super::human_bytes(base64 as u64))
+        } else {
+            format!(
+                "up to {} (base64/MCP) or {} (hex)",
+                super::human_bytes(base64 as u64),
+                super::human_bytes(hex as u64)
+            )
+        };
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Maximum raw bytes for this call, capped at the {} profile read ceiling. On OpenAI, an omitted limit fits the selected encoding inside the MCP response budget (base64/MCP up to {}, hex up to {}); use offset for additional chunks.",
+                "Maximum raw bytes for this call, capped at the {} profile read ceiling. On OpenAI, an omitted limit fits the selected encoding inside the MCP response budget ({fits}); use offset for additional chunks.",
                 super::human_bytes(max_bytes as u64),
-                super::human_bytes(binary_raw_response_ceiling(
-                    BreadFormat::Base64,
-                    max_bytes,
-                    Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
-                ) as u64),
-                super::human_bytes(binary_raw_response_ceiling(
-                    BreadFormat::Hex,
-                    max_bytes,
-                    Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
-                ) as u64),
             )),
         );
         property.insert("maximum".to_owned(), serde_json::Value::from(max_bytes));

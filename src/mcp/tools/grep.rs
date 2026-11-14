@@ -87,7 +87,7 @@ pub(crate) enum GrepOutputMode {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GrepArgs {
-    /// Regular expression, or literal text when `literal` is set. Maximum {grep_pattern} printable characters.
+    /// Regular expression, or literal text when `literal` is set. Maximum {grep_pattern} characters.
     #[schemars(length(max = MAX_GREP_PATTERN))]
     pub(crate) pattern: String,
 
