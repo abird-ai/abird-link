@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.6] - 2026-11-14
+
 ### Added
 
 - Every tool call now reports `notifications/progress` while it blocks: the heartbeat sink moved from the shell module up to `LocalMachine::call_tool`, so it covers the whole tool surface on every transport instead of the handful of tools that a wait happens to be written in. Silence was the problem: 36 responses in one deployment took 60 s or more and 17 took 85 s or more, all of them dead air, so a client could show "still thinking" while the bridge was healthy and a build was simply quiet. `bash` keeps its own sink because that one is clamped to the child's deadline; two sinks would interleave counters on one progress token. Without a caller-supplied progress token nothing is emitted and every path is unchanged.
