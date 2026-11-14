@@ -96,7 +96,10 @@ fn shell_timeout_description(max_secs: u64) -> String {
 
 fn shell_output_description(max_bytes: usize) -> String {
     format!(
-        "Ordinary shell-result byte limit per stream. Defaults to the short-page size and is capped at {max_bytes}; ask for a larger size when the output is genuinely needed. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output."
+        "Ordinary shell-result byte limit per stream. Defaults to the short page ({default}) and is capped at {max_bytes}; ask for more when the output is genuinely needed. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output.",
+        default =
+            super::human_bytes((crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(max_bytes)) as u64),
+        max_bytes = super::human_bytes(max_bytes as u64),
     )
 }
 
@@ -3564,7 +3567,9 @@ mod tests {
             .unwrap();
         assert!(timeout.contains("42"), "{timeout}");
         assert!(!timeout.contains("max_shell_timeout_secs"), "{timeout}");
-        assert!(output.contains("2048"), "{output}");
+        // Prose is human-readable; the exact number stays machine-readable.
+        assert!(output.contains("2 KiB"), "{output}");
+        assert_eq!(properties["max_output_bytes"]["maximum"], 2048);
         // The description states the real hold and the shared follow-up, so
         // neither can drift from behaviour.
         let description = patched.description.as_deref().unwrap();

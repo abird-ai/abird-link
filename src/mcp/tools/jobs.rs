@@ -96,8 +96,11 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: 
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Serialized MCP result budget for this page. Defaults to {} and is capped at {max_output_bytes}; must be at least {}.",
-                crate::limits::DEFAULT_OUTPUT_PAGE_BYTES,
+                "Serialized MCP result budget for this page. Defaults to {} and is capped at {}; must be at least {}.",
+                super::human_bytes(
+                    (crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(max_output_bytes)) as u64
+                ),
+                super::human_bytes(max_output_bytes as u64),
                 crate::mcp::MIN_BYTE_LIMIT,
             )),
         );
@@ -198,9 +201,11 @@ struct JobOutputArgs {
     /// Maximum response bytes for this page. Defaults to the short-page size and is capped at the profile ceiling.
     #[serde(default)]
     max_output_bytes: Option<usize>,
-    /// Read the last N bytes of the stream instead of paging from `offset`.
-    /// Mutually exclusive with `offset`; with `wait_secs` it waits for the job to
-    /// finish first, so the tail is final. The page is the end of that window.
+    /// Read the last N bytes of the stream instead of paging from `offset`
+    /// (0 reads one byte). Mutually exclusive with `offset`. Returns at once
+    /// unless `wait_secs` is given, which waits for the job to finish so the tail
+    /// is final. The page is the end of that window; acknowledging it frees the
+    /// whole prefix, including output it did not show.
     #[serde(default)]
     tail_bytes: Option<usize>,
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
@@ -300,7 +305,14 @@ impl LocalMachine {
             .tail_lines
             .unwrap_or(crate::jobs::DEFAULT_TAIL_LINES)
             .min(crate::jobs::MAX_TAIL_LINES);
-        match self.jobs.status_with_tail(&args.job_id, tail_lines) {
+        // The tail reads the spool, so it runs off the async worker; a status
+        // probe with no tail does no I/O beyond the metadata `status` already
+        // needs.
+        let status = match tail_lines {
+            0 => self.jobs.status(&args.job_id),
+            _ => crate::blocking::run(|| self.jobs.status_with_tail(&args.job_id, tail_lines)),
+        };
+        match status {
             Ok(status) => ok_text(status),
             Err(error) => tool_error(error),
         }
@@ -326,14 +338,19 @@ impl LocalMachine {
         let stream = args.stream.into();
         let offset = args.offset.unwrap_or(0);
         let base64 = matches!(args.encoding, OutputEncoding::Base64);
-        let wait = resolve_wait(
-            args.wait_secs,
-            self.request_sync_budget_millis(&context)
-                .map(Duration::from_millis),
-        );
+        let window = self
+            .request_sync_budget_millis(&context)
+            .map(Duration::from_millis);
         if args.tail_bytes.is_some() && args.offset.is_some_and(|value| value > 0) {
             return tool_error("pass either `offset` or `tail_bytes`, not both");
         }
+        // A tail peek is "show me the end now". Only an explicit `wait_secs`
+        // defers it; inheriting the default wait would silently turn every peek
+        // into a wait for completion.
+        let wait = match (args.tail_bytes.is_some(), args.wait_secs) {
+            (true, None) => Duration::ZERO,
+            _ => resolve_wait(args.wait_secs, window),
+        };
         if !wait.is_zero() {
             let deadline = TokioInstant::now() + wait;
             // A tail read wants the end of the stream, so it waits for the job
@@ -427,11 +444,11 @@ mod tests {
         with_job_limits(&mut output, 3600, 8 * 1024 * 1024);
         let output_limit = &output.input_schema["properties"]["max_output_bytes"];
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
+        let output_description = output_limit["description"].as_str().unwrap();
+        assert!(output_description.contains("8 MiB"), "{output_description}");
         assert!(
-            output_limit["description"]
-                .as_str()
-                .unwrap()
-                .contains("8388608")
+            output_description.contains("256 KiB"),
+            "{output_description}"
         );
 
         // The tail peek advertises the same default and cap the handler clamps

@@ -1527,9 +1527,7 @@ impl JobManager {
         state.jobs.get(id).map(JobEntry::phase)
     }
 
-    /// Status without spool reads. Runtime callers use `status_with_tail`;
-    /// tests and internal probes assert on the plain payload.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Status without spool reads: the path a probe with `tail_lines: 0` takes.
     pub(crate) fn status(&self, id: &str) -> JobResult<String> {
         self.status_with_tail(id, 0)
     }
@@ -1547,9 +1545,17 @@ impl JobManager {
             let entry = state
                 .available(id)
                 .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            let payload = render_status_locked(&self.inner, entry);
+            // Read exactly the prefix the reply reports, so the tail can never
+            // be newer than the byte counts next to it.
+            let stdout_stored = stored_bytes_in(&payload, "stdout");
+            let stderr_stored = stored_bytes_in(&payload, "stderr");
             (
-                render_status_locked(&self.inner, entry),
-                [entry.stdout_path.clone(), entry.stderr_path.clone()],
+                payload,
+                [
+                    (entry.stdout_path.clone(), stdout_stored),
+                    (entry.stderr_path.clone(), stderr_stored),
+                ],
             )
         };
         if tail_lines > 0 {
@@ -1557,8 +1563,8 @@ impl JobManager {
             // stderr while progress goes to stdout, and the two spools are
             // independent, so a stream with nothing to show stays silent
             // instead of contributing an empty array.
-            for (key, path) in ["stdout", "stderr"].into_iter().zip(spools) {
-                let Some(lines) = read_tail_lines(&path, tail_lines) else {
+            for (key, (path, stored)) in ["stdout", "stderr"].into_iter().zip(spools) {
+                let Some(lines) = read_tail_lines(&path, stored, tail_lines) else {
                     continue;
                 };
                 if lines.is_empty() {
@@ -2616,35 +2622,51 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
 
 /// The last `lines` lines of one spool stream, best effort. Only a bounded
 /// window is read, so a status probe stays cheap on a huge spool.
-fn read_tail_lines(path: &Path, lines: usize) -> Option<Vec<Value>> {
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len == 0 {
+fn read_tail_lines(path: &Path, stored: u64, lines: usize) -> Option<Vec<Value>> {
+    if stored == 0 || lines == 0 {
         return Some(Vec::new());
     }
-    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    let mut file = File::open(path).ok()?;
+    let start = stored.saturating_sub(TAIL_WINDOW_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut window = Vec::new();
-    file.take(TAIL_WINDOW_BYTES).read_to_end(&mut window).ok()?;
+    file.take(stored - start).read_to_end(&mut window).ok()?;
     let text = String::from_utf8_lossy(&window);
     let mut parts: Vec<&str> = text.split('\n').collect();
-    // A window that starts mid-stream opens with a partial line.
-    if start > 0 && parts.len() > 1 {
-        parts.remove(0);
+    // The window can open mid-line. Drop that fragment, unless it is the only
+    // one, in which case it is the whole tail and is shown as a fragment.
+    let mut fragment = false;
+    if start > 0 {
+        if parts.len() > 1 {
+            parts.remove(0);
+        } else {
+            fragment = true;
+        }
     }
     // A trailing newline does not create an empty final line.
     if parts.last() == Some(&"") {
         parts.pop();
     }
-    Some(
-        parts
-            .iter()
-            .rev()
-            .take(lines)
-            .rev()
-            .map(|line| Value::String(clip_tail_line(line)))
-            .collect(),
-    )
+    let mut tail: Vec<String> = parts
+        .iter()
+        .rev()
+        .take(lines)
+        .rev()
+        .map(|line| clip_tail_line(line))
+        .collect();
+    if fragment && let Some(first) = tail.first_mut() {
+        first.insert(0, '…');
+    }
+    Some(tail.into_iter().map(Value::String).collect())
+}
+
+/// The `stored_bytes` a status payload reports for one stream.
+fn stored_bytes_in(payload: &Value, key: &str) -> u64 {
+    payload
+        .get(key)
+        .and_then(|stream| stream.get("stored_bytes"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// One rendered tail line: CRLF loses its syntax CR, and an over-wide line is
@@ -3673,6 +3695,32 @@ mod tests {
     }
 
     #[test]
+    fn tail_reads_only_the_reported_prefix_and_marks_a_fragment() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stdout");
+        fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+
+        // The caller sees `stored_bytes: 8` ("one\ntwo\n"), so the tail must
+        // come from that prefix — never from lines written after the snapshot.
+        let tail = read_tail_lines(&path, 8, 4).unwrap();
+        assert_eq!(
+            tail,
+            vec![Value::String("one".into()), Value::String("two".into())]
+        );
+
+        // A window that opens mid-line and holds no further newline is a
+        // fragment, and says so instead of pretending to be a whole line.
+        let long = "x".repeat(TAIL_WINDOW_BYTES as usize * 2);
+        fs::write(&path, &long).unwrap();
+        let tail = read_tail_lines(&path, long.len() as u64, 4).unwrap();
+        assert_eq!(tail.len(), 1, "{tail:?}");
+        assert!(
+            tail[0].as_str().unwrap().starts_with('…'),
+            "a mid-line window must be marked: {tail:?}"
+        );
+    }
+
+    #[test]
     fn status_carries_the_tail_of_each_stream_and_honours_the_cap() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let job = manager.create_for_test(30).unwrap();
@@ -3772,7 +3820,7 @@ mod tests {
         let long = "x".repeat(TAIL_LINE_BYTES * 2);
         fs::write(&path, format!("first\r\n{long}\nlast\n")).unwrap();
 
-        let tail = read_tail_lines(&path, 10).unwrap();
+        let tail = read_tail_lines(&path, std::fs::metadata(&path).unwrap().len(), 10).unwrap();
         assert_eq!(tail.len(), 3, "{tail:?}");
         assert_eq!(tail[0], "first", "{tail:?}");
         // An over-wide line is cut on a boundary and says so.
@@ -3785,7 +3833,7 @@ mod tests {
         assert_eq!(tail[2], "last", "{tail:?}");
 
         // A spool that is gone (fully acknowledged) simply has no tail.
-        assert!(read_tail_lines(&temp.path().join("missing"), 10).is_none());
+        assert!(read_tail_lines(&temp.path().join("missing"), 10, 10).is_none());
     }
 
     #[test]
