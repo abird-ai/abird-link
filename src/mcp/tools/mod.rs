@@ -156,6 +156,10 @@ pub(crate) fn description_tokens(job_retention_secs: u64) -> Vec<(&'static str, 
             crate::limits::MAX_JOB_TAIL_LINES.to_string(),
         ),
         ("{grep_context}", grep::MAX_GREP_CONTEXT.to_string()),
+        ("{grep_pattern}", grep::MAX_GREP_PATTERN.to_string()),
+        ("{ls_limit}", ls::DEFAULT_MAX_LIST_ENTRIES.to_string()),
+        ("{ls_limit_max}", ls::MAX_LIST_ENTRIES.to_string()),
+        ("{read_lines}", text::DEFAULT_READ_LINES.to_string()),
         (
             "{grep_files}",
             grep::MAX_GREP_FILES
@@ -172,55 +176,85 @@ pub(crate) fn description_tokens(job_retention_secs: u64) -> Vec<(&'static str, 
     ]
 }
 
-/// Resolve the limit placeholders of one advertised tool.
+/// Rewrite every advertised description of one tool: its own text and each
+/// description anywhere in the input schema, nested definitions included. Text
+/// is edited in place, so a caller that maps to the identity changes nothing.
+fn map_descriptions(tool: &mut rmcp::model::Tool, mut map: impl FnMut(String) -> String) {
+    if let Some(description) = tool.description.as_deref() {
+        let mapped = map(description.to_owned());
+        if mapped.as_str() != description {
+            tool.description = Some(mapped.into());
+        }
+    }
+    let mut schema = (*tool.input_schema).clone();
+    let mut changed = false;
+    for value in schema.values_mut() {
+        changed |= map_descriptions_in(value, &mut map);
+    }
+    if changed {
+        tool.input_schema = std::sync::Arc::new(schema);
+    }
+}
+
+fn map_descriptions_in(
+    value: &mut serde_json::Value,
+    map: &mut impl FnMut(String) -> String,
+) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut changed = false;
+            for (key, child) in object.iter_mut() {
+                if key == "description"
+                    && let Some(text) = child.as_str().map(str::to_owned)
+                {
+                    let mapped = map(text.clone());
+                    if mapped != text {
+                        *child = serde_json::Value::String(mapped);
+                        changed = true;
+                    }
+                } else {
+                    changed |= map_descriptions_in(child, map);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            for child in values {
+                changed |= map_descriptions_in(child, map);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the limit placeholders of one advertised tool through the shared
+/// table, so no description restates a number that could drift.
 pub(crate) fn substitute_description_tokens(
     tool: &mut rmcp::model::Tool,
     tokens: &[(&'static str, String)],
 ) {
-    let resolve = |text: &str| {
-        let mut text = text.to_owned();
+    map_descriptions(tool, |mut text| {
         for (token, value) in tokens {
             if text.contains(token) {
                 text = text.replace(token, value);
             }
         }
         text
-    };
-    if let Some(description) = tool.description.as_deref() {
-        let resolved = resolve(description);
-        if resolved != description {
-            tool.description = Some(resolved.into());
-        }
-    }
-    // Argument descriptions carry the same limits, so they resolve through the
-    // same table instead of restating numbers that could drift.
-    let mut schema = (*tool.input_schema).clone();
-    let Some(properties) = schema
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    let mut changed = false;
-    for property in properties.values_mut() {
-        let Some(object) = property.as_object_mut() else {
-            continue;
-        };
-        let Some(description) = object.get("description").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let resolved = resolve(description);
-        if resolved != description {
-            object.insert(
-                "description".to_owned(),
-                serde_json::Value::String(resolved),
-            );
-            changed = true;
-        }
-    }
-    if changed {
-        tool.input_schema = std::sync::Arc::new(schema);
-    }
+    });
+}
+
+/// Every description one tool advertises, in the order it is written.
+#[cfg(test)]
+pub(crate) fn advertised_descriptions(tool: &rmcp::model::Tool) -> Vec<String> {
+    let mut descriptions = Vec::new();
+    let mut probe = tool.clone();
+    map_descriptions(&mut probe, |text| {
+        descriptions.push(text.clone());
+        text
+    });
+    descriptions
 }
 
 #[cfg(test)]
@@ -1497,45 +1531,48 @@ mod tests {
         unknown
     }
 
+    /// The advertised surface is what the model reads: every description must
+    /// be one line (a wrapped rustdoc comment would ship a literal `\n`), every
+    /// limit placeholder must resolve from its enforcing constant, and no
+    /// declared token may go unused.
     #[test]
-    fn every_advertised_description_resolves_its_limits() {
+    fn advertised_descriptions_are_single_line_and_resolve_their_limits() {
         use std::collections::BTreeSet;
         let tokens = super::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
         let known: Vec<&str> = tokens.iter().map(|(token, _)| *token).collect();
         let mut used = BTreeSet::new();
-        for mut tool in crate::mcp::LocalMachine::all_tools().list_all() {
-            let raw = tool.description.clone().unwrap_or_default();
-            let unknown = unknown_placeholders(&raw, &known);
-            assert!(unknown.is_empty(), "{} uses {unknown:?}", tool.name);
-            // A token may belong to the description or to an argument's
-            // description; both resolve through the same table, so either
-            // place counts as used.
-            let mut texts: Vec<&str> = vec![raw.as_ref()];
-            if let Some(properties) = tool
-                .input_schema
-                .get("properties")
-                .and_then(serde_json::Value::as_object)
-            {
-                texts.extend(properties.values().filter_map(|property| {
-                    property
-                        .get("description")
-                        .and_then(serde_json::Value::as_str)
-                }));
-            }
-            for text in texts {
+        let temp = tempfile::tempdir().unwrap();
+        // Every surface counts, so the fixture advertises the shell too.
+        let machine =
+            test_support::test_machine_with(temp.path().canonicalize().unwrap(), |config| {
+                config.allow_shell = true;
+            });
+        for tool in machine.policy_tool_router().list_all() {
+            // Authored text: single line, and every placeholder it uses counts.
+            for text in super::advertised_descriptions(&tool) {
+                assert!(
+                    !text.contains(['\n', '\r', '\t']),
+                    "{} advertises a control character: {text:?}",
+                    tool.name
+                );
                 for token in &known {
                     if text.contains(token) {
                         used.insert(*token);
                     }
                 }
             }
-            super::substitute_description_tokens(&mut tool, &tokens);
-            let rendered = tool.description.clone().unwrap_or_default();
-            assert!(
-                unknown_placeholders(&rendered, &known).is_empty(),
-                "{} left a placeholder unresolved",
-                tool.name
-            );
+            // Shipped text: no placeholder survives, and the limit patchers
+            // cannot reintroduce a line break.
+            let described = machine.describe_tool(tool, &tokens);
+            for text in super::advertised_descriptions(&described) {
+                assert!(
+                    !text.contains(['\n', '\r', '\t']),
+                    "{} ships a control character: {text:?}",
+                    described.name
+                );
+                let unknown = unknown_placeholders(&text, &known);
+                assert!(unknown.is_empty(), "{} uses {unknown:?}", described.name);
+            }
         }
         for token in known {
             assert!(used.contains(token), "{token} is declared but never used");

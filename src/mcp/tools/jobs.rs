@@ -125,15 +125,10 @@ fn resolve_wait(wait_secs: Option<u64>, budget: Option<Duration>) -> Duration {
 struct JobGetArgs {
     /// Job id from a shell call that returned a handle.
     job_id: String,
-    /// Wait up to this many seconds for the job to finish; 0 answers now.
-    /// Defaults to 90 where the transport supplies a response window and is
-    /// always clamped to what remains of it (90 is also the ceiling without one).
+    /// Wait up to this many seconds for the job to finish; 0 answers now. Defaults to 90 where the transport supplies a response window and is always clamped to what remains of it (90 is also the ceiling without one).
     #[serde(default)]
     wait_secs: Option<u64>,
-    /// Trailing lines of *each* stream (stdout and stderr) to include in this
-    /// reply; a stream with nothing in it is omitted. Defaults to {job_tail}, at
-    /// most {job_tail_max}; 0 returns status only. The end of a build answers
-    /// "how is it going" and "why did it fail" without paging.
+    /// Trailing lines of *each* stream (stdout and stderr) to include in this reply; a stream with nothing in it is omitted. Defaults to {job_tail}, at most {job_tail_max}; 0 returns status only. The end of a build answers "how is it going" and "why did it fail" without paging.
     #[serde(default)]
     tail_lines: Option<usize>,
 }
@@ -152,18 +147,13 @@ struct JobOutputArgs {
     /// Maximum response bytes for this page. Defaults to the short-page size and is capped at the profile ceiling.
     #[serde(default)]
     max_output_bytes: Option<usize>,
-    /// Read the last N bytes instead of paging from `offset` (0 reads one byte);
-    /// exclusive with `offset`. With `wait_secs` it waits for the job to finish
-    /// so the tail is final, and the page is the end of that window.
+    /// Read the last N bytes instead of paging from `offset` (0 reads one byte); exclusive with `offset`. With `wait_secs` it waits for the job to finish so the tail is final, and the page is the end of that window.
     #[serde(default)]
     tail_bytes: Option<usize>,
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
     #[serde(default)]
     encoding: OutputEncoding,
-    /// Wait up to this many seconds for output past `offset` or for the job to
-    /// finish; 0 pages now. Defaults to 90 where the transport supplies a
-    /// response window and is always clamped to what remains of it (90 is also
-    /// the ceiling without one).
+    /// Wait up to this many seconds for output past `offset` or for the job to finish; 0 pages now. Defaults to 90 where the transport supplies a response window and is always clamped to what remains of it (90 is also the ceiling without one).
     #[serde(default)]
     wait_secs: Option<u64>,
 }

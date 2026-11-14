@@ -19,7 +19,7 @@ use super::{
 };
 use crate::mcp::AccessNeed;
 
-const DEFAULT_READ_LINES: usize = 4 * 1024;
+pub(crate) const DEFAULT_READ_LINES: usize = 4 * 1024;
 /// Limit work before a requested line window, independently of output size.
 pub(crate) const MAX_READ_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
@@ -32,18 +32,15 @@ pub(super) struct ReadArgs {
     #[serde(default)]
     offset: Option<usize>,
 
-    /// Maximum number of lines to return. Defaults to 4096, bounded by the profile
-    /// read limit. A capped result ends with one `… truncated at line N` marker.
+    /// Maximum number of lines to return. Defaults to {read_lines}, bounded by the profile read limit. A capped result ends with one `… truncated at line N` marker.
     #[serde(default)]
     limit: Option<usize>,
 
-    /// Prefix each line with its 1-based line number and a tab. Defaults to true.
-    /// Set false to return the file text exactly, byte for byte.
+    /// Prefix each line with its 1-based line number and a tab. Defaults to true. Set false to return the file text exactly, byte for byte.
     #[serde(default)]
     numbered: Option<bool>,
 
-    /// Maximum returned bytes for this call. Defaults to the profile read ceiling
-    /// and is capped there. A capped result ends with a truncation marker.
+    /// Maximum returned bytes for this call. Defaults to the profile read ceiling and is capped there. A capped result ends with a truncation marker.
     #[serde(default)]
     max_read_bytes: Option<usize>,
 }
@@ -177,7 +174,8 @@ pub(crate) fn with_read_limit(tool: &mut Tool, max_bytes: usize) {
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Maximum raw returned bytes for this call. Defaults to {max_bytes} and is capped at {max_bytes}. When the transport supplies a serialized-result budget, the final page also fits that budget, so escape-heavy text may end earlier at a whole-line boundary."
+                "Maximum raw returned bytes for this call. Defaults to {} and is capped there. When the transport supplies a serialized-result budget, the final page also fits that budget, so escape-heavy text may end earlier at a whole-line boundary.",
+                super::human_bytes(max_bytes as u64)
             )),
         );
         property.insert("maximum".to_owned(), serde_json::Value::from(max_bytes));
@@ -414,7 +412,7 @@ impl LocalMachine {
 #[tool_router(router = "text_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Read a UTF-8 text file as numbered lines. `offset` is the 1-based first line (default 1), `limit` the line count (default 4096); each line is prefixed with its number and a tab unless `numbered` is false, which returns the text exactly. A capped window ends with one truncation marker. Skipping to an offset scans at most {read_scan} per call; beyond that use grep or a narrower file. An offset past EOF is an error.",
+        description = "Read a UTF-8 text file as numbered lines. `offset` is the 1-based first line (default 1), `limit` the line count (default {read_lines}); each line is prefixed with its number and a tab unless `numbered` is false, which returns the text exactly. A capped window ends with one truncation marker. Skipping to an offset scans at most {read_scan} per call; beyond that use grep or a narrower file. An offset past EOF is an error.",
         annotations(
             title = "Read text file",
             read_only_hint = true,
@@ -476,7 +474,7 @@ mod tests {
             property["description"]
                 .as_str()
                 .unwrap()
-                .contains("8388608")
+                .contains(&crate::mcp::tools::human_bytes(8 * 1024 * 1024))
         );
     }
 

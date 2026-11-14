@@ -19,8 +19,8 @@ use super::{
 };
 use crate::mcp::AccessNeed;
 
-const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
-const MAX_LIST_ENTRIES: usize = 16 * 1024;
+pub(crate) const DEFAULT_MAX_LIST_ENTRIES: usize = 4 * 1024;
+pub(crate) const MAX_LIST_ENTRIES: usize = 16 * 1024;
 
 #[cfg(test)]
 impl Default for ListArgs {
@@ -42,14 +42,11 @@ pub(crate) struct ListArgs {
     #[serde(default = "dot")]
     pub(super) path: String,
 
-    /// Glob over entry paths relative to `path`, and over the bare entry name.
-    /// `*`, `?`, `[...]`, `{a,b}` stay within one path segment; `**` recurses.
+    /// Glob over entry paths relative to `path`, and over the bare entry name. `*`, `?`, `[...]`, `{a,b}` stay within one path segment; `**` recurses.
     #[serde(default)]
     pub(super) pattern: Option<String>,
 
-    /// Directory levels to descend: 1, the pattern's path-segment count, or
-    /// unbounded when `pattern` contains `**`. An explicit value always wins.
-    /// Symlinked directories are never traversed.
+    /// Directory levels to descend: 1, the pattern's path-segment count, or unbounded when `pattern` contains `**`. An explicit value always wins. Symlinked directories are never traversed.
     #[serde(default)]
     pub(super) depth: Option<usize>,
 
@@ -61,7 +58,7 @@ pub(crate) struct ListArgs {
     #[serde(default)]
     pub(super) sort: ListSort,
 
-    /// Maximum number of entries to return. Defaults to 4096 and is capped at 16384.
+    /// Maximum number of entries to return. Defaults to {ls_limit} and is capped at {ls_limit_max}.
     #[serde(default)]
     pub(super) limit: Option<usize>,
 }

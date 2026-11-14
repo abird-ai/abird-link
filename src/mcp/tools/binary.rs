@@ -126,8 +126,7 @@ pub(super) struct BeditArgs {
     #[serde(deserialize_with = "bounded_bedit_ranges")]
     edits: Vec<BeditRange>,
 
-    /// Optional hex SHA-256 of the current file content, in any case. A
-    /// mismatch writes nothing.
+    /// Optional hex SHA-256 of the current file content, in any case. A mismatch writes nothing.
     #[serde(default)]
     sha256: Option<String>,
 }
@@ -137,8 +136,7 @@ pub(super) struct BeditRange {
     /// Zero-based byte offset in the original file.
     offset: usize,
 
-    /// Number of existing bytes to replace. Defaults to the decoded payload
-    /// length. Use 0 to insert; empty data with a positive length deletes.
+    /// Number of existing bytes to replace. Defaults to the decoded payload length. Use 0 to insert; empty data with a positive length deletes.
     #[serde(default)]
     length: Option<usize>,
 
@@ -170,17 +168,18 @@ pub(crate) fn with_read_limit(tool: &mut Tool, max_bytes: usize) {
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Maximum raw bytes for this call, capped at the {max_bytes}-byte profile read ceiling. On OpenAI, omitted limits automatically fit the selected encoding inside the MCP response budget (base64/MCP up to {} raw bytes, hex up to {}); use offset for additional chunks.",
-                binary_raw_response_ceiling(
+                "Maximum raw bytes for this call, capped at the {} profile read ceiling. On OpenAI, an omitted limit fits the selected encoding inside the MCP response budget (base64/MCP up to {}, hex up to {}); use offset for additional chunks.",
+                super::human_bytes(max_bytes as u64),
+                super::human_bytes(binary_raw_response_ceiling(
                     BreadFormat::Base64,
                     max_bytes,
                     Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
-                ),
-                binary_raw_response_ceiling(
+                ) as u64),
+                super::human_bytes(binary_raw_response_ceiling(
                     BreadFormat::Hex,
                     max_bytes,
                     Some(crate::limits::OPENAI_TUNNEL_TOOL_RESULT_BYTES),
-                ),
+                ) as u64),
             )),
         );
         property.insert("maximum".to_owned(), serde_json::Value::from(max_bytes));
@@ -634,8 +633,14 @@ mod tests {
         let limit = &tool.input_schema["properties"]["limit"];
         assert_eq!(limit["maximum"], profile);
         let description = limit["description"].as_str().unwrap();
-        assert!(description.contains(&base64.to_string()), "{description}");
-        assert!(description.contains(&hex.to_string()), "{description}");
+        assert!(
+            description.contains(&crate::mcp::tools::human_bytes(base64 as u64)),
+            "{description}"
+        );
+        assert!(
+            description.contains(&crate::mcp::tools::human_bytes(hex as u64)),
+            "{description}"
+        );
     }
 
     #[test]

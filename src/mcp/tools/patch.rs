@@ -28,18 +28,14 @@ const MAX_AMBIGUOUS_LINES: usize = 10;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(super) struct PatchArgs {
-    /// Base directory for the patch's relative paths. Relative paths resolve
-    /// from the directory where dotlink was launched.
+    /// Base directory for the patch's relative paths. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
     dir: String,
 
-    /// Codex patch text: `*** Begin Patch`, `*** Update File:` / `*** Add File:`
-    /// sections, then `*** End Patch`. Addition-only update hunks require
-    /// an explicit `*** End of File` marker to anchor their insertion.
+    /// Codex patch text: `*** Begin Patch`, `*** Update File:` / `*** Add File:` sections, then `*** End Patch`. Addition-only update hunks require an explicit `*** End of File` marker to anchor their insertion.
     patch: String,
 
-    /// Write the files that planned cleanly and report the rest instead of
-    /// failing the whole call.
+    /// Write the files that planned cleanly and report the rest instead of failing the whole call.
     #[serde(default)]
     best_effort: bool,
 }

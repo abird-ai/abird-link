@@ -2544,7 +2544,7 @@ fn tool_call_log_outcome(
 impl LocalMachine {
     /// One place where advertised text is made true: profile ceilings plus the
     /// limit placeholders resolved from the same constants that enforce them.
-    fn describe_tool(&self, tool: Tool, tokens: &[(&'static str, String)]) -> Tool {
+    pub(crate) fn describe_tool(&self, tool: Tool, tokens: &[(&'static str, String)]) -> Tool {
         let mut tool = with_profile_limits(
             tool,
             self.config.max_shell_timeout_secs,

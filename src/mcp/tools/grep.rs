@@ -24,7 +24,7 @@ use crate::mcp::AccessNeed;
 
 pub(crate) const MAX_GREP_HITS: usize = 200;
 pub(crate) const MAX_GREP_FILE_BYTES: usize = 1_048_576;
-const MAX_GREP_PATTERN: usize = 1024;
+pub(crate) const MAX_GREP_PATTERN: usize = 1024;
 const MAX_GREP_PER_FILE: usize = 50;
 /// Context lines one hit may expand to per side. The output ceiling still bounds
 /// what fits on the page; a wider request narrows to this and reports the value
@@ -87,11 +87,10 @@ pub(crate) enum GrepOutputMode {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GrepArgs {
-    /// Regular expression, or literal text when `literal` is set. Maximum 1024 printable characters.
+    /// Regular expression, or literal text when `literal` is set. Maximum {grep_pattern} printable characters.
     pub(crate) pattern: String,
 
-    /// Directory to search recursively, or a single file. Relative paths
-    /// resolve from the directory where dotlink was launched.
+    /// Directory to search recursively, or a single file. Relative paths resolve from the directory where dotlink was launched.
     #[serde(default = "dot")]
     pub(super) path: String,
 
@@ -111,11 +110,11 @@ pub(crate) struct GrepArgs {
     #[serde(default)]
     pub(super) output_mode: GrepOutputMode,
 
-    /// Context lines before each hit. Maximum 8.
+    /// Context lines before each hit. Maximum {grep_context}.
     #[serde(default)]
     pub(super) before: Option<usize>,
 
-    /// Context lines after each hit. Maximum 8.
+    /// Context lines after each hit. Maximum {grep_context}.
     #[serde(default)]
     pub(super) after: Option<usize>,
 
@@ -127,7 +126,7 @@ pub(crate) struct GrepArgs {
     #[serde(default)]
     pub(super) offset: Option<usize>,
 
-    /// Maximum hits, or files. Defaults to 200 and is capped at 200.
+    /// Maximum hits, or files. Defaults to {grep_hits} and is capped there.
     #[serde(default)]
     pub(super) limit: Option<usize>,
 
