@@ -114,7 +114,7 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; {follow_up}. Results carry `ts` (epoch seconds); checkpoint around {} min in a turn.",
+            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `job_start` returns that handle at once instead of waiting. {follow_up}. Results carry `ts` (epoch seconds); checkpoint around {} min in a turn.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
@@ -2076,6 +2076,26 @@ impl LocalMachine {
         .await
     }
 
+    /// Start the command and return its handle instead of waiting: the single
+    /// implementation of the explicit-background form, shared by the transport
+    /// dispatch and the `job_start` handler. A refused command is an ordinary
+    /// tool error, exactly as it is for the waiting form, so the wire shape never
+    /// depends on which path handled the call.
+    pub(crate) fn background_receipt(
+        &self,
+        args: ShellArgs,
+        powershell: bool,
+        request_key: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.start_shell_job(args, powershell, request_key) {
+            Ok(started) => Ok(match self.jobs.expose_compatibility(&started.id) {
+                Ok(result) => result,
+                Err(error) => tool_error(error),
+            }),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
     async fn handle_shell_call_with(
         &self,
         request: &CallToolRequestParams,
@@ -2107,13 +2127,7 @@ impl LocalMachine {
         };
 
         if explicit_background {
-            let started = self
-                .start_shell_job(args, powershell, request_key)
-                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let receipt = self
-                .jobs
-                .expose_compatibility(&started.id)
-                .map_err(crate::jobs::JobError::into_mcp)?;
+            let receipt = self.background_receipt(args, powershell, request_key)?;
             return Ok(Some(CallToolResponse::Complete(receipt)));
         }
 
@@ -2122,9 +2136,14 @@ impl LocalMachine {
         // command therefore remains a normal synchronous tools/call even when
         // its requested timeout is long; a slow command keeps running after the
         // synchronous response window closes.
-        let started = self
-            .start_shell_job(args, powershell, request_key)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        // A command the machine refuses is a tool error, not a protocol error:
+        // the caller can read it and correct the call.
+        let started = match self.start_shell_job(args, powershell, request_key) {
+            Ok(started) => started,
+            Err(error) => {
+                return Ok(Some(CallToolResponse::Complete(tool_error(error))));
+            }
+        };
 
         if !started.is_new
             && let Some(handoff) = self
@@ -4222,6 +4241,37 @@ mod tests {
             matches!(response, CallToolResponse::Complete(_)),
             "machine-wide bounded transport must prevent an unsafe native Task"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_background_never_changes_how_a_failing_call_reports() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+
+        // An empty command is a tool error whether the caller waits or asks for
+        // the handle, and both paths must agree on that.
+        for name in ["bash", "job_start"] {
+            let call = CallToolRequestParams::new(name).with_arguments(
+                serde_json::from_value::<serde_json::Map<String, Value>>(
+                    serde_json::json!({ "command": "   " }),
+                )
+                .unwrap(),
+            );
+            let response = machine
+                .handle_shell_call_with(&call, Some(1_000), true, None, None, None)
+                .await
+                .expect("a rejected command is a tool result, not a protocol error")
+                .expect("shell tools always answer");
+            let CallToolResponse::Complete(result) = response else {
+                panic!("a rejected command must not become a task");
+            };
+            assert_eq!(result.is_error, Some(true), "{name}");
+        }
     }
 
     #[cfg(unix)]

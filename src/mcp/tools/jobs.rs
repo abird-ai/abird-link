@@ -5,6 +5,7 @@
 //! poll, page output and cancel without holding one request open.
 
 use rmcp::{
+    ErrorData as McpError,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Tool},
     schemars,
@@ -251,14 +252,13 @@ impl LocalMachine {
             open_world_hint = true
         )
     )]
-    async fn job_start(&self, Parameters(args): Parameters<JobStartArgs>) -> CallToolResult {
-        match self.start_shell_job(args.into(), cfg!(windows), None) {
-            Ok(started) => match self.jobs.expose_compatibility(&started.id) {
-                Ok(result) => result,
-                Err(error) => tool_error(error),
-            },
-            Err(error) => tool_error(error),
-        }
+    async fn job_start(
+        &self,
+        Parameters(args): Parameters<JobStartArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // The background half lives with the shell it starts, so the transport
+        // dispatch and this handler cannot drift apart.
+        self.background_receipt(args.into(), cfg!(windows), None)
     }
 
     #[tool(
