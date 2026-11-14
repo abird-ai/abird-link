@@ -89,6 +89,10 @@ const JOB_FOLLOW_UP_CLAUSES: &[(&str, &str)] = &[
     ("job_cancel", "job_cancel=stop"),
 ];
 
+/// A receipt always has something to say: `already_used` skips at most one
+/// clause, so a shorter table fails the build instead of a render.
+const _: () = assert!(JOB_FOLLOW_UP_CLAUSES.len() >= 2);
+
 /// The one prohibition that belongs wherever a handle is handed back.
 pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run a command that returned a handle";
 

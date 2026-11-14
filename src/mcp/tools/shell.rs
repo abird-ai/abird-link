@@ -118,7 +118,7 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
+            "Run a {shell} command. When the response window closes — at most {}s — it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
@@ -3585,7 +3585,8 @@ mod tests {
         let tunnel = with_profile_limits(shell.clone(), 42, 2048, Some(hold));
         let tunnel = tunnel.description.as_deref().unwrap();
         assert!(
-            tunnel.contains(&format!("after {}s", hold.as_secs())),
+            tunnel.contains(&format!("at most {}s", hold.as_secs()))
+                && tunnel.contains("response window"),
             "{tunnel}"
         );
         assert!(tunnel.contains("`ts`"), "{tunnel}");

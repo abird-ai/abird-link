@@ -147,7 +147,7 @@ struct JobOutputArgs {
     /// Maximum response bytes for this page. Defaults to the short-page size and is capped at the profile ceiling.
     #[serde(default)]
     max_output_bytes: Option<usize>,
-    /// Read the last N bytes instead of paging from `offset` (0 reads one byte); exclusive with `offset`. With `wait_secs` it waits for the job to finish so the tail is final, and the page is the end of that window.
+    /// Read the last N bytes instead of paging from `offset` (0 reads one byte); exclusive with a non-zero `offset`. With `wait_secs` it waits for the job to finish so the tail is final, and the page is the end of that window.
     #[serde(default)]
     tail_bytes: Option<usize>,
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
