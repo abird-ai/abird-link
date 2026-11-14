@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.7] - 2026-11-14
+
 ### Fixed
 
 - A command the machine refuses (empty, or blocked by sandbox policy) is now a tool error on every path. The transport dispatch turned it into a JSON-RPC `-32603` while the tool handlers reported a readable error, so the same bad call looked different depending on which path handled it — and an opaque protocol error is harder for a caller to correct than a tool result. The explicit-background half also had two copies (`job_start`'s handler and the dispatch), each starting the job with a different request key; `background_receipt` is now the single implementation, and the windowed shell description names `job_start` (it had only ever mentioned it in the variant used without a response window).
