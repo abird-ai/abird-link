@@ -93,6 +93,10 @@ const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
 /// The one prohibition that belongs wherever a handle is handed back.
 pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run a command that returned a handle";
 
+/// Reading a job by default means reading its end: a build's failures and a
+/// test run's verdict are at the tail, and the middle is context nobody reads.
+pub(crate) const JOB_TAIL_PEEK_PREFERENCE: &str = "To check on a job, peek its tail instead of reading the whole spool: `job_get` reports each stream's `stored_bytes`, so page `job_output` from `stored_bytes - N`. Read from the acknowledged offset only when the complete output is what you need.";
+
 /// One follow-up sentence, dropping the tool whose result the caller is already
 /// reading: a `job_get` payload must not tell the caller to call `job_get`.
 /// What a caller should do next, given the job's actual stage.

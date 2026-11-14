@@ -174,10 +174,10 @@ struct JobOutputArgs {
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]
     stream: OutputStream,
-    /// Raw byte offset in the selected spool stream. Defaults to zero.
+    /// Raw byte offset in the selected spool stream. Defaults to zero; for the tail, take `stored_bytes` from `job_get` and start at `stored_bytes - N`.
     #[serde(default)]
     offset: Option<u64>,
-    /// Maximum response bytes for this page. Defaults to the profile output ceiling and is capped there.
+    /// Maximum response bytes for this page. Defaults to the short-page size and is capped at the profile ceiling.
     #[serde(default)]
     max_output_bytes: Option<usize>,
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
@@ -280,7 +280,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read one page of a job's stdout or stderr by raw byte offset. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages default to the short-page size and are bounded by the profile ceiling; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. Streams retain <={spool} and report truncation.",
+        description = "Read one page of a job's stdout or stderr by raw byte offset. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages default to the short-page size and are bounded by the profile ceiling; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. To look at the end without reading the middle — a failure summary, the last lines of a build — `job_get` reports each stream's `stored_bytes`; page from `stored_bytes - N`. Streams retain <={spool} and report truncation.",
         annotations(
             title = "Read shell job output",
             read_only_hint = true,
