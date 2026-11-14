@@ -582,11 +582,31 @@ impl JobEntry {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RemoteStartReceipt {
+    Mcp(CallToolResult),
+}
+
+#[derive(Clone, Debug)]
+enum RemoteStartDisposition {
+    Claimed,
+    Ready(RemoteStartReceipt),
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteStartEntry {
+    semantic_hash: [u8; 32],
+    expires_at_unix_ms: u64,
+    disposition: RemoteStartDisposition,
+}
+
 #[derive(Default)]
 struct JobState {
     closed: bool,
     jobs: HashMap<String, JobEntry>,
     request_jobs: HashMap<String, String>,
+    remote_starts: HashMap<[u8; 32], RemoteStartEntry>,
     next_exposure_sequence: u64,
 }
 
@@ -602,6 +622,80 @@ impl JobState {
     }
 }
 
+pub(crate) enum RemoteStartDecision {
+    New(RemoteStartGuard),
+    Existing(RemoteStartReceipt),
+    Unknown,
+}
+
+pub(crate) struct RemoteStartGuard {
+    inner: Weak<JobManagerInner>,
+    key: [u8; 32],
+    settled: bool,
+}
+
+impl RemoteStartGuard {
+    pub(crate) fn mark_ready(mut self, receipt: RemoteStartReceipt) -> Result<()> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| anyhow!("remote Start owner is unavailable"))?;
+        let mut state = inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("job manager lock poisoned"))?;
+        let entry = state
+            .remote_starts
+            .get_mut(&self.key)
+            .ok_or_else(|| anyhow!("remote Start claim disappeared"))?;
+        if !matches!(entry.disposition, RemoteStartDisposition::Claimed) {
+            bail!("remote Start claim is no longer pending");
+        }
+        entry.disposition = RemoteStartDisposition::Ready(receipt);
+        self.settled = true;
+        Ok(())
+    }
+
+    pub(crate) fn release_before_effect(mut self) {
+        if let Some(inner) = self.inner.upgrade()
+            && let Ok(mut state) = inner.state.lock()
+            && state
+                .remote_starts
+                .get(&self.key)
+                .is_some_and(|entry| matches!(entry.disposition, RemoteStartDisposition::Claimed))
+        {
+            state.remote_starts.remove(&self.key);
+        }
+        self.settled = true;
+    }
+
+    pub(crate) fn mark_unknown(mut self) {
+        if let Some(inner) = self.inner.upgrade()
+            && let Ok(mut state) = inner.state.lock()
+            && let Some(entry) = state.remote_starts.get_mut(&self.key)
+            && matches!(entry.disposition, RemoteStartDisposition::Claimed)
+        {
+            entry.disposition = RemoteStartDisposition::Unknown;
+        }
+        self.settled = true;
+    }
+}
+
+impl Drop for RemoteStartGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(inner) = self.inner.upgrade()
+            && let Ok(mut state) = inner.state.lock()
+            && let Some(entry) = state.remote_starts.get_mut(&self.key)
+            && matches!(entry.disposition, RemoteStartDisposition::Claimed)
+        {
+            entry.disposition = RemoteStartDisposition::Unknown;
+        }
+    }
+}
+
 struct JobManagerInner {
     root: PathBuf,
     retention_secs: AtomicU64,
@@ -614,6 +708,7 @@ struct JobManagerInner {
     sweeper: Mutex<Option<JoinHandle<()>>>,
     intent_fingerprint: Mutex<Option<[u8; 32]>>,
     policy_fingerprint: Mutex<Option<[u8; 32]>>,
+    remote_target: Mutex<Option<crate::remote_start::BridgeTarget>>,
     session_fingerprint: [u8; 32],
     shared_jobs: Arc<SharedJobManager>,
 }
@@ -1897,6 +1992,7 @@ impl JobManager {
             sweeper: Mutex::new(None),
             intent_fingerprint: Mutex::new(None),
             policy_fingerprint: Mutex::new(None),
+            remote_target: Mutex::new(None),
             session_fingerprint,
             shared_jobs,
         });
@@ -2334,6 +2430,89 @@ impl JobManager {
             .lock()
             .map_err(|_| anyhow!("job policy fingerprint lock poisoned"))?
             .ok_or_else(|| anyhow!("job execution policy is not bound"))
+    }
+
+    pub(crate) fn bind_remote_target(
+        &self,
+        target: crate::remote_start::BridgeTarget,
+    ) -> Result<()> {
+        let mut current = self
+            .inner
+            .remote_target
+            .lock()
+            .map_err(|_| anyhow!("remote bridge target lock poisoned"))?;
+        match current.as_ref() {
+            None => {
+                *current = Some(target);
+                Ok(())
+            }
+            Some(existing) if existing == &target => Ok(()),
+            Some(_) => bail!("remote bridge target differs from live Job runtime"),
+        }
+    }
+
+    pub(crate) fn remote_target(&self) -> Result<crate::remote_start::BridgeTarget> {
+        self.inner
+            .remote_target
+            .lock()
+            .map_err(|_| anyhow!("remote bridge target lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow!("remote bridge target is not configured"))
+    }
+
+    pub(crate) fn claim_remote_start(
+        &self,
+        start: &crate::remote_start::ValidatedRemoteStart,
+    ) -> Result<RemoteStartDecision> {
+        let now = crate::remote_start::now_unix_ms()?;
+        if start.expires_at_unix_ms() <= now {
+            bail!("remote Start authorization expired before replay claim");
+        }
+        let key = start.claim_key();
+        let semantic_hash = start.semantic_hash();
+        if key == [0; 32] || semantic_hash == [0; 32] {
+            bail!("invalid remote Start replay identity");
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("job manager lock poisoned"))?;
+        state.remote_starts.retain(|_, entry| {
+            entry.expires_at_unix_ms > now
+                || matches!(entry.disposition, RemoteStartDisposition::Claimed)
+        });
+        if let Some(existing) = state.remote_starts.get(&key) {
+            if existing.semantic_hash != semantic_hash {
+                bail!("remote Start replay identity was reused for different semantics");
+            }
+            return Ok(match &existing.disposition {
+                RemoteStartDisposition::Claimed | RemoteStartDisposition::Unknown => {
+                    RemoteStartDecision::Unknown
+                }
+                RemoteStartDisposition::Ready(receipt) => {
+                    RemoteStartDecision::Existing(receipt.clone())
+                }
+            });
+        }
+        if state.remote_starts.len() >= MAX_REQUEST_REPLAYS {
+            bail!(
+                "too many retained remote Start replay claims ({MAX_REQUEST_REPLAYS}); wait for proof expiry or restart the runtime"
+            );
+        }
+        state.remote_starts.insert(
+            key,
+            RemoteStartEntry {
+                semantic_hash,
+                expires_at_unix_ms: start.expires_at_unix_ms(),
+                disposition: RemoteStartDisposition::Claimed,
+            },
+        );
+        Ok(RemoteStartDecision::New(RemoteStartGuard {
+            inner: Arc::downgrade(&self.inner),
+            key,
+            settled: false,
+        }))
     }
 
     #[cfg(test)]
@@ -2855,6 +3034,20 @@ impl JobManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn process_input_ready_for_test(&self, id: &str, node: Option<usize>) -> bool {
+        let state = self.inner.state.lock().expect("job manager lock");
+        let Some(entry) = state.jobs.get(id) else {
+            return false;
+        };
+        let coordinate = match (entry.shared_graph_authoritative, node) {
+            (false, None) => 1,
+            (true, Some(node)) if node > 0 => node,
+            _ => return false,
+        };
+        entry.process_inputs.contains_key(&coordinate)
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_shell_guard_generation_for_test(
         &self,
         id: &str,
@@ -3097,7 +3290,7 @@ impl JobManager {
             let page = render(0);
             return fits(&page).then_some(page).ok_or_else(|| {
                 JobError::Unknown(
-                    "job_list response budget is too small for page metadata; raise the response limit"
+                    "jobs_list response budget is too small for page metadata; raise the response limit"
                         .to_owned(),
                 )
             });
@@ -3114,7 +3307,7 @@ impl JobManager {
         }
         best.ok_or_else(|| {
             JobError::Unknown(
-                "job_list response budget is too small for one complete Job row; raise the response limit"
+                "jobs_list response budget is too small for one complete Job row; raise the response limit"
                     .to_owned(),
             )
         })
@@ -5154,8 +5347,8 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
             "truncated": completion.is_some_and(|value| value.stderr.truncated),
             "released": stderr_owner.released,
         },
-        "output": "use job_output to read; job_ack explicitly advances cleanup watermarks",
-        "cancel": "use job_cancel while status=working",
+        "output": "use jobs_read to read; jobs_ack explicitly advances cleanup watermarks",
+        "cancel": "use jobs_cancel while status=working",
     })
     .to_string()
 }
@@ -5179,7 +5372,7 @@ fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
         entry.retention = RetentionClass::TransportOnly;
     } else if entry.request_key.is_none() && entry.response_attempts == 0 {
         // Local transports have no durable request identity to replay. Make an
-        // abandoned execution discoverable through job_list instead of hiding a
+        // abandoned execution discoverable through jobs_list instead of hiding a
         // side effect behind an irrecoverable lost response. The local retained
         // slot was reserved at admission, so shared exposure capacity is not an
         // independent admission decision here.
@@ -5301,10 +5494,10 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
             "spool_limit_bytes_per_stream": MAX_JOB_SPOOL_BYTES_PER_STREAM,
             "spool_session_limit_bytes": inner.spool_limit_bytes.load(Ordering::Relaxed),
             "async": true,
-            "poll": "job_get",
-            "output": "job_output",
-            "ack": "job_ack",
-            "cancel": "job_cancel",
+            "poll": "jobs_get",
+            "output": "jobs_read",
+            "ack": "jobs_ack",
+            "cancel": "jobs_cancel",
         })
         .to_string(),
     )])
@@ -6400,10 +6593,10 @@ fn task_from_entry(entry: &JobEntry, retention: Duration) -> Task {
         .with_status_message(match entry.phase {
             JobPhase::Queued => "shell job is queued",
             JobPhase::Running => {
-                "shell job is running; job_output provides durable paged stdout/stderr"
+                "shell job is running; jobs_read provides durable paged stdout/stderr"
             }
             JobPhase::Terminal => {
-                "shell job finished; job_output provides durable paged stdout/stderr"
+                "shell job finished; jobs_read provides durable paged stdout/stderr"
             }
         })
 }
@@ -7479,7 +7672,7 @@ mod tests {
             .to_string();
         assert!(
             page_error.contains("beyond stored output (0 bytes)"),
-            "job_output must validate against current retained bytes after partial cleanup: {page_error}"
+            "jobs_read must validate against current retained bytes after partial cleanup: {page_error}"
         );
         {
             let state = manager.inner.state.lock().unwrap();
@@ -8422,7 +8615,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|job| job["job_id"] == id),
-            "retired transport-only execution must be recoverable through job_list"
+            "retired transport-only execution must be recoverable through jobs_list"
         );
         manager.shutdown().await.unwrap();
     }
@@ -9309,7 +9502,7 @@ mod tests {
             .to_string();
         assert!(
             page_error.contains("beyond stored output (4 bytes)"),
-            "job_output must not expose the pre-compaction terminal length: {page_error}"
+            "jobs_read must not expose the pre-compaction terminal length: {page_error}"
         );
 
         let detailed = manager.detailed_task(&job.id).unwrap();

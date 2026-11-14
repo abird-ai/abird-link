@@ -2042,6 +2042,39 @@ impl LocalMachine {
         &self.config.log
     }
 
+    pub(crate) fn remote_start_lease(&self) -> Result<aw_tools::remote_start::RemoteRuntimeLease> {
+        self.jobs
+            .remote_target()?
+            .lease(self.jobs.runtime_generation_fingerprint())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_remote_target_for_test(&self, host: &str, profile: &str) {
+        self.jobs
+            .bind_remote_target(crate::remote_start::BridgeTarget::new(host, profile).unwrap())
+            .unwrap();
+    }
+
+    pub(crate) fn validate_remote_start(
+        &self,
+        context: &RequestContext<RoleServer>,
+        operation: aw_tools::OperationId,
+        class: crate::remote_start::StartClass,
+        arguments: &Value,
+        control_ref: Option<&str>,
+    ) -> Result<Option<crate::remote_start::ValidatedRemoteStart>> {
+        let target = self.jobs.remote_target()?;
+        crate::remote_start::validate_request(
+            context,
+            &target,
+            self.jobs.runtime_generation_fingerprint(),
+            operation,
+            class,
+            arguments,
+            control_ref,
+        )
+    }
+
     pub fn shell_enabled(&self) -> bool {
         self.config.allow_shell
     }
@@ -2563,9 +2596,47 @@ impl rmcp::ServerHandler for LocalMachine {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
+        if crate::remote_start::has_metadata(&context.meta) {
+            let operation = aw_tools::OperationId::from_model_name(&name).ok_or_else(|| {
+                McpError::invalid_params("remote Start targets an unknown operation", None)
+            })?;
+            let class = match operation {
+                aw_tools::OperationId::Fs(tool)
+                    if tool.action() != aw_tools::filesystem::access::Action::Read =>
+                {
+                    crate::remote_start::StartClass::Submit
+                }
+                aw_tools::OperationId::Bash
+                | aw_tools::OperationId::Pwsh
+                | aw_tools::OperationId::Powershell
+                | aw_tools::OperationId::Batch => crate::remote_start::StartClass::Submit,
+                aw_tools::OperationId::JobsAck
+                | aw_tools::OperationId::JobsSend
+                | aw_tools::OperationId::JobsCancel => crate::remote_start::StartClass::Control,
+                _ => {
+                    return Err(McpError::invalid_params(
+                        "remote Start is not valid for this operation",
+                        None,
+                    ));
+                }
+            };
+            let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
+            let control_ref = matches!(class, crate::remote_start::StartClass::Control)
+                .then(|| arguments.get("ref").and_then(Value::as_str))
+                .flatten();
+            let start = self
+                .validate_remote_start(&context, operation, class, &arguments, control_ref)
+                .map_err(|error| {
+                    McpError::invalid_params(format!("remote Start rejected: {error}"), None)
+                })?
+                .ok_or_else(|| {
+                    McpError::invalid_params("remote Start metadata disappeared", None)
+                })?;
+            context.extensions.insert(start);
+        }
         let result_budget = self.request_result_budget(&context);
         // Building the router to read the schema is not free, so only do it when
         // the detail line will actually be printed.
@@ -3421,6 +3492,83 @@ mod tests {
             if other != selected {
                 assert!(!names.contains(&other.to_owned()), "{names:?}");
             }
+        }
+    }
+
+    #[test]
+    fn final_standalone_unix_catalog_schema_footprint_is_measured() {
+        let tools = LocalMachine::tool_router_for_policy(Capabilities {
+            read: true,
+            write: true,
+            read_write: true,
+            shell: true,
+        })
+        .list_all();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        let bytes = tools
+            .iter()
+            .map(|tool| serde_json::to_vec(tool).unwrap().len())
+            .sum::<usize>();
+        println!(
+            "final-dotlink-catalog tools={} bytes={} approx_tokens={} names={:?}",
+            tools.len(),
+            bytes,
+            bytes.div_ceil(4),
+            names
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            tools.len(),
+            21,
+            "unexpected Unix standalone catalog: {names:?}"
+        );
+        for expected in [
+            "ls",
+            "find",
+            "grep",
+            "read",
+            "write",
+            "edit",
+            "patch",
+            "cp",
+            "mv",
+            "rm",
+            "bread",
+            "bwrite",
+            "bedit",
+            "batch",
+            "jobs_list",
+            "jobs_get",
+            "jobs_read",
+            "jobs_ack",
+            "jobs_send",
+            "jobs_cancel",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        assert!(names.contains(&platform_shell_node_tool().name()));
+        for removed in [
+            "job_start",
+            "job_restart",
+            "job_list",
+            "job_get",
+            "job_output",
+            "job_ack",
+            "job_cancel",
+            "jobs_subscribe",
+            "agent",
+            "subagent",
+            "team",
+            "plan",
+            "review_release",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "removed/unsupported tool leaked: {removed}"
+            );
         }
     }
 

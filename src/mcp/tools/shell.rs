@@ -43,7 +43,8 @@ use crate::mcp::{
 use crate::{
     jobs::{
         JobCompletion, JobDisposition, JobHandle, JobHandoff, JobResultContext, JobStatus, JobWait,
-        ProcessInput, ProcessInputRequest, SharedShellWriters, SpoolWriterGuard, StreamSummary,
+        ProcessInput, ProcessInputRequest, RemoteStartDecision, RemoteStartReceipt,
+        SharedShellWriters, SpoolWriterGuard, StreamSummary,
     },
     mcp::RuntimeConfig,
 };
@@ -2281,6 +2282,17 @@ impl LocalMachine {
         request: &CallToolRequestParams,
         context: &RequestContext<RoleServer>,
     ) -> Result<Option<CallToolResponse>, McpError> {
+        if crate::mcp::is_shell_tool(request.name.as_ref())
+            && let Some(start) = context
+                .extensions
+                .get::<crate::remote_start::ValidatedRemoteStart>()
+                .cloned()
+        {
+            return self
+                .handle_remote_shell_call(request, start)
+                .await
+                .map(Some);
+        }
         self.handle_shell_call_with(
             request,
             self.request_sync_budget_millis(context),
@@ -2292,6 +2304,76 @@ impl LocalMachine {
             ProgressHeartbeat::for_request(context),
         )
         .await
+    }
+
+    async fn handle_remote_shell_call(
+        &self,
+        request: &CallToolRequestParams,
+        start: crate::remote_start::ValidatedRemoteStart,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.as_ref();
+        if !crate::mcp::is_shell_tool(name) {
+            return Err(McpError::invalid_params("unknown shell tool", None));
+        }
+        let arguments = request.arguments.clone().unwrap_or_default();
+        let call_args = serde_json::from_value::<ShellCallArgs>(Value::Object(arguments))
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let interactive = call_args.interactive;
+        let args = call_args.execution_args();
+        let shell_tool = crate::mcp::shell_node_tool(name)
+            .ok_or_else(|| McpError::invalid_params("unknown shell tool", None))?;
+
+        let guard = match self
+            .jobs
+            .claim_remote_start(&start)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+        {
+            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => {
+                return Ok(CallToolResponse::Complete(result));
+            }
+            RemoteStartDecision::Unknown => {
+                return Ok(CallToolResponse::Complete(tool_error(
+                    "remote Start outcome is unknown; inspect the original attempt before any new invocation",
+                )));
+            }
+            RemoteStartDecision::New(guard) => guard,
+        };
+
+        // Current dotlink authority is rechecked only for a genuinely new
+        // attempt. Exact replay must return the stored receipt even if policy
+        // was revoked after the original Start crossed its effect boundary.
+        if !self.has_tool_for_policy(name) {
+            guard.release_before_effect();
+            return Err(McpError::invalid_params(
+                "remote Start shell is not granted by current dotlink policy",
+                None,
+            ));
+        }
+
+        let started =
+            match self.start_shell_job(args, shell_tool, Some(start.replay_key()), interactive) {
+                Ok(started) => started,
+                Err(error) => {
+                    guard.release_before_effect();
+                    return Err(McpError::internal_error(error.to_string(), None));
+                }
+            };
+        if let Err(error) = self.jobs.expose_compatibility(&started.id) {
+            guard.mark_unknown();
+            return Err(crate::jobs::JobError::into_mcp(error));
+        }
+        let status = match self.jobs.standalone_status(&started.id, None) {
+            Ok((_, status)) => status,
+            Err(error) => {
+                guard.mark_unknown();
+                return Err(error.into_mcp());
+            }
+        };
+        let result = ok_text(status);
+        guard
+            .mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(CallToolResponse::Complete(result))
     }
 
     async fn handle_shell_call_with(
@@ -4321,6 +4403,269 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn remote_shell_start(
+        machine: &LocalMachine,
+        request: &CallToolRequestParams,
+    ) -> crate::remote_start::ValidatedRemoteStart {
+        use aw_tools::remote_start::{
+            REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
+            RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
+        };
+        let arguments = Value::Object(request.arguments.clone().unwrap_or_default());
+        let now = crate::remote_start::now_unix_ms().unwrap();
+        let generation = machine.jobs.runtime_generation_fingerprint();
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "invocation".into(),
+                turn_id: 1,
+                call_id: "call".into(),
+                effect_attempt_id: "attempt".into(),
+                operation: aw_tools::OperationId::Bash.semantic_name().into(),
+                canonical_ref: "/d:d/i:i/p:p/a:0/t:1".into(),
+                arguments_sha256: crate::remote_start::arguments_sha256(&arguments),
+                original_request_sha256: [3; 32],
+                session_action: RemoteSessionAction::Submit,
+                target: RemoteRuntimeLease {
+                    target_host: "l5".into(),
+                    target_profile: "default".into(),
+                    generation,
+                    issued_at_unix_ms: now,
+                    expires_at_unix_ms: now + 5_000,
+                },
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "bash".into(),
+                    source_epoch: 1,
+                    site: "l5".into(),
+                    resource_scope: "root".into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+        let target = crate::remote_start::BridgeTarget::new("l5", "default").unwrap();
+        crate::remote_start::validate_authorization(
+            authorization,
+            crate::remote_start::ValidationContext {
+                client_id: "aw-client",
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: aw_tools::OperationId::Bash,
+                class: crate::remote_start::StartClass::Submit,
+                arguments: &arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_start_duplicate_shell_replays_receipt_without_second_process() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut machine = direct_shell_machine(root.clone(), bash, 16 * 1024);
+        let request = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "printf x >> once.txt",
+                "dir": ".",
+                "timeout_secs": 3
+            }))
+            .unwrap(),
+        );
+        let start = remote_shell_start(&machine, &request);
+        let first = machine
+            .handle_remote_shell_call(&request, start.clone())
+            .await
+            .unwrap();
+        let CallToolResponse::Complete(first) = first else {
+            panic!("remote shell Start must return compact Job receipt")
+        };
+        let first_text = first.content[0].as_text().unwrap().text.clone();
+        let job_id = first_text
+            .split_whitespace()
+            .next()
+            .and_then(|reference| reference.strip_prefix("j:"))
+            .unwrap()
+            .to_owned();
+        machine.jobs.wait_until(&job_id, None).await.unwrap();
+        machine.config.allow_shell = false;
+
+        let duplicate = machine
+            .handle_remote_shell_call(&request, start)
+            .await
+            .unwrap();
+        let CallToolResponse::Complete(duplicate) = duplicate else {
+            panic!("remote shell replay must remain a compact receipt")
+        };
+        assert_eq!(
+            duplicate.content[0].as_text().unwrap().text,
+            first_text,
+            "duplicate Start must replay the original receipt, not a later projection"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("once.txt")).await.unwrap(),
+            "x"
+        );
+    }
+
+    #[cfg(unix)]
+    fn remote_send_start(
+        machine: &LocalMachine,
+        job_id: &str,
+        arguments: &Value,
+    ) -> crate::remote_start::ValidatedRemoteStart {
+        use aw_tools::remote_start::{
+            REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
+            RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
+        };
+        let now = crate::remote_start::now_unix_ms().unwrap();
+        let generation = machine.jobs.runtime_generation_fingerprint();
+        let reference = format!("j:{job_id}");
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "invocation".into(),
+                turn_id: 2,
+                call_id: "send".into(),
+                effect_attempt_id: "send-attempt".into(),
+                operation: aw_tools::OperationId::JobsSend.semantic_name().into(),
+                canonical_ref: format!("/d:d/i:i/p:p/a:0/j:{job_id}"),
+                arguments_sha256: crate::remote_start::arguments_sha256(arguments),
+                original_request_sha256: [7; 32],
+                session_action: RemoteSessionAction::Control,
+                target: RemoteRuntimeLease {
+                    target_host: "l5".into(),
+                    target_profile: "default".into(),
+                    generation,
+                    issued_at_unix_ms: now,
+                    expires_at_unix_ms: now + 5_000,
+                },
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "jobs.send".into(),
+                    source_epoch: 1,
+                    site: "l5".into(),
+                    resource_scope: reference.clone(),
+                    grant_sha256: [8; 32],
+                },
+                policy_revision_sha256: [9; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+        let target = crate::remote_start::BridgeTarget::new("l5", "default").unwrap();
+        crate::remote_start::validate_authorization(
+            authorization,
+            crate::remote_start::ValidationContext {
+                client_id: "aw-client",
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: aw_tools::OperationId::JobsSend,
+                class: crate::remote_start::StartClass::Control,
+                arguments,
+                control_ref: Some(&reference),
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_start_duplicate_stdin_replays_receipt_without_resending_bytes() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root.clone(), bash, 16 * 1024);
+        let started = machine
+            .start_shell_job(
+                ShellArgs {
+                    command: "IFS= read -r line; printf '%s' \"$line\" > stdin.txt".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(3),
+                    max_output_bytes: Some(4096),
+                    writes: None,
+                },
+                aw_tools::filesystem::batch::NodeTool::Bash,
+                None,
+                true,
+            )
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !machine.jobs.process_input_ready_for_test(&started.id, None) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stdin custody not installed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let reference = format!("j:{}", started.id);
+        let arguments = serde_json::json!({
+            "ref": reference,
+            "input": {"text": "hello\n"}
+        });
+        let start = remote_send_start(&machine, &started.id, &arguments);
+        let guard = match machine.jobs.claim_remote_start(&start).unwrap() {
+            crate::jobs::RemoteStartDecision::New(guard) => guard,
+            _ => panic!("first stdin Start claim must be new"),
+        };
+        let revision = machine
+            .send_process_input_checked(
+                &started.id,
+                None,
+                None,
+                ProcessInput::Text(b"hello\n".to_vec()),
+            )
+            .await
+            .unwrap();
+        let receipt = format!("j:{} rev={revision} ok", started.id);
+        guard
+            .mark_ready(crate::jobs::RemoteStartReceipt::Mcp(ok_text(
+                receipt.clone(),
+            )))
+            .unwrap();
+        assert!(matches!(
+            machine.jobs.claim_remote_start(&start).unwrap(),
+            crate::jobs::RemoteStartDecision::Existing(
+                crate::jobs::RemoteStartReceipt::Mcp(ref result)
+            ) if result.content[0].as_text().is_some_and(|text| text.text == receipt)
+        ));
+        machine.jobs.wait_until(&started.id, None).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("stdin.txt")).await.unwrap(),
+            "hello"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_background_constructor_returns_same_standalone_job_ref() {
         let Some(bash) = resolve_executable("bash") else {
@@ -4570,7 +4915,7 @@ mod tests {
             serde_json::from_str(&machine.jobs.status(&task_id).unwrap()).unwrap();
         assert_eq!(
             compacted["stdout"]["stored_bytes"], 4,
-            "job_get must report the retained native-task prefix, not historical spool bytes"
+            "jobs_get must report the retained native-task prefix, not historical spool bytes"
         );
         let replay = machine.jobs.detailed_task(&task_id).unwrap();
         let rmcp::model::TaskPayload::Completed { result } = replay.payload else {
@@ -5285,7 +5630,7 @@ mod tests {
         let listed: serde_json::Value = serde_json::from_str(&machine.jobs.list(0, 64)).unwrap();
         assert!(
             listed["jobs"].as_array().unwrap().is_empty(),
-            "revoked hidden output must never become discoverable through job_list"
+            "revoked hidden output must never become discoverable through jobs_list"
         );
         machine.jobs.shutdown().await.unwrap();
     }

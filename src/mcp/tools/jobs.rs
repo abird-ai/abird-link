@@ -15,7 +15,9 @@ use serde::Deserialize;
 use aw_tools::execution_ref::{ExecutionRef, ExecutionSegment};
 
 use super::{LocalMachine, graph, ok_text, resolve_capped, tool_error};
-use crate::jobs::{JobHandoff, JobOutputStream, JobWait, ProcessInput};
+use crate::jobs::{
+    JobHandoff, JobOutputStream, JobWait, ProcessInput, RemoteStartDecision, RemoteStartReceipt,
+};
 
 const MAX_JOB_LIST_LIMIT: usize = 256;
 const MAX_WAIT_MS: u64 = 30_000;
@@ -336,9 +338,60 @@ impl LocalMachine {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let result_budget = self.request_result_budget(&context);
-        let request_key = self.request_job_key(&context);
+        let remote_start = context
+            .extensions
+            .get::<crate::remote_start::ValidatedRemoteStart>()
+            .cloned();
+        let request_key = remote_start
+            .as_ref()
+            .map(crate::remote_start::ValidatedRemoteStart::replay_key)
+            .or_else(|| self.request_job_key(&context));
         let background = args.background;
         let _display_title = args.title;
+        if let Some(start) = remote_start {
+            // Exact replay lookup precedes all mutable Graph preparation and
+            // topology/policy revalidation. A duplicate successful Start must
+            // return its original receipt even if the workspace has changed.
+            let guard = match self.jobs.claim_remote_start(&start) {
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
+                    return result;
+                }
+                Ok(RemoteStartDecision::Unknown) => {
+                    return tool_error(
+                        "remote Start outcome is unknown; inspect the original attempt before any new invocation",
+                    );
+                }
+                Ok(RemoteStartDecision::New(guard)) => guard,
+                Err(error) => return tool_error(error),
+            };
+            let prepared = match graph::prepare(self, args.ops).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    guard.release_before_effect();
+                    return tool_error(error);
+                }
+            };
+            let started = match graph::start(self, prepared, None, request_key, true).await {
+                Ok(started) => started,
+                Err(error) => {
+                    guard.release_before_effect();
+                    return tool_error(error);
+                }
+            };
+            let status = match self.jobs.standalone_status(&started.id, None) {
+                Ok((_, status)) => status,
+                Err(error) => {
+                    guard.mark_unknown();
+                    return tool_error(error);
+                }
+            };
+            let result = ok_text(status);
+            if let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone())) {
+                return tool_error(error);
+            }
+            return result;
+        }
+
         let prepared = match graph::prepare(self, args.ops).await {
             Ok(prepared) => prepared,
             Err(error) => return tool_error(error),
@@ -518,22 +571,67 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn jobs_ack(&self, Parameters(args): Parameters<JobsAckArgs>) -> CallToolResult {
+    async fn jobs_ack(
+        &self,
+        Parameters(args): Parameters<JobsAckArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         let reference = match parse_ref(&args.reference) {
             Ok(reference) => reference,
             Err(error) => return tool_error(error),
         };
-        match self.jobs.acknowledge_node_output(
+        let remote_start = context
+            .extensions
+            .get::<crate::remote_start::ValidatedRemoteStart>()
+            .cloned();
+        let guard = if let Some(start) = remote_start.as_ref() {
+            match self.jobs.claim_remote_start(start) {
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
+                    return result;
+                }
+                Ok(RemoteStartDecision::Unknown) => {
+                    return tool_error(
+                        "remote Start outcome is unknown; do not repeat Job acknowledgement",
+                    );
+                }
+                Ok(RemoteStartDecision::New(guard)) => Some(guard),
+                Err(error) => return tool_error(error),
+            }
+        } else {
+            None
+        };
+        let outcome = match self.jobs.acknowledge_node_output(
             &reference.id,
             reference.node,
             args.view.map(Into::into),
             args.offset,
         ) {
-            Ok(_) => match self.jobs.standalone_status(&reference.id, reference.node) {
-                Ok((_, status)) => ok_text(status),
-                Err(error) => tool_error(error),
-            },
-            Err(error) => tool_error(error),
+            Ok(_) => self
+                .jobs
+                .standalone_status(&reference.id, reference.node)
+                .map(|(_, status)| status)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        match outcome {
+            Ok(text) => {
+                let result = ok_text(text);
+                if let Some(guard) = guard
+                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(error);
+                }
+                result
+            }
+            Err(text) => {
+                let result = tool_error(text);
+                if let Some(guard) = guard
+                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(error);
+                }
+                result
+            }
         }
     }
 
@@ -547,7 +645,11 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn jobs_send(&self, Parameters(args): Parameters<JobsSendArgs>) -> CallToolResult {
+    async fn jobs_send(
+        &self,
+        Parameters(args): Parameters<JobsSendArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         if !matches!(args.mode, SendMode::Auto) {
             return tool_error("standalone Process jobs_send supports only mode=auto");
         }
@@ -559,15 +661,143 @@ impl LocalMachine {
             Ok(input) => input,
             Err(error) => return tool_error(error),
         };
+        let remote_start = context
+            .extensions
+            .get::<crate::remote_start::ValidatedRemoteStart>()
+            .cloned();
+        let guard = if let Some(start) = remote_start.as_ref() {
+            match self.jobs.claim_remote_start(start) {
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
+                    return result;
+                }
+                Ok(RemoteStartDecision::Unknown) => {
+                    return tool_error(
+                        "remote Start outcome is unknown; do not resend Process stdin",
+                    );
+                }
+                Ok(RemoteStartDecision::New(guard)) => Some(guard),
+                Err(error) => return tool_error(error),
+            }
+        } else {
+            None
+        };
         match self
             .send_process_input_checked(&reference.id, reference.node, args.rev, input)
             .await
         {
-            Ok(revision) => ok_text(format!(
-                "{} rev={revision} ok",
-                crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
-            )),
-            Err(error) => tool_error(error),
+            Ok(revision) => {
+                let text = format!(
+                    "{} rev={revision} ok",
+                    crate::jobs::JobManager::standalone_ref(&reference.id, reference.node)
+                );
+                let result = ok_text(text);
+                if let Some(guard) = guard
+                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(error);
+                }
+                result
+            }
+            Err(error) => {
+                let text = error.to_string();
+                let result = tool_error(text);
+                if let Some(guard) = guard
+                    && let Err(replay_error) =
+                        guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(replay_error);
+                }
+                result
+            }
+        }
+    }
+
+    async fn jobs_cancel_impl(
+        &self,
+        args: JobsCancelArgs,
+        remote_start: Option<crate::remote_start::ValidatedRemoteStart>,
+    ) -> CallToolResult {
+        let reference = match parse_ref(&args.reference) {
+            Ok(reference) => reference,
+            Err(error) => return tool_error(error),
+        };
+        if reference.node.is_some() {
+            return tool_error("standalone jobs_cancel targets a Job root, not a Graph node");
+        }
+        let guard = if let Some(start) = remote_start.as_ref() {
+            match self.jobs.claim_remote_start(start) {
+                Ok(RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result))) => {
+                    return result;
+                }
+                Ok(RemoteStartDecision::Unknown) => {
+                    return tool_error(
+                        "remote Start outcome is unknown; do not repeat Job cancellation",
+                    );
+                }
+                Ok(RemoteStartDecision::New(guard)) => Some(guard),
+                Err(error) => return tool_error(error),
+            }
+        } else {
+            None
+        };
+        // Replay lookup must precede current-state preconditions: a successful
+        // first cancellation may itself advance the Job revision, so an exact
+        // duplicate remote Start must return the original receipt rather than
+        // being reinterpreted as a fresh stale-revision request.
+        if let Some(expected) = args.rev {
+            let (current, _) = match self.jobs.standalone_status(&reference.id, None) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let result = tool_error(error);
+                    if let Some(guard) = guard
+                        && let Err(replay_error) =
+                            guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                    {
+                        return tool_error(replay_error);
+                    }
+                    return result;
+                }
+            };
+            if expected != current {
+                let result = tool_error(format!(
+                    "stale Job revision: expected {expected}, current {current}"
+                ));
+                if let Some(guard) = guard
+                    && let Err(replay_error) =
+                        guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(replay_error);
+                }
+                return result;
+            }
+        }
+        let outcome = match self.jobs.cancel(&reference.id) {
+            Ok(_) => self
+                .jobs
+                .standalone_status(&reference.id, None)
+                .map(|(_, status)| status)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        match outcome {
+            Ok(text) => {
+                let result = ok_text(text);
+                if let Some(guard) = guard
+                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(error);
+                }
+                result
+            }
+            Err(text) => {
+                let result = tool_error(text);
+                if let Some(guard) = guard
+                    && let Err(error) = guard.mark_ready(RemoteStartReceipt::Mcp(result.clone()))
+                {
+                    return tool_error(error);
+                }
+                result
+            }
         }
     }
 
@@ -581,32 +811,16 @@ impl LocalMachine {
             open_world_hint = false
         )
     )]
-    async fn jobs_cancel(&self, Parameters(args): Parameters<JobsCancelArgs>) -> CallToolResult {
-        let reference = match parse_ref(&args.reference) {
-            Ok(reference) => reference,
-            Err(error) => return tool_error(error),
-        };
-        if reference.node.is_some() {
-            return tool_error("standalone jobs_cancel targets a Job root, not a Graph node");
-        }
-        if let Some(expected) = args.rev {
-            let (current, _) = match self.jobs.standalone_status(&reference.id, None) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return tool_error(error),
-            };
-            if expected != current {
-                return tool_error(format!(
-                    "stale Job revision: expected {expected}, current {current}"
-                ));
-            }
-        }
-        match self.jobs.cancel(&reference.id) {
-            Ok(_) => match self.jobs.standalone_status(&reference.id, None) {
-                Ok((_, status)) => ok_text(status),
-                Err(error) => tool_error(error),
-            },
-            Err(error) => tool_error(error),
-        }
+    async fn jobs_cancel(
+        &self,
+        Parameters(args): Parameters<JobsCancelArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let remote_start = context
+            .extensions
+            .get::<crate::remote_start::ValidatedRemoteStart>()
+            .cloned();
+        self.jobs_cancel_impl(args, remote_start).await
     }
 }
 
@@ -644,6 +858,232 @@ mod tests {
         assert_eq!(limit["maximum"], MAX_JOB_LIST_LIMIT);
     }
 
+    #[tokio::test]
+    async fn remote_start_duplicate_graph_replays_receipt_without_second_effect() {
+        use aw_tools::remote_start::{
+            REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
+            RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine(root.clone());
+        let raw = serde_json::json!({
+            "ops": [["mv", {"from":"a.txt", "to":"b.txt"}]]
+        });
+        let args: graph::GraphArgs = serde_json::from_value(raw.clone()).unwrap();
+        let generation = machine.jobs.runtime_generation_fingerprint();
+        let now = crate::remote_start::now_unix_ms().unwrap();
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "turn:1/call:graph".into(),
+                turn_id: 1,
+                call_id: "graph".into(),
+                effect_attempt_id: "graph".into(),
+                operation: aw_tools::OperationId::Batch.semantic_name().into(),
+                canonical_ref: "/d:d/i:i/p:p/a:0/t:1".into(),
+                arguments_sha256: crate::remote_start::arguments_sha256(&raw),
+                original_request_sha256: [3; 32],
+                session_action: RemoteSessionAction::Submit,
+                target: RemoteRuntimeLease {
+                    target_host: "l5".into(),
+                    target_profile: "default".into(),
+                    generation,
+                    issued_at_unix_ms: now,
+                    expires_at_unix_ms: now + 5_000,
+                },
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "batch".into(),
+                    source_epoch: 1,
+                    site: "dotlink:l5".into(),
+                    resource_scope: "root".into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+        let target = crate::remote_start::BridgeTarget::new("l5", "default").unwrap();
+        let start = crate::remote_start::validate_authorization(
+            authorization,
+            crate::remote_start::ValidationContext {
+                client_id: "aw-client",
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: aw_tools::OperationId::Batch,
+                class: crate::remote_start::StartClass::Submit,
+                arguments: &raw,
+                control_ref: None,
+            },
+        )
+        .unwrap();
+
+        let prepared = graph::prepare(&machine, args.ops).await.unwrap();
+        let guard = match machine.jobs.claim_remote_start(&start).unwrap() {
+            RemoteStartDecision::New(guard) => guard,
+            _ => panic!("first Graph Start claim must be new"),
+        };
+        let started = graph::start(&machine, prepared, None, Some(start.replay_key()), true)
+            .await
+            .unwrap();
+        let (_, status) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let first = ok_text(status);
+        guard
+            .mark_ready(RemoteStartReceipt::Mcp(first.clone()))
+            .unwrap();
+        machine.jobs.wait_until(&started.id, None).await.unwrap();
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
+
+        let replay = match machine.jobs.claim_remote_start(&start).unwrap() {
+            RemoteStartDecision::Existing(RemoteStartReceipt::Mcp(result)) => result,
+            _ => panic!("duplicate Graph Start must replay the first receipt"),
+        };
+        assert_eq!(replay, first);
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_cancel_replay_precedes_revision_recheck() {
+        use aw_tools::{
+            filesystem::batch::NodeTool,
+            remote_start::{
+                REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
+                RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance,
+                RemoteStartSource,
+            },
+        };
+
+        let Some(bash) = std::env::var_os("AW_BASH").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine_with_shell(root, bash);
+        let started = machine
+            .start_shell_job(
+                crate::mcp::tools::shell::ShellArgs {
+                    command: "sleep 30".into(),
+                    dir: ".".into(),
+                    stdin: None,
+                    timeout_secs: Some(30),
+                    max_output_bytes: Some(1024),
+                    writes: None,
+                },
+                NodeTool::Bash,
+                None,
+                false,
+            )
+            .unwrap();
+        machine.jobs.expose_compatibility(&started.id).unwrap();
+        let (initial_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        let reference = format!("j:{}", started.id);
+        let raw = serde_json::json!({"ref":reference,"rev":initial_rev});
+        let generation = machine.jobs.runtime_generation_fingerprint();
+        let now = crate::remote_start::now_unix_ms().unwrap();
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "turn:1/call:cancel".into(),
+                turn_id: 1,
+                call_id: "cancel".into(),
+                effect_attempt_id: "cancel".into(),
+                operation: aw_tools::OperationId::JobsCancel.semantic_name().into(),
+                canonical_ref: format!("/d:d/i:i/p:p/a:0/j:{}", started.id),
+                arguments_sha256: crate::remote_start::arguments_sha256(&raw),
+                original_request_sha256: [3; 32],
+                session_action: RemoteSessionAction::Control,
+                target: RemoteRuntimeLease {
+                    target_host: "l5".into(),
+                    target_profile: "default".into(),
+                    generation,
+                    issued_at_unix_ms: now,
+                    expires_at_unix_ms: now + 5_000,
+                },
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "jobs.cancel".into(),
+                    source_epoch: 1,
+                    site: "dotlink:l5".into(),
+                    resource_scope: "root".into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+        let target = crate::remote_start::BridgeTarget::new("l5", "default").unwrap();
+        let start = crate::remote_start::validate_authorization(
+            authorization,
+            crate::remote_start::ValidationContext {
+                client_id: "aw-client",
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation: aw_tools::OperationId::JobsCancel,
+                class: crate::remote_start::StartClass::Control,
+                arguments: &raw,
+                control_ref: Some(&reference),
+            },
+        )
+        .unwrap();
+
+        let first = machine
+            .jobs_cancel_impl(
+                JobsCancelArgs {
+                    reference: reference.clone(),
+                    rev: Some(initial_rev),
+                },
+                Some(start.clone()),
+            )
+            .await;
+        assert_ne!(first.is_error, Some(true));
+        let (after_rev, _) = machine.jobs.standalone_status(&started.id, None).unwrap();
+        assert_ne!(
+            after_rev, initial_rev,
+            "first cancellation must advance revision so replay exercises stale-current-state ordering"
+        );
+
+        let replay = machine
+            .jobs_cancel_impl(
+                JobsCancelArgs {
+                    reference,
+                    rev: Some(initial_rev),
+                },
+                Some(start),
+            )
+            .await;
+        assert_eq!(
+            replay, first,
+            "duplicate remote Start must replay the original cancel receipt"
+        );
+        machine.jobs.wait_until(&started.id, None).await.unwrap();
+    }
+
     #[test]
     fn standalone_constructors_expose_background_without_wake_or_legacy_start() {
         let router = LocalMachine::all_tools();
@@ -653,6 +1093,8 @@ mod tests {
         assert!(!batch_props.contains_key("wake"));
         assert!(router.get("job_start").is_none());
         assert!(router.get("job_restart").is_none());
+        assert!(router.get("jobs_subscribe").is_none());
+        assert!(router.get("agent").is_none());
 
         if let Some(shell) = router.get(crate::mcp::shell_tool_name()) {
             let shell_props = shell.input_schema["properties"].as_object().unwrap();

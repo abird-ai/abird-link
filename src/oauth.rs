@@ -1665,18 +1665,28 @@ impl Runtime {
         self.access_tokens().insert(token_hash(raw), grant);
     }
 
-    fn validate_access_token(&self, raw: &str, issuer: &str, resource: &str) -> Result<bool> {
+    fn access_identity(&self, raw: &str, issuer: &str, resource: &str) -> Result<Option<String>> {
         let hash = token_hash(raw);
         let current = now();
         let mut access = self.access_tokens();
         access.retain(|_, grant| grant.expires_at > current);
         let Some(grant) = access.get(&hash) else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(grant.issuer == issuer
-            && grant.resource == resource
-            && scope_contains(&grant.scope, SCOPE_MCP)
-            && !grant.client_id.is_empty())
+        if grant.issuer != issuer
+            || grant.resource != resource
+            || !scope_contains(&grant.scope, SCOPE_MCP)
+            || grant.client_id.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(grant.client_id.clone()))
+    }
+
+    #[cfg(test)]
+    fn validate_access_token(&self, raw: &str, issuer: &str, resource: &str) -> Result<bool> {
+        self.access_identity(raw, issuer, resource)
+            .map(|identity| identity.is_some())
     }
 
     #[cfg(test)]
@@ -1774,17 +1784,24 @@ impl Server {
             .with_state(self.clone())
     }
 
-    pub async fn require_bearer(&self, request: Request<Body>, next: Next) -> Response {
+    pub async fn require_bearer(&self, mut request: Request<Body>, next: Next) -> Response {
         let Some(raw) = bearer_token(request.headers()) else {
             return self.unauthorized(false);
         };
 
         match self
             .runtime
-            .validate_access_token(raw, &self.issuer, &self.resource)
+            .access_identity(raw, &self.issuer, &self.resource)
         {
-            Ok(true) => next.run(request).await,
-            Ok(false) | Err(_) => self.unauthorized(true),
+            Ok(Some(client_id)) => {
+                let identity = match crate::remote_start::AuthenticatedMcpClient::new(client_id) {
+                    Ok(identity) => identity,
+                    Err(_) => return self.unauthorized(true),
+                };
+                request.extensions_mut().insert(identity);
+                next.run(request).await
+            }
+            Ok(None) | Err(_) => self.unauthorized(true),
         }
     }
 

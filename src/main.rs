@@ -14,6 +14,7 @@ mod mcp;
 mod oauth;
 mod private_state;
 mod recovery;
+mod remote_start;
 mod requester;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod secure_fs;
@@ -1505,6 +1506,16 @@ async fn prepare_runtime(
     if let Some(openai) = transports.openai.as_mut() {
         openai.execution_authority = Some(authority);
     }
+    let bridge_host = hostname::get()
+        .ok()
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local-machine".to_owned());
+    let bridge_profile = args.profile.as_deref().unwrap_or("default");
+    job_manager.bind_remote_target(crate::remote_start::BridgeTarget::new(
+        bridge_host,
+        bridge_profile,
+    )?)?;
     let machine = LocalMachine::from_prepared(prepared, job_manager, authority)?;
     Ok((transports, machine))
 }

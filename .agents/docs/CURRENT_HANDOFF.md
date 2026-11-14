@@ -1,49 +1,35 @@
-# CURRENT HANDOFF — dotlink companion for unified Jobs + Agent runtime
+# CURRENT HANDOFF — dotlink unified Jobs + Agent runtime
 
 Prepared: 2026-11-14
 Owner: @pvl
-Machine: **L5 only**
+Machine: **L5 implementation/source authority**
 Repo: `/home/pvl/spaces/abird/src/dotlink`
 
-> The canonical comprehensive cross-repo handoff is
-> `/home/pvl/spaces/abird/src/aw/.agents/docs/CURRENT_HANDOFF.md`.
-> This companion records dotlink's current checkpoint and exact next boundary.
+> Canonical cross-repo design authority remains AW
+> `890e9a383fe2edc3e0bd0aa34a2b217f2724475c`.
+> Source/tests/executed evidence outrank prose.
 
-## Current checkpoint
+## Final implementation state
 
-- Branch: `main`.
-- Pushed D1 implementation checkpoint:
-  `3f59bb16b0262f6157351fd28b13167cc1b3e5db`
-  (`Cut over standalone Jobs to shared AW runtime`).
-- Exact reviewed AW shared pin:
-  `9e9ab043410241c3f797f760d93a1cfd9126fdd2`.
-- `aw-tools`, `aw-tools-fs-unix`, and `aw-tools-fs-win` all use that exact pin.
-- D1 standalone cutover is complete and qualified.
-- D2 dotlink remote Start consume/dispatch is the next implementation boundary.
-- `docs/CHATGPT_PLUGIN.md` remains a pre-existing unrelated dirty modification;
-  preserve it unless the user explicitly asks to include it.
-- Existing second worktree:
-  `/home/pvl/spaces/abird/src/dotlink-016-fixes` on `release/0.16`.
-  Do not touch it and do not create another worktree.
+The unified Jobs + Agent dotlink integration is complete.
 
-## Required reading order
+Exact shared AW revision:
 
-1. `AGENTS.md`
-2. `.agents/plans/README.md`
-3. `.agents/plans/TODO.md`
-4. this file
-5. AW canonical handoff:
-   `/home/pvl/spaces/abird/src/aw/.agents/docs/CURRENT_HANDOFF.md`
-6. dotlink unified plan README/TODO/NEXT-AGENT
-7. AW unified `DESIGN.md` at normative design commit `890e9a...`
-8. live source/tests/Git state
+`0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`
 
-Source and executed tests outrank prose.
+All three shared dependencies pin that exact reachable Git SHA:
 
-## D1 completed behavior
+- `aw-tools`
+- `aw-tools-fs-unix`
+- `aw-tools-fs-win`
+
+The temporary local remote-Start argument-digest implementation is gone.
+dotlink now reuses `aw_tools::remote_start::arguments_sha256` directly.
 
 Standalone model surface:
 
+- shell constructor (`bash`, plus prepared PowerShell spelling where supported)
+- `batch`
 - `jobs_list`
 - `jobs_get`
 - `jobs_read`
@@ -51,94 +37,79 @@ Standalone model surface:
 - `jobs_send`
 - `jobs_cancel`
 
-Constructors:
+Standalone refs remain `j:<handle>[/n:<coordinate>]`.
 
-- shell + `background:true`
-- `batch(..., background:true)`
-
-Removed/unreachable:
+Intentionally absent:
 
 - `job_start`
 - `job_restart`
 - old `job_*`
+- Agent constructor/history/filter
+- `jobs_subscribe`
+- wake
+- team/plan/review routes
+- nested `batch`
 
-Standalone intentionally does not expose Agent, Agent history/filter,
-`jobs_subscribe`, wake, or nested `batch`.
+dotlink remains the concrete finite Process/Graph executor. AW exclusively owns
+Agent, Session, Policy, membership, transcript, hierarchy and upstream authority.
 
-The final reviewed pin cutover uses shared AW primitives without importing AW
-host semantics:
+## Remote Start bridge
 
-- shell flat names resolve through shared `OperationId`;
-- `j:<handle>[/n:<coordinate>]` grammar uses shared `ExecutionRef` typed suffixes;
-- no `aw-host`, AW Session/Policy/Agent runtime dependency is introduced.
+The authenticated AW -> dotlink bridge is implemented and qualified:
 
-Correctness retained:
+1. OAuth-authenticated MCP client identity is attached to HTTP requests.
+2. The authenticated lease endpoint returns host/profile + live runtime generation.
+3. AW supplies one immutable source-fenced `RemoteStartAuthorization`.
+4. dotlink validates exact target generation, operation and canonical arguments.
+5. The existing JobManager replay owner claims the Start **before mutable
+   state/policy/topology checks and before effects**.
+6. Only a genuinely new claim rechecks current dotlink launcher/sandbox/tool/resource authority.
+7. Exact redelivery returns the original factual receipt or pending/unknown state.
+8. Expired, changed-semantics and old-generation proofs fail closed.
 
-- Process natural stdout;
-- Graph root synthesized result and exact node reads;
-- Graph-root aggregate non-ACKable; exact node ACK delivery-fenced;
-- current-authority interactive stdin;
-- same-Job sync/handoff/background replay;
-- cancellation/unknown settlement;
-- fresh runtime generation per startup;
-- stale refs/cursors cannot resurrect;
-- no Job ID reuse across generations;
-- existing native launcher/sandbox/protected-path checks remain authoritative.
+Final replay-first review fixed and regression-locked:
 
-Final D1 repin gates on L5:
+- `jobs_cancel`: claim before current revision check;
+- remote `batch`: claim before Graph preparation/topology revalidation;
+- remote shell: claim before current shell-policy recheck.
 
-- `cargo fmt --all -- --check` — green;
-- `cargo test --offline --locked --all-features` — green:
-  637 main tests passed, one reviewed-fixture test intentionally ignored, and all
-  integration suites passed;
-- `cargo clippy --offline --locked --all-targets --all-features -- -D warnings`
-  — green.
+`jobs_ack`, `jobs_send` and shared-native effects already had correct claim-first ordering.
 
-## AW side already available for D2
+## Final qualification
 
-AW pushed code checkpoint:
-`9e9ab043410241c3f797f760d93a1cfd9126fdd2`.
+Against exact AW pin
+`0a6c6a0bea07a3886c4dc8be4f423eec3ea3c134`:
 
-It provides the host-neutral remote Start value contract and the AW-side durable
-authorization owner. AW already implements replay-before-reauthorization,
-source/grant/site fencing, writer/Session participation rechecks, exact
-operation/ref/request binding, target host/profile/live generation and bounded
-target-clock lease.
+- `cargo check --offline --locked --all-targets --all-features` — green
+- `AW_BASH=... cargo test --offline --locked --all-features --quiet`
+  - main: **651 passed / 0 failed / 1 intentional external-fixture ignore**
+  - integrations: **1/1, 8/8, 1/1, 12/12, 4/4**
+- `cargo clippy --offline --locked --all-targets --all-features -- -D warnings` — green
+- `cargo fmt --all -- --check` — green
+- `git diff --check` excluding unrelated `docs/CHATGPT_PLUGIN.md` — green
 
-Therefore do not add another upstream policy/grant system in dotlink.
+The final Unix standalone catalog remains 21 tools / 13,832 serialized MCP Tool
+bytes (~3,458 rough tokens).
 
-## D2 exact next boundary
+Checkpoint F's real OAuth/TCP Process and FS/Graph bridge evidence remains
+current. Native Windows/macOS execution remains a separate platform/release gate
+and is not claimed from L5.
 
-For every remote effect or Process stdin delivery:
+## Working-tree safety
 
-1. validate the authenticated AW Start and exact dotlink host/profile/generation;
-2. atomically claim its exact effect-attempt through the existing native
-   replay/owner ledger before effect;
-3. reject changed/duplicate/expired/old-generation proof as appropriate;
-4. independently recheck current local launcher/sandbox/source/site/resource
-   authority;
-5. execute at most once and return the factual Process/Graph receipt.
+- `docs/CHATGPT_PLUGIN.md` is unrelated pre-existing dirty work and is not part of
+  this implementation checkpoint.
+- Separate worktree:
+  `/home/pvl/spaces/abird/src/dotlink-016-fixes`, branch `release/0.16`.
+  Do not touch it or create another worktree.
+- Never use A1 for this project.
+- x2 was used only as an inference host for the live Qwen benchmark; it is not
+  source authority.
 
-Duplicate same-generation delivery replays the same factual/pending/unknown
-receipt. A restart never turns an ambiguous old attempt into a fresh launch.
-AW must not issue a replacement Start for that same original attempt.
+## What is next
 
-AW offline blocks new authorization but does not invalidate an already committed
-same-generation unexpired Start. Initial D2 rejects remote wake/subscription.
+No unified-runtime implementation item remains.
 
-Keep Agent/Session/Policy/history entirely AW-owned. Standalone dotlink remains
-finite/native only and its D1 surface must not change.
-
-## Operating constraints
-
-- L5 only.
-- Canonical main checkout only.
-- Preserve `docs/CHATGPT_PLUGIN.md`.
-- Do not touch `dotlink-016-fixes`.
-- No new worktree.
-- No further commit/push/tag/release/deploy without explicit authorization.
-- Keep a turn near ~30 minutes and pause at a coherent checkpoint.
-- Do not requalify unchanged primitives repeatedly.
-
-Next-agent prompt:
-`.agents/plans/ai-native-unified-jobs-agent-runtime-2026-11-11/NEXT-AGENT.md`
+Future work should begin from live Git state and only reopen this surface for a
+new scoped design/change. Release/tag/deploy/platform certification remain
+separate actions and require their own authorization.

@@ -579,6 +579,48 @@ pub(crate) fn execute(
     enforce_result_budget(result, result_budget)
 }
 
+fn execute_with_remote_start(
+    machine: &LocalMachine,
+    name: &str,
+    arguments: Value,
+    result_budget: Option<usize>,
+    cancellation: &tokio_util::sync::CancellationToken,
+    start: Option<crate::remote_start::ValidatedRemoteStart>,
+) -> Result<CallToolResult, McpError> {
+    let Some(start) = start else {
+        return execute(machine, name, arguments, result_budget, cancellation);
+    };
+
+    let guard = match machine
+        .jobs
+        .claim_remote_start(&start)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?
+    {
+        crate::jobs::RemoteStartDecision::Existing(crate::jobs::RemoteStartReceipt::Mcp(
+            result,
+        )) => return Ok(result),
+        crate::jobs::RemoteStartDecision::Unknown => {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "remote Start outcome is unknown; inspect the original filesystem attempt before any new invocation",
+            )]));
+        }
+        crate::jobs::RemoteStartDecision::New(guard) => guard,
+    };
+
+    match execute(machine, name, arguments, result_budget, cancellation) {
+        Ok(result) => {
+            guard
+                .mark_ready(crate::jobs::RemoteStartReceipt::Mcp(result.clone()))
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            Ok(result)
+        }
+        Err(error) => {
+            guard.mark_unknown();
+            Err(error)
+        }
+    }
+}
+
 pub(crate) async fn call(
     machine: &LocalMachine,
     request: CallToolRequestParams,
@@ -587,7 +629,12 @@ pub(crate) async fn call(
 ) -> Result<CallToolResponse, McpError> {
     let name = request.name.to_string();
     let arguments = Value::Object(request.arguments.unwrap_or_default());
-    execute(machine, &name, arguments, result_budget, &context.ct).map(CallToolResponse::Complete)
+    let start = context
+        .extensions
+        .get::<crate::remote_start::ValidatedRemoteStart>()
+        .cloned();
+    execute_with_remote_start(machine, &name, arguments, result_budget, &context.ct, start)
+        .map(CallToolResponse::Complete)
 }
 
 #[cfg(test)]
@@ -909,6 +956,115 @@ mod tests {
             let parsed = url::Url::parse(&uri).unwrap();
             assert!(parsed.query().is_none() && parsed.fragment().is_none());
         }
+    }
+
+    fn remote_fs_start(
+        machine: &LocalMachine,
+        operation: aw_tools::OperationId,
+        arguments: &Value,
+    ) -> crate::remote_start::ValidatedRemoteStart {
+        use aw_tools::remote_start::{
+            REMOTE_START_VERSION, RemoteRuntimeLease, RemoteSessionAction,
+            RemoteStartAuthorization, RemoteStartIntent, RemoteStartProvenance, RemoteStartSource,
+        };
+        let now = crate::remote_start::now_unix_ms().unwrap();
+        let generation = machine.jobs.runtime_generation_fingerprint();
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "turn:1/call:fs".into(),
+                turn_id: 1,
+                call_id: "fs".into(),
+                effect_attempt_id: "fs".into(),
+                operation: operation.semantic_name().into(),
+                canonical_ref: "/d:d/i:i/p:p/a:0/t:1".into(),
+                arguments_sha256: crate::remote_start::arguments_sha256(arguments),
+                original_request_sha256: [3; 32],
+                session_action: RemoteSessionAction::Submit,
+                target: RemoteRuntimeLease {
+                    target_host: "l5".into(),
+                    target_profile: "default".into(),
+                    generation,
+                    issued_at_unix_ms: now,
+                    expires_at_unix_ms: now + 5_000,
+                },
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "fs".into(),
+                    source_epoch: 1,
+                    site: "dotlink:l5".into(),
+                    resource_scope: "root".into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+        let target = crate::remote_start::BridgeTarget::new("l5", "default").unwrap();
+        crate::remote_start::validate_authorization(
+            authorization,
+            crate::remote_start::ValidationContext {
+                client_id: "aw-client",
+                target: &target,
+                generation,
+                now_unix_ms: now,
+                operation,
+                class: crate::remote_start::StartClass::Submit,
+                arguments,
+                control_ref: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_start_filesystem_move_replays_first_receipt_without_second_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let machine = crate::mcp::tools::test_support::test_machine(root.clone());
+        let arguments = json!({"from":"a.txt","to":"b.txt"});
+        let operation = aw_tools::OperationId::Fs(CoreTool::Move);
+        let start = remote_fs_start(&machine, operation, &arguments);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+
+        let first = execute_with_remote_start(
+            &machine,
+            "mv",
+            arguments.clone(),
+            None,
+            &cancellation,
+            Some(start.clone()),
+        )
+        .unwrap();
+        assert_ne!(first.is_error, Some(true), "{first:?}");
+        assert!(!root.join("a.txt").exists());
+        assert!(root.join("b.txt").exists());
+
+        let replay = execute_with_remote_start(
+            &machine,
+            "mv",
+            arguments.clone(),
+            None,
+            &cancellation,
+            Some(start),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert!(!root.join("a.txt").exists());
+        assert!(root.join("b.txt").exists());
+
+        let direct_second = execute(&machine, "mv", arguments, None, &cancellation).unwrap();
+        assert_eq!(direct_second.is_error, Some(true));
     }
 
     #[test]

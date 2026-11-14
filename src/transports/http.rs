@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::connect_info::Connected,
     http::{Request, StatusCode, header::HOST, uri::Authority},
@@ -936,6 +936,28 @@ async fn stop_server_tasks_with_budget(
     }
 }
 
+async fn remote_start_lease(machine: LocalMachine, request: Request<Body>) -> Response {
+    if request
+        .extensions()
+        .get::<crate::remote_start::AuthenticatedMcpClient>()
+        .is_none()
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "remote Start lease requires authenticated MCP client",
+        )
+            .into_response();
+    }
+    match machine.remote_start_lease() {
+        Ok(lease) => (StatusCode::OK, Json(lease)).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote Start lease is unavailable for this runtime",
+        )
+            .into_response(),
+    }
+}
+
 fn mcp_router(
     machine: LocalMachine,
     path: &str,
@@ -950,6 +972,13 @@ fn mcp_router(
     let request_cancellation = cancellation.clone();
     let request_body_limit = machine.max_request_body_bytes();
     let policy_machine = Arc::new(machine.clone());
+    let lease_machine = machine.clone();
+    let lease_base = path.trim_end_matches('/');
+    let lease_path = if lease_base.is_empty() {
+        "/remote-start-lease".to_owned()
+    } else {
+        format!("{lease_base}/remote-start-lease")
+    };
     let server_config = super::streamable_config(&machine, cancellation).disable_allowed_hosts();
 
     let service: StreamableHttpService<LocalMachine, LocalSessionManager> =
@@ -961,6 +990,12 @@ fn mcp_router(
 
     let mut mcp =
         Router::new()
+            .route(
+                &lease_path,
+                axum::routing::get(move |request: Request<Body>| {
+                    remote_start_lease(lease_machine.clone(), request)
+                }),
+            )
             .nest_service(path, service)
             .layer(middleware::from_fn(
                 move |request: Request<Body>, next: Next| {
@@ -1190,6 +1225,175 @@ fn loopback_public_base(bind: SocketAddr) -> Result<Url> {
 mod tests {
     use super::*;
     use axum::extract::{ConnectInfo, connect_info::MockConnectInfo};
+
+    #[tokio::test]
+    async fn remote_start_lease_requires_authenticated_client_and_binds_live_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let machine = crate::mcp::test_machine(temp.path().canonicalize().unwrap());
+        machine.bind_remote_target_for_test("l5", "work");
+
+        let request = Request::builder()
+            .uri("/mcp/remote-start-lease")
+            .body(Body::empty())
+            .unwrap();
+        let denied = remote_start_lease(machine.clone(), request).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let mut request = Request::builder()
+            .uri("/mcp/remote-start-lease")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(crate::remote_start::AuthenticatedMcpClient::new("aw-client").unwrap());
+        let response = remote_start_lease(machine, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let lease: aw_tools::remote_start::RemoteRuntimeLease =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(lease.target_host, "l5");
+        assert_eq!(lease.target_profile, "work");
+        assert_ne!(lease.generation, [0; 32]);
+        assert!(lease.expires_at_unix_ms > lease.issued_at_unix_ms);
+        assert!(
+            lease.expires_at_unix_ms - lease.issued_at_unix_ms
+                <= crate::remote_start::REMOTE_START_LEASE_MILLIS
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_remote_start_metadata_executes_once_and_replays_wire_result() {
+        use aw_tools::remote_start::{
+            REMOTE_START_VERSION, RemoteSessionAction, RemoteStartAuthorization, RemoteStartIntent,
+            RemoteStartProvenance, RemoteStartSource,
+        };
+        use tower::ServiceExt as _;
+
+        const VERSION: &str = "2026-07-28";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let machine = crate::mcp::test_machine(root.clone());
+        machine.bind_remote_target_for_test("l5", "default");
+        let lease = machine.remote_start_lease().unwrap();
+        let arguments = serde_json::json!({"from":"a.txt","to":"b.txt"});
+        let authorization = RemoteStartAuthorization::new(
+            RemoteStartIntent {
+                version: REMOTE_START_VERSION,
+                original_invocation_id: "turn:1/call:wire".into(),
+                turn_id: 1,
+                call_id: "wire".into(),
+                effect_attempt_id: "wire".into(),
+                operation: aw_tools::OperationId::Fs(aw_tools::filesystem::schema::Tool::Move)
+                    .semantic_name()
+                    .into(),
+                canonical_ref: "/d:d/i:i/p:p/a:0/t:1".into(),
+                arguments_sha256: crate::remote_start::arguments_sha256(&arguments),
+                original_request_sha256: [3; 32],
+                session_action: RemoteSessionAction::Submit,
+                target: lease,
+            },
+            RemoteStartProvenance {
+                actor: "actor".into(),
+                source: RemoteStartSource {
+                    source_kind: "host".into(),
+                    source_id: "mv".into(),
+                    source_epoch: 1,
+                    site: "dotlink:l5".into(),
+                    resource_scope: "root".into(),
+                    grant_sha256: [4; 32],
+                },
+                policy_revision_sha256: [5; 32],
+                policy_admission_id: "policy".into(),
+                session_id: "session".into(),
+                branch_id: "branch".into(),
+                writer_epoch: 1,
+                membership_epoch: 1,
+                audience_epoch: 1,
+            },
+        )
+        .unwrap();
+        let body = |id: i64| {
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "mv",
+                    "arguments": arguments,
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": VERSION,
+                        "io.modelcontextprotocol/clientInfo": {"name":"aw-test","version":"1"},
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                        (crate::remote_start::REMOTE_START_META_KEY): authorization
+                    }
+                }
+            }))
+            .unwrap()
+        };
+        let request = |id: i64| {
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(HOST, "127.0.0.1:3000")
+                .header("MCP-Protocol-Version", VERSION)
+                .header("Mcp-Method", "tools/call")
+                .header("Mcp-Name", "mv")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .body(Body::from(body(id)))
+                .unwrap()
+        };
+        let base = mcp_router(
+            machine,
+            "/mcp",
+            LogConfig::default(),
+            None,
+            trusted_http_hosts("127.0.0.1:3000".parse().unwrap(), None),
+            CancellationToken::new(),
+        )
+        .layer(MockConnectInfo(RequesterId::Local));
+
+        let unauthenticated = base.clone().oneshot(request(1)).await.unwrap();
+        let unauthenticated_body = axum::body::to_bytes(unauthenticated.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let unauthenticated_json: serde_json::Value =
+            serde_json::from_slice(&unauthenticated_body).unwrap();
+        assert!(unauthenticated_json.get("error").is_some());
+        assert!(root.join("a.txt").exists());
+        assert!(!root.join("b.txt").exists());
+
+        let identity = crate::remote_start::AuthenticatedMcpClient::new("aw-client").unwrap();
+        let authenticated = base.layer(middleware::from_fn(
+            move |mut request: Request<Body>, next: Next| {
+                let identity = identity.clone();
+                async move {
+                    request.extensions_mut().insert(identity);
+                    next.run(request).await
+                }
+            },
+        ));
+        let first = authenticated.clone().oneshot(request(2)).await.unwrap();
+        let first_body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert!(first_json.get("result").is_some(), "{first_json}");
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
+
+        let replay = authenticated.oneshot(request(3)).await.unwrap();
+        let replay_body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(replay_json["result"], first_json["result"]);
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "a");
+    }
 
     #[tokio::test]
     async fn startup_operations_race_cancellation() {
