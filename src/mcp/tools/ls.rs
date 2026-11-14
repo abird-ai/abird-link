@@ -60,6 +60,7 @@ pub(crate) struct ListArgs {
 
     /// Maximum number of entries to return. Defaults to {ls_limit} and is capped at {ls_limit_max}.
     #[serde(default)]
+    #[schemars(range(max = MAX_LIST_ENTRIES))]
     pub(super) limit: Option<usize>,
 }
 
@@ -305,6 +306,16 @@ impl LocalMachine {
 mod tests {
     use super::*;
     use crate::mcp::tools::test_support::test_machine;
+
+    #[test]
+    fn ls_schema_advertises_the_same_cap_the_clamp_applies() {
+        let schema = LocalMachine::all_tools()
+            .get("ls")
+            .unwrap()
+            .input_schema
+            .clone();
+        assert_eq!(schema["properties"]["limit"]["maximum"], MAX_LIST_ENTRIES);
+    }
 
     #[tokio::test]
     async fn ls_globs_and_limits_depth() {

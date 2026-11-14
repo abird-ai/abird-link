@@ -196,6 +196,10 @@ fn map_descriptions(tool: &mut rmcp::model::Tool, mut map: impl FnMut(String) ->
     }
 }
 
+/// Keywords whose values are data, not schema annotations: a `description` key
+/// inside one of them belongs to the caller's payload, so it is never rewritten.
+const DATA_KEYWORDS: [&str; 4] = ["default", "enum", "const", "examples"];
+
 fn map_descriptions_in(
     value: &mut serde_json::Value,
     map: &mut impl FnMut(String) -> String,
@@ -204,6 +208,9 @@ fn map_descriptions_in(
         serde_json::Value::Object(object) => {
             let mut changed = false;
             for (key, child) in object.iter_mut() {
+                if DATA_KEYWORDS.contains(&key.as_str()) {
+                    continue;
+                }
                 if key == "description"
                     && let Some(text) = child.as_str().map(str::to_owned)
                 {
@@ -1536,24 +1543,35 @@ mod tests {
     /// limit placeholder must resolve from its enforcing constant, and no
     /// declared token may go unused.
     #[test]
-    fn advertised_descriptions_are_single_line_and_resolve_their_limits() {
+    fn advertised_text_is_single_line_and_resolves_its_limits() {
         use std::collections::BTreeSet;
         let tokens = super::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
         let known: Vec<&str> = tokens.iter().map(|(token, _)| *token).collect();
         let mut used = BTreeSet::new();
         let temp = tempfile::tempdir().unwrap();
-        // Every surface counts, so the fixture advertises the shell too.
-        let machine =
-            test_support::test_machine_with(temp.path().canonicalize().unwrap(), |config| {
-                config.allow_shell = true;
-            });
-        for tool in machine.policy_tool_router().list_all() {
+        let root = temp.path().canonicalize().unwrap();
+        // Both shell descriptions are advertised text: the local wait and the
+        // hosted handoff. Only the tunnel one reaches a hosted client.
+        let local = test_support::test_machine(root.clone());
+        let hosted = test_support::test_machine_with(root, |config| {
+            config.sync_hold = Some(crate::limits::OPENAI_TUNNEL_SYNC_HOLD);
+        });
+        // The whole registry, not the policy-filtered surface: a tool this
+        // fixture hides must not escape the check.
+        for tool in crate::mcp::LocalMachine::all_tools().list_all() {
+            let name = tool.name.to_string();
+            assert!(
+                tool.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.title.as_deref())
+                    .is_some(),
+                "{name} needs an annotation title: --list-tools prints titles, never raw description text"
+            );
             // Authored text: single line, and every placeholder it uses counts.
             for text in super::advertised_descriptions(&tool) {
                 assert!(
                     !text.contains(['\n', '\r', '\t']),
-                    "{} advertises a control character: {text:?}",
-                    tool.name
+                    "{name} advertises a control character: {text:?}"
                 );
                 for token in &known {
                     if text.contains(token) {
@@ -1561,17 +1579,19 @@ mod tests {
                     }
                 }
             }
-            // Shipped text: no placeholder survives, and the limit patchers
-            // cannot reintroduce a line break.
-            let described = machine.describe_tool(tool, &tokens);
-            for text in super::advertised_descriptions(&described) {
-                assert!(
-                    !text.contains(['\n', '\r', '\t']),
-                    "{} ships a control character: {text:?}",
-                    described.name
-                );
-                let unknown = unknown_placeholders(&text, &known);
-                assert!(unknown.is_empty(), "{} uses {unknown:?}", described.name);
+            // Shipped text: no placeholder survives, and no limit patcher or
+            // profile variant can reintroduce a line break.
+            for machine in [&local, &hosted] {
+                for text in
+                    super::advertised_descriptions(&machine.describe_tool(tool.clone(), &tokens))
+                {
+                    assert!(
+                        !text.contains(['\n', '\r', '\t']),
+                        "{name} ships a control character: {text:?}"
+                    );
+                    let unknown = unknown_placeholders(&text, &known);
+                    assert!(unknown.is_empty(), "{name} uses {unknown:?}");
+                }
             }
         }
         for token in known {

@@ -88,6 +88,7 @@ pub(crate) enum GrepOutputMode {
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GrepArgs {
     /// Regular expression, or literal text when `literal` is set. Maximum {grep_pattern} printable characters.
+    #[schemars(length(max = MAX_GREP_PATTERN))]
     pub(crate) pattern: String,
 
     /// Directory to search recursively, or a single file. Relative paths resolve from the directory where dotlink was launched.
@@ -112,10 +113,12 @@ pub(crate) struct GrepArgs {
 
     /// Context lines before each hit. Maximum {grep_context}.
     #[serde(default)]
+    #[schemars(range(max = MAX_GREP_CONTEXT))]
     pub(super) before: Option<usize>,
 
     /// Context lines after each hit. Maximum {grep_context}.
     #[serde(default)]
+    #[schemars(range(max = MAX_GREP_CONTEXT))]
     pub(super) after: Option<usize>,
 
     /// Prefix content lines with `path:line:`. Defaults to true.
@@ -128,6 +131,7 @@ pub(crate) struct GrepArgs {
 
     /// Maximum hits, or files. Defaults to {grep_hits} and is capped there.
     #[serde(default)]
+    #[schemars(range(max = MAX_GREP_HITS))]
     pub(super) limit: Option<usize>,
 
     /// Honour `.gitignore` files below `path`. Off by default.
@@ -917,6 +921,20 @@ mod tests {
     use super::*;
     use crate::mcp::tools::test_support::{grep_args, grep_tree, test_machine};
     use serde_json::Value;
+
+    #[test]
+    fn grep_schema_advertises_the_same_caps_the_clamp_applies() {
+        let schema = LocalMachine::all_tools()
+            .get("grep")
+            .unwrap()
+            .input_schema
+            .clone();
+        let properties = &schema["properties"];
+        assert_eq!(properties["limit"]["maximum"], MAX_GREP_HITS);
+        assert_eq!(properties["after"]["maximum"], MAX_GREP_CONTEXT);
+        assert_eq!(properties["before"]["maximum"], MAX_GREP_CONTEXT);
+        assert_eq!(properties["pattern"]["maxLength"], MAX_GREP_PATTERN);
+    }
 
     #[test]
     fn dense_hit_selection_keeps_only_the_requested_page() {

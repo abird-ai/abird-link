@@ -2471,12 +2471,14 @@ impl LocalMachine {
         tools
             .into_iter()
             .map(|tool| {
+                // A title is an annotation, never the raw description: that text
+                // carries limit placeholders and is rendered only by
+                // `describe_tool`, which this inspection path deliberately skips.
                 let title = tool
                     .title
                     .as_deref()
                     .or_else(|| tool.annotations.as_ref().and_then(|a| a.title.as_deref()))
-                    .or(tool.description.as_deref())
-                    .unwrap_or("")
+                    .unwrap_or_default()
                     .to_owned();
                 (tool.name.to_string(), title)
             })
@@ -2544,7 +2546,7 @@ fn tool_call_log_outcome(
 impl LocalMachine {
     /// One place where advertised text is made true: profile ceilings plus the
     /// limit placeholders resolved from the same constants that enforce them.
-    pub(crate) fn describe_tool(&self, tool: Tool, tokens: &[(&'static str, String)]) -> Tool {
+    fn describe_tool(&self, tool: Tool, tokens: &[(&'static str, String)]) -> Tool {
         let mut tool = with_profile_limits(
             tool,
             self.config.max_shell_timeout_secs,
