@@ -2761,9 +2761,10 @@ impl rmcp::ServerHandler for LocalMachine {
         // tool cannot forget. `bash` keeps its own sink because that one is
         // clamped to the child's deadline; two sinks would interleave counters
         // on one progress token.
-        let heartbeat = (!is_shell_tool(&request.name))
-            .then(|| crate::mcp::tools::ProgressHeartbeat::for_request(&context))
-            .flatten();
+        let heartbeat = match is_shell_tool(&request.name) {
+            true => None,
+            false => crate::mcp::tools::ProgressHeartbeat::for_request(&context),
+        };
         crate::mcp::tools::await_with_heartbeat(
             heartbeat,
             None,

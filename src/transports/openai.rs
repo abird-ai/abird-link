@@ -7725,6 +7725,86 @@ name"
     }
 
     #[tokio::test]
+    async fn tool_blocked_on_the_mutation_lock_reports_progress() {
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("a.txt");
+        std::fs::write(&target, "before\n").unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: vec![root.clone()],
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: false,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+
+            task_result_budget: None,
+
+            sync_hold: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        // Another owner already holds the resolved target, so the edit below
+        // blocks inside the tool rather than in the transport.
+        let held = machine
+            .lock_mutations([target.as_path()])
+            .await
+            .expect("hold the target lock");
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "edit",
+                "arguments": {"edits": [{
+                    "path": "a.txt",
+                    "old_text": "before",
+                    "new_text": "after"
+                }]},
+                "_meta": {"progressToken": "lock"}
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let task =
+            tokio::spawn(async move { mcp.dispatch_stream(&BTreeMap::new(), &call, tx).await });
+        let first = tokio::time::timeout(Duration::from_millis(900), rx.recv())
+            .await
+            .expect("a tool blocked on the mutation lock must report progress")
+            .expect("stream closed without a progress event");
+        assert!(!task.is_finished(), "the edit returned before its lock");
+        assert_eq!(first["method"], "notifications/progress", "{first}");
+        assert_eq!(first["params"]["progressToken"], "lock");
+
+        // Releasing the lock lets the same call finish normally.
+        drop(held);
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after\n");
+    }
+
+    #[tokio::test]
     async fn waiting_job_get_reports_progress_before_completion() {
         if crate::mcp::resolve_executable("bash").is_none() {
             return;
