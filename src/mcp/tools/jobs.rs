@@ -456,10 +456,7 @@ mod tests {
             "{get_description}"
         );
         assert!(
-            get_description.contains(&format!(
-                "capped at {}",
-                crate::jobs::MAX_TAIL_LINES
-            )),
+            get_description.contains(&format!("capped at {}", crate::jobs::MAX_TAIL_LINES)),
             "{get_description}"
         );
         let tail_description = get.input_schema["properties"]["tail_lines"]["description"]
