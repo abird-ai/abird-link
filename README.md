@@ -375,7 +375,7 @@ The Runtime key is stored separately from JSONC config and follows the selected 
 
 When OpenAI transport is disabled for a profile, that profile does not require a runtime key.
 
-Shell execution is durable: if a `bash`/`powershell` call cannot return its complete result inside the tunnel response window, the same execution continues behind a job/task handle instead of being restarted. The shell tool surface includes explicit background start, status, output paging, acknowledgement, and cancellation controls. See [Architecture](docs/ARCHITECTURE.md) for the transport and replay model.
+Shell execution is durable: if a `bash`/`powershell` call cannot return its complete result inside the tunnel response window, the same execution continues behind a job handle instead of being restarted. `background: true` asks for that handle immediately instead of waiting; `job_get`, `job_output`, `job_ack`, `job_cancel` and `job_list` then read, page, free and stop it. See [Architecture](docs/ARCHITECTURE.md) for the transport and replay model.
 
 ### Automatic tunnel recovery
 

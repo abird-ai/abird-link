@@ -72,7 +72,7 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobIdArgs {
-    /// Job/task identifier returned by a `background: true` shell call.
+    /// Job id from a shell call that returned a handle.
     job_id: String,
 }
 
@@ -123,7 +123,7 @@ fn resolve_wait(wait_secs: Option<u64>, budget: Option<Duration>) -> Duration {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobGetArgs {
-    /// Job/task identifier.
+    /// Job id from a shell call that returned a handle.
     job_id: String,
     /// Wait up to this many seconds for the job to finish before returning its
     /// status. Defaults to 90 where the transport supplies a response window and
@@ -143,7 +143,7 @@ struct JobGetArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobOutputArgs {
-    /// Job/task identifier returned by a `background: true` shell call.
+    /// Job id from a shell call that returned a handle.
     job_id: String,
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]
@@ -175,7 +175,7 @@ struct JobOutputArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobAckArgs {
-    /// Job/task identifier.
+    /// Job id from a shell call that returned a handle.
     job_id: String,
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]

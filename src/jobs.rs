@@ -2352,7 +2352,10 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             snapshot.timeout_secs
         )
     });
-    let next = timed_out.then_some("retry with background: true, or a larger timeout_secs");
+    // A timed-out command was killed at its own `timeout_secs`, so the only
+    // remedy is a larger one: `background: true` changes who waits, not how long
+    // the child may run.
+    let next = timed_out.then_some("retry with a larger timeout_secs");
     let text = serde_json::json!({
         "ts": completion.completed_unix,
         "exit_code": completion.exit_code,
@@ -2579,7 +2582,6 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
     let mut payload = serde_json::json!({
         "ts": crate::mcp::now_unix(),
         "job_id": entry.id,
-        "task_id": entry.id,
         "status": entry.status(),
         "elapsed_ms": entry.created.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         "timeout_secs": entry.timeout_secs,
@@ -2759,7 +2761,6 @@ fn compatibility_receipt(inner: &JobManagerInner, entry: &JobEntry) -> CallToolR
             ),
             "ts": crate::mcp::now_unix(),
             "job_id": entry.id,
-            "task_id": entry.id,
             "status": entry.status(),
             "async": true,
             "elapsed_ms": u64::try_from(entry.created.elapsed().as_millis()).unwrap_or(u64::MAX),

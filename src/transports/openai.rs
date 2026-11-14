@@ -3174,7 +3174,6 @@ fn annotate_response_context(
     }
     let name = jsonrpc.pointer("/params/name").and_then(Value::as_str);
     let shell = tools_call && name.is_some_and(crate::mcp::is_shell_tool);
-    let durable_shell = shell;
     // The job tools that can wait need the same remaining-window metadata the
     // shell uses, so a bounded wait can never outlive the response.
     let waits_on_job = tools_call && name.is_some_and(crate::mcp::is_waiting_job_tool);
@@ -3204,7 +3203,9 @@ fn annotate_response_context(
     if !tools_call {
         return Ok(None);
     }
-    if durable_shell {
+    // Every shell call is one durable execution, so it always carries request
+    // identity; the window below only decides how long this response waits.
+    if shell {
         meta.insert(
             crate::mcp::REQUEST_KEY_META_KEY.to_owned(),
             Value::String(request_key.to_owned()),
@@ -7589,11 +7590,10 @@ name"
         assert_eq!(sync_meta(&call), Some(90_000));
         assert_eq!(request_meta(&call), Some("request".to_owned()));
 
-        // Explicit background jobs carry request identity but no synchronous
-        // wait budget because they return immediately by definition.
-        // `background: true` is one tool now, so the annotation cannot tell it
-        // apart from a waiting call — nor does it need to: the budget is advisory
-        // and a background call returns before it is ever consulted.
+        // `background: true` is the same shell tool, so the annotation cannot
+        // tell it apart from a waiting call — nor does it need to: a background
+        // call returns before the budget is ever consulted, and carrying it keeps
+        // one rule for every shell execution.
         let mut background = shell(json!({"command":"true","background":true}));
         assert_eq!(
             annotate_response_context(&mut background, window, reserve, "request", "token"),

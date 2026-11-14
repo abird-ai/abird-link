@@ -30,8 +30,8 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 
 use super::{
-    LocalMachine, ProgressHeartbeat, dot, heartbeat_tick, resolve_capped, resolve_output_page,
-    tool_error,
+    LocalMachine, ProgressHeartbeat, await_with_heartbeat, dot, resolve_capped,
+    resolve_output_page, tool_error,
 };
 #[cfg(target_os = "linux")]
 use crate::mcp::{
@@ -84,9 +84,7 @@ pub(crate) struct ShellArgs {
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
 
-    /// Return the durable job handle instead of waiting for the command. The
-    /// execution is the same either way; this only chooses not to hold the
-    /// request, which is what a build that outlives a response window wants.
+    /// Return the durable job handle instead of waiting. The execution is the same either way; this only chooses not to hold the request, which is what a build that outlives a response window wants.
     #[serde(default)]
     pub(crate) background: bool,
 }
@@ -1884,37 +1882,29 @@ impl LocalMachine {
             .bubblewrap_command(&shell, working_dir, script)
     }
 
-    async fn run_shell_to_completion(
+    /// Run one shell call as the caller asked: `background: true` answers with
+    /// the durable handle at once, otherwise this waits for the execution to
+    /// finish. Local transports have no request identity to replay, so a handle
+    /// started here carries none; the tunnel dispatch owns its own key and
+    /// therefore keeps its own bounded-wait path.
+    async fn run_shell(
         &self,
         args: ShellArgs,
         powershell: bool,
         heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<CallToolResult, McpError> {
+        if args.background {
+            return Ok(self.background_receipt(args, powershell, None));
+        }
         let started = match self.start_shell_job(args, powershell, None) {
             Ok(started) => started,
             Err(error) => return Ok(tool_error(error)),
         };
-        let wait = self.jobs.wait_until(&started.id, None);
-        tokio::pin!(wait);
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut wait => {
-                    result.map_err(crate::jobs::JobError::into_mcp)?;
-                    break;
-                }
-                () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
-                    if let Some(heartbeat) = heartbeat.as_ref() {
-                        heartbeat
-                            .report(Some(
-                                Instant::now()
-                                    + Duration::from_secs(self.config.max_shell_timeout_secs),
-                            ))
-                            .await;
-                    }
-                }
-            }
-        }
+        // A local transport has no response window, so the wait ends only when
+        // the execution does; each heartbeat delivery stays bounded on its own.
+        await_with_heartbeat(heartbeat, None, self.jobs.wait_until(&started.id, None))
+            .await
+            .map_err(crate::jobs::JobError::into_mcp)?;
         let result = self
             .jobs
             .tool_result(&started.id, None)
@@ -1926,17 +1916,6 @@ impl LocalMachine {
             .mark_synchronous_result(&started.id)
             .map_err(crate::jobs::JobError::into_mcp)?;
         Ok(result)
-    }
-
-    #[cfg(test)]
-    async fn execute_shell(
-        &self,
-        args: ShellArgs,
-        powershell: bool,
-        heartbeat: Option<ProgressHeartbeat>,
-    ) -> Result<CallToolResult, McpError> {
-        self.run_shell_to_completion(args, powershell, heartbeat)
-            .await
     }
 
     pub(crate) fn response_from_handoff(
@@ -2083,11 +2062,11 @@ impl LocalMachine {
     }
 
     /// Start the command and return its handle instead of waiting: the single
-    /// implementation of `background: true`, shared by the transport dispatch and
-    /// the router handlers. A refused command is an ordinary tool error, exactly
-    /// as it is for the waiting form, so the wire shape never depends on which
-    /// path handled the call.
-    pub(crate) fn background_receipt(
+    /// implementation of `background: true`, reached from both entry points (the
+    /// router handlers' `run_shell` and the tunnel dispatch). A refused command
+    /// is an ordinary tool error, exactly as it is for the waiting form, so the
+    /// wire shape never depends on which path handled the call.
+    fn background_receipt(
         &self,
         args: ShellArgs,
         powershell: bool,
@@ -2119,7 +2098,7 @@ impl LocalMachine {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
-        let args = { serde_json::from_value::<ShellArgs>(Value::Object(arguments)) }
+        let args = serde_json::from_value::<ShellArgs>(Value::Object(arguments))
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let powershell = name == "powershell";
 
@@ -2153,24 +2132,18 @@ impl LocalMachine {
                 .map(Some);
         }
 
+        // The transport's remaining response window bounds only this wait; the
+        // execution keeps its own deadline. Heartbeats report while it blocks and
+        // are clipped to that same window, so neither can outlive the response.
         let deadline = sync_budget_millis
             .and_then(|millis| Instant::now().checked_add(Duration::from_millis(millis)));
-        let wait = self.jobs.wait_until(&started.id, deadline);
-        tokio::pin!(wait);
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                result = &mut wait => break result.map_err(crate::jobs::JobError::into_mcp)?,
-                () = heartbeat_tick(heartbeat.as_ref()), if heartbeat.is_some() => {
-                    if let Some(heartbeat) = heartbeat.as_ref() {
-                        let report_deadline = deadline.unwrap_or_else(|| {
-                            Instant::now() + Duration::from_secs(self.config.max_shell_timeout_secs)
-                        });
-                        heartbeat.report(Some(report_deadline)).await;
-                    }
-                }
-            }
-        };
+        let outcome = await_with_heartbeat(
+            heartbeat,
+            deadline,
+            self.jobs.wait_until(&started.id, deadline),
+        )
+        .await
+        .map_err(crate::jobs::JobError::into_mcp)?;
         match outcome {
             JobWait::Terminal => {
                 if let Some(result) = self
@@ -2700,13 +2673,8 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match args.background {
-            true => Ok(self.background_receipt(args, false, None)),
-            false => {
-                self.run_shell_to_completion(args, false, ProgressHeartbeat::for_request(&context))
-                    .await
-            }
-        }
+        self.run_shell(args, false, ProgressHeartbeat::for_request(&context))
+            .await
     }
 
     #[tool(
@@ -2724,13 +2692,8 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match args.background {
-            true => Ok(self.background_receipt(args, true, None)),
-            false => {
-                self.run_shell_to_completion(args, true, ProgressHeartbeat::for_request(&context))
-                    .await
-            }
-        }
+        self.run_shell(args, true, ProgressHeartbeat::for_request(&context))
+            .await
     }
 }
 
@@ -3526,7 +3489,7 @@ mod tests {
         let machine = direct_shell_machine(root, bash, 256 * 1024);
         let started = Instant::now();
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     // Child writes more than a pipe buffer before it reads
                     // stdin; both directions must make progress concurrently.
@@ -3559,7 +3522,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let machine = direct_shell_machine(root, bash, 256 * 1024);
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: "exec 0<&-; sleep 0.05; printf survived".to_owned(),
                     dir: ".".to_owned(),
@@ -3861,7 +3824,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let machine = direct_shell_machine(root, bash, 16 * 1024);
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: "printf never-runs".to_owned(),
                     dir: "missing-directory".to_owned(),
@@ -4048,7 +4011,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let machine = direct_shell_machine(root, bash, 16 * 1024);
         let expected = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: "printf abcdefgh".to_owned(),
                     dir: ".".to_owned(),
@@ -5764,7 +5727,7 @@ mod tests {
 
         let started = Instant::now();
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     // The background process inherits the captured pipes after
                     // Bash exits, so output collection must share the same
@@ -5843,7 +5806,7 @@ mod tests {
         };
 
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: "printf 'partial output\\n'; sleep 30".to_owned(),
                     dir: ".".to_owned(),
@@ -5960,7 +5923,7 @@ mod tests {
         );
 
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: concat!(
                         "set -eu; ",
@@ -6155,7 +6118,7 @@ mod tests {
             python = python.display(),
         );
         let response = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command,
                     dir: ".".to_owned(),
@@ -6238,7 +6201,7 @@ mod tests {
             .await
             .unwrap();
             let result = machine
-                .execute_shell(
+                .run_shell(
                     ShellArgs {
                         command: concat!(
                             "set -eu; test ! -e /nix/var/nix/daemon-socket/socket; ",
@@ -6254,7 +6217,7 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(8),
                         max_output_bytes: None,
-                                        background: false,
+                        background: false,
                     },
                     false, None)
                 .await
@@ -6518,14 +6481,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let result = machine.execute_shell(ShellArgs {
+        let result = machine.run_shell(ShellArgs {
             command: format!(
                 "set -eu; {} add README.md; {} commit -qm 'Signed in Bubblewrap'; {} cat-file commit HEAD; test ! -e /tmp/home/.ssh",
                 git.display(), git.display(), git.display(),
             ),
             dir: ".".into(), stdin: None,
             timeout_secs: Some(15), max_output_bytes: None,
-                background: false,
+            background: false,
         }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -6617,7 +6580,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let result = machine.execute_shell(ShellArgs {
+        let result = machine.run_shell(ShellArgs {
             command: concat!(
                 "set -eu; ",
                 "for node in /dev/kvm /dev/kfd /dev/nvidia0 /dev/nvidiactl /dev/dri/renderD128; do ",
@@ -6774,7 +6737,7 @@ mod tests {
         .await
         .unwrap();
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: checked,
                     dir: ".".into(),
@@ -6878,7 +6841,7 @@ mod tests {
                 "set -eu; test ! -e /dev/kvm; test ! -e /dev/dri/renderD128; echo isolated"
             };
             let result = machine
-                .execute_shell(
+                .run_shell(
                     ShellArgs {
                         command: command.to_owned(),
                         dir: ".".to_owned(),
@@ -6967,7 +6930,7 @@ mod tests {
         .await
         .unwrap();
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: format!(
                         "{} --extra-experimental-features 'nix-command flakes' store info",
@@ -7068,7 +7031,7 @@ mod tests {
         };
 
         let result = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: concat!(
                         "set -eu; ",
@@ -7100,7 +7063,7 @@ mod tests {
 
         let late = writable.join("late");
         let background = machine
-            .execute_shell(
+            .run_shell(
                 ShellArgs {
                     command: "(sleep 2; touch late) >/dev/null 2>&1 &".to_owned(),
                     dir: "writable".to_owned(),

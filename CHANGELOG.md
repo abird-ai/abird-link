@@ -6,9 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-14
+
 ### Changed
 
-- **`job_start` is gone; `bash`/`powershell` take `background: true`.** It was the same durable execution with the wait suppressed — the dispatch read `explicit_background = name == "job_start"` and its argument type was a field-for-field copy of the shell's. One tool now: `background: false` (default) keeps today's behaviour, `background: true` returns the same handle immediately. One argument schema instead of two, `with_job_limits` no longer patches a shell-shaped tool, and both `name == "job_start"` special cases in the tunnel transport collapse into `is_shell_tool`. Breaking tool-surface change.
+- **`job_start` is gone; `bash`/`powershell` take `background: true`.** It was the same durable execution with the wait suppressed — the dispatch read `explicit_background = name == "job_start"` and its argument type was a field-for-field copy of the shell's. One tool now: `background: false` (default) keeps today's behaviour, `background: true` returns the same handle immediately. One argument schema instead of two, `with_job_limits` no longer patches a shell-shaped tool, and both `name == "job_start"` special cases in the tunnel transport collapse into `is_shell_tool`. Breaking tool-surface change. A timed-out command now only advises a larger `timeout_secs`: `background: true` changes who waits, not how long the child may run.
+
+- **`task_id` is gone from job payloads.** The compatibility receipt and `job_get` repeated `job_id` under a second name, but `tasks/get` addresses only a native task, so following that alias answered `unknown task`. Jobs are read through `job_id`; a native task arrives as a task, with its own `taskId`.
 
 - The turn clock asks for **35 minutes** instead of 40, and states it as a limit rather than a hint: the server instructions tell the model to take the first `ts` of a turn as its anchor, keep one user turn to that horizon, then stop at the next coherent boundary, say what is done and what remains, and hand back instead of starting another step. Both shell descriptions carry the same sentence, so the advice appears wherever the clock is read. A long turn is what makes a hosted client show "still thinking" while the bridge is answering every call.
 
@@ -684,10 +688,13 @@ enumeration never worked, and tool output depended on the host separator.
 - Initial native Rust Secure MCP Tunnel client.
 - Embedded rmcp server with local filesystem and Bash tools.
 
+[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/abird-ai/dotlink/compare/v0.16.7...v0.17.0
+[0.16.7]: https://github.com/abird-ai/dotlink/compare/v0.16.6...v0.16.7
+[0.16.6]: https://github.com/abird-ai/dotlink/compare/v0.16.5...v0.16.6
 [0.16.5]: https://github.com/abird-ai/dotlink/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/abird-ai/dotlink/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/abird-ai/dotlink/compare/v0.16.2...v0.16.3
-[Unreleased]: https://github.com/abird-ai/dotlink/compare/v0.14.0...HEAD
 [0.16.2]: https://github.com/abird-ai/dotlink/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/abird-ai/dotlink/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/abird-ai/dotlink/compare/v0.15.3...v0.16.0
@@ -700,6 +707,9 @@ enumeration never worked, and tool output depended on the host separator.
 [0.14.6]: https://github.com/abird-ai/dotlink/compare/v0.14.5...v0.14.6
 [0.14.5]: https://github.com/abird-ai/dotlink/compare/v0.14.4...v0.14.5
 [0.14.4]: https://github.com/abird-ai/dotlink/compare/v0.14.3...v0.14.4
+[0.14.3]: https://github.com/abird-ai/dotlink/compare/v0.14.2...v0.14.3
+[0.14.2]: https://github.com/abird-ai/dotlink/compare/v0.14.1...v0.14.2
+[0.14.1]: https://github.com/abird-ai/dotlink/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/abird-ai/dotlink/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/abird-ai/dotlink/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/abird-ai/dotlink/compare/v0.12.0...v0.13.0

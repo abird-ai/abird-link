@@ -556,9 +556,6 @@ pub fn shell_tool_name() -> &'static str {
         .map_or("bash", |spec| spec.name)
 }
 
-/// True for the shell tool this platform advertises. Tool visibility, the
-/// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
-/// this one question, so a new shell variant cannot be missed in one of them.
 /// Job tools whose request may wait for progress or completion. They receive the
 /// same remaining-window metadata the shell uses, so a wait cannot outlive the
 /// response it belongs to.
@@ -566,6 +563,9 @@ pub fn is_waiting_job_tool(name: &str) -> bool {
     matches!(name, "job_get" | "job_output")
 }
 
+/// True for the shell tool this platform advertises. Tool visibility, the
+/// schema-limit rewrite, the tunnel's delivery reserve and the TOOL log all ask
+/// this one question, so a new shell variant cannot be missed in one of them.
 pub fn is_shell_tool(name: &str) -> bool {
     name == shell_tool_name()
 }
@@ -2748,9 +2748,9 @@ impl rmcp::ServerHandler for LocalMachine {
     ) -> Result<CallToolResponse, McpError> {
         // One sink underneath every tool: any call that blocks for a transport
         // window reports while it blocks, so no wait can be silent and a new
-        // tool cannot forget. `bash` keeps its own sink because that one is
-        // clamped to the child's deadline; two sinks would interleave counters
-        // on one progress token.
+        // tool cannot forget. `bash` keeps its own sink because its wait also
+        // carries the shell's response window; two sinks would interleave
+        // counters on one progress token.
         let heartbeat = match is_shell_tool(&request.name) {
             true => None,
             false => crate::mcp::tools::ProgressHeartbeat::for_request(&context),
