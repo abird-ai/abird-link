@@ -147,6 +147,7 @@ pub(crate) fn description_tokens(job_retention_secs: u64) -> Vec<(&'static str, 
         ("{grep_scan}", human_bytes(grep::MAX_GREP_SCAN_BYTES as u64)),
         ("{grep_file}", human_bytes(grep::MAX_GREP_FILE_BYTES as u64)),
         ("{grep_hits}", grep::MAX_GREP_HITS.to_string()),
+        ("{job_tail}", crate::jobs::MAX_TAIL_LINES.to_string()),
         ("{grep_context}", grep::MAX_GREP_CONTEXT.to_string()),
         (
             "{grep_files}",

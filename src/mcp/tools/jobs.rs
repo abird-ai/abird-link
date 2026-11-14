@@ -164,6 +164,11 @@ struct JobGetArgs {
     /// 90 is also the ceiling where no response window exists.
     #[serde(default)]
     wait_secs: Option<u64>,
+    /// Trailing lines of each stream to include in this reply. Defaults to
+    /// {job_tail} and is capped there; 0 returns status only. The end of a build
+    /// answers "how is it going" and "why did it fail" without paging the spool.
+    #[serde(default)]
+    tail_lines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -174,12 +179,17 @@ struct JobOutputArgs {
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]
     stream: OutputStream,
-    /// Raw byte offset in the selected spool stream. Defaults to zero; for the tail, take `stored_bytes` from `job_get` and start at `stored_bytes - N`.
+    /// Raw byte offset in the selected spool stream. Defaults to zero; `job_get` already carries the tail, so page here only for the full output.
     #[serde(default)]
     offset: Option<u64>,
     /// Maximum response bytes for this page. Defaults to the short-page size and is capped at the profile ceiling.
     #[serde(default)]
     max_output_bytes: Option<usize>,
+    /// Read the last N bytes of the stream instead of paging from `offset`.
+    /// Mutually exclusive with `offset`; with `wait_secs` it waits for the job to
+    /// finish first, so the tail is final. The page is the end of that window.
+    #[serde(default)]
+    tail_bytes: Option<usize>,
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
     #[serde(default)]
     encoding: OutputEncoding,
@@ -248,7 +258,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts. The job id is the native task id when Tasks are supported. `wait_secs`: 90 by default where the transport supplies a response window, clamped to what remains, waiting for completion; 0 answers immediately.",
+        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. The job id is the native task id when Tasks are supported. `wait_secs`: 90 by default where the transport supplies a response window, clamped to what remains, waiting for completion; 0 answers immediately. `tail_lines` defaults to {job_tail} and is capped there; 0 omits the lines.",
         annotations(
             title = "Get shell job status",
             read_only_hint = true,
@@ -273,14 +283,18 @@ impl LocalMachine {
                 return tool_error(error);
             }
         }
-        match self.jobs.status(&args.job_id) {
+        let tail_lines = args
+            .tail_lines
+            .unwrap_or(crate::jobs::DEFAULT_TAIL_LINES)
+            .min(crate::jobs::MAX_TAIL_LINES);
+        match self.jobs.status_with_tail(&args.job_id, tail_lines) {
             Ok(status) => ok_text(status),
             Err(error) => tool_error(error),
         }
     }
 
     #[tool(
-        description = "Read one page of a job's stdout or stderr by raw byte offset. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages default to the short-page size and are bounded by the profile ceiling; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. To look at the end without reading the middle — a failure summary, the last lines of a build — `job_get` reports each stream's `stored_bytes`; page from `stored_bytes - N`. Streams retain <={spool} and report truncation.",
+        description = "Read content from a job's stdout or stderr: a page from `offset`, or the last `tail_bytes` of the stream. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages default to the short-page size and are bounded by the profile ceiling; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. For a quick look at the end without reading the middle, `job_get` already returns the last lines of each stream. Streams retain <={spool} and report truncation.",
         annotations(
             title = "Read shell job output",
             read_only_hint = true,
@@ -304,13 +318,26 @@ impl LocalMachine {
             self.request_sync_budget_millis(&context)
                 .map(Duration::from_millis),
         );
+        if args.tail_bytes.is_some() && args.offset.is_some_and(|value| value > 0) {
+            return tool_error("pass either `offset` or `tail_bytes`, not both");
+        }
         if !wait.is_zero() {
             let deadline = TokioInstant::now() + wait;
-            if let Err(error) = self
-                .jobs
-                .wait_for_output(&args.job_id, stream, offset, deadline)
-                .await
-            {
+            // A tail read wants the end of the stream, so it waits for the job
+            // itself; an offset read waits for new bytes past that offset.
+            let waited = match args.tail_bytes.is_some() {
+                true => self
+                    .jobs
+                    .wait_until(&args.job_id, Some(deadline))
+                    .await
+                    .map(|_| ()),
+                false => {
+                    self.jobs
+                        .wait_for_output(&args.job_id, stream, offset, deadline)
+                        .await
+                }
+            };
+            if let Err(error) = waited {
                 return tool_error(error);
             }
         }
@@ -319,6 +346,7 @@ impl LocalMachine {
                 &args.job_id,
                 stream,
                 offset,
+                args.tail_bytes,
                 ceiling,
                 response_ceiling,
                 base64,

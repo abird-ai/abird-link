@@ -6,6 +6,7 @@
 //! paging leases, retention and teardown. Protocol adapters only decide how long
 //! to wait for an already-started job and how to expose its stable id.
 
+use serde_json::Value;
 use std::{
     collections::HashMap,
     fmt,
@@ -93,9 +94,20 @@ const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
 /// The one prohibition that belongs wherever a handle is handed back.
 pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run a command that returned a handle";
 
+/// Trailing lines a `job_get` reply carries per stream unless the caller asks
+/// otherwise. The end of a build answers "how is it going" and "why did it fail"
+/// in one round trip, without paging the middle.
+pub(crate) const DEFAULT_TAIL_LINES: usize = 10;
+/// Hard ceiling on the same argument.
+pub(crate) const MAX_TAIL_LINES: usize = 10;
+/// Bytes read backwards from a stream to find those lines.
+const TAIL_WINDOW_BYTES: u64 = 8 * 1024;
+/// Rendered width of one tail line; longer lines are cut with an ellipsis.
+const TAIL_LINE_BYTES: usize = 512;
+
 /// Reading a job by default means reading its end: a build's failures and a
 /// test run's verdict are at the tail, and the middle is context nobody reads.
-pub(crate) const JOB_TAIL_PEEK_PREFERENCE: &str = "To check on a job, peek its tail instead of reading the whole spool: `job_get` reports each stream's `stored_bytes`, so page `job_output` from `stored_bytes - N`. Read from the acknowledged offset only when the complete output is what you need.";
+pub(crate) const JOB_TAIL_PEEK_PREFERENCE: &str = "To check on a job, use `job_get`: it returns the last lines of each stream, so one call shows how far a build has got or why it failed. When you need more than that, `job_output` reads either the last `tail_bytes` of a stream or a page from an offset; read the complete output from the acknowledged offset only when the whole log is genuinely needed.";
 
 /// One follow-up sentence, dropping the tool whose result the caller is already
 /// reading: a `job_get` payload must not tell the caller to call `job_get`.
@@ -1465,7 +1477,7 @@ impl JobManager {
             entry.cancel.cancel();
             entry.updated_at = chrono::Utc::now().to_rfc3339();
         }
-        Ok(render_status_locked(&self.inner, entry))
+        Ok(render_status_locked(&self.inner, entry).to_string())
     }
 
     /// Lifecycle stage only; tool payloads expose the single normalized
@@ -1476,13 +1488,42 @@ impl JobManager {
         state.jobs.get(id).map(JobEntry::phase)
     }
 
+    /// Status without spool reads. Runtime callers use `status_with_tail`;
+    /// tests and internal probes assert on the plain payload.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn status(&self, id: &str) -> JobResult<String> {
+        self.status_with_tail(id, 0)
+    }
+
+    /// Status plus, when `tail_lines` is non-zero, the last lines of each stream.
+    ///
+    /// The spools are read after the manager lock is released: a status probe
+    /// must not sit on the job critical path, and a missing spool (fully
+    /// acknowledged, compacted or cleaned up) simply yields no tail.
+    pub(crate) fn status_with_tail(&self, id: &str, tail_lines: usize) -> JobResult<String> {
         sweep_expired(&self.inner);
-        let state = self.inner.state.lock().expect("job manager lock");
-        let entry = state
-            .available(id)
-            .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
-        Ok(render_status_locked(&self.inner, entry))
+        let tail_lines = tail_lines.min(MAX_TAIL_LINES);
+        let (mut payload, spools) = {
+            let state = self.inner.state.lock().expect("job manager lock");
+            let entry = state
+                .available(id)
+                .ok_or_else(|| JobError::Unknown(format!("unknown job {id}")))?;
+            (
+                render_status_locked(&self.inner, entry),
+                [entry.stdout_path.clone(), entry.stderr_path.clone()],
+            )
+        };
+        if tail_lines > 0 {
+            for (key, path) in ["stdout", "stderr"].into_iter().zip(spools) {
+                let Some(lines) = read_tail_lines(&path, tail_lines) else {
+                    continue;
+                };
+                if let Some(stream) = payload.get_mut(key).and_then(Value::as_object_mut) {
+                    stream.insert("tail".to_owned(), Value::Array(lines));
+                }
+            }
+        }
+        Ok(payload.to_string())
     }
 
     pub(crate) fn list(&self, limit: usize) -> String {
@@ -1977,11 +2018,16 @@ impl JobManager {
         RequestRetirement::Retired
     }
 
+    /// One page of a stream. `tail` reads from the end instead of `offset`:
+    /// at most that many trailing bytes, resolved against the stored length
+    /// inside the same snapshot the read uses, so the reply can still be paged
+    /// and acknowledged by absolute offset.
     pub(crate) fn output_page(
         &self,
         id: &str,
         stream: JobStream,
         offset: u64,
+        tail: Option<usize>,
         requested_bytes: usize,
         response_ceiling: usize,
         base64: bool,
@@ -1989,7 +2035,8 @@ impl JobManager {
         sweep_expired(&self.inner);
         let payload_ceiling =
             job_output_payload_ceiling(response_ceiling).map_err(JobError::Internal)?;
-        let (snapshot, _lease) = {
+        let read_cap = requested_bytes.min(payload_ceiling).max(1);
+        let (snapshot, _lease, offset) = {
             let mut state = self.inner.state.lock().expect("job manager lock");
             let entry = state
                 .available_mut(id)
@@ -2005,6 +2052,14 @@ impl JobManager {
                     JobStream::Stderr => entry.stderr_retained,
                 },
             );
+            // A tail read is the last `n` bytes of what is stored, so the
+            // request never needs an offset the caller cannot know.
+            // The page is the *end* of the requested window, so a tail wider
+            // than one page still answers with the last bytes, not the head.
+            let offset = match tail {
+                Some(bytes) => stored.saturating_sub((bytes.max(1) as u64).min(read_cap as u64)),
+                None => offset,
+            };
             if offset > stored {
                 return Err(JobError::Internal(anyhow!(
                     "job {id} {} offset {offset} is beyond stored output ({stored} bytes)",
@@ -2044,10 +2099,10 @@ impl JobManager {
                     inner: Arc::downgrade(&self.inner),
                     id: id.to_owned(),
                 },
+                offset,
             )
         };
 
-        let read_cap = requested_bytes.min(payload_ceiling).max(1);
         let mut file = OpenOptions::new()
             .read(true)
             .open(&snapshot.path)
@@ -2104,7 +2159,7 @@ impl JobManager {
         }
         entry.output_cleanup_requested = true;
         maybe_release_output(entry);
-        Ok(render_status_locked(&self.inner, entry))
+        Ok(render_status_locked(&self.inner, entry).to_string())
     }
 
     pub(crate) fn detailed_task(&self, id: &str) -> JobResult<DetailedTask> {
@@ -2465,7 +2520,7 @@ impl OutputPageRender<'_> {
     }
 }
 
-fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
+fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> Value {
     let completion = entry.completion.as_ref();
     let stdout_stored = completion.map_or_else(
         || stored_len(&entry.stdout_path, None),
@@ -2507,7 +2562,56 @@ fn render_status_locked(inner: &JobManagerInner, entry: &JobEntry) -> String {
     if let Some(next) = job_follow_up(JobFollowUp::of(entry), Some("job_get")) {
         payload["next"] = serde_json::Value::String(next);
     }
-    payload.to_string()
+    payload
+}
+
+/// The last `lines` lines of one spool stream, best effort. Only a bounded
+/// window is read, so a status probe stays cheap on a huge spool.
+fn read_tail_lines(path: &Path, lines: usize) -> Option<Vec<Value>> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut window = Vec::new();
+    file.take(TAIL_WINDOW_BYTES).read_to_end(&mut window).ok()?;
+    let text = String::from_utf8_lossy(&window);
+    let mut parts: Vec<&str> = text.split('\n').collect();
+    // A window that starts mid-stream opens with a partial line.
+    if start > 0 && parts.len() > 1 {
+        parts.remove(0);
+    }
+    // A trailing newline does not create an empty final line.
+    if parts.last() == Some(&"") {
+        parts.pop();
+    }
+    Some(
+        parts
+            .iter()
+            .rev()
+            .take(lines)
+            .rev()
+            .map(|line| Value::String(clip_tail_line(line)))
+            .collect(),
+    )
+}
+
+/// One rendered tail line: CRLF loses its syntax CR, and an over-wide line is
+/// cut on a character boundary with an ellipsis.
+fn clip_tail_line(line: &str) -> String {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.len() <= TAIL_LINE_BYTES {
+        return line.to_owned();
+    }
+    let mut end = TAIL_LINE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut clipped = line[..end].to_owned();
+    clipped.push('…');
+    clipped
 }
 
 fn abandon_response_attempt(inner: &JobManagerInner, id: &str) {
@@ -3460,6 +3564,136 @@ mod tests {
     }
 
     #[test]
+    fn tail_bytes_reads_the_end_of_the_stream_and_still_pages_by_offset() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let text: String = (0..100).map(|n| format!("line {n}\n")).collect();
+        fs::write(&job.stdout_path, &text).unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: text.len() as u64,
+                    stored_bytes: text.len() as u64,
+                    truncated: false,
+                },
+                StreamSummary {
+                    total_bytes: 0,
+                    stored_bytes: 0,
+                    truncated: false,
+                },
+            ),
+        );
+
+        // The last four bytes, reported at the absolute offset they came from.
+        let page: Value = serde_json::from_str(
+            &manager
+                .output_page(&job.id, JobStream::Stdout, 0, Some(4), 4096, 4096, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["offset"], text.len() - 4, "{page}");
+        assert_eq!(page["data"], &text[text.len() - 4..], "{page}");
+        assert_eq!(page["next_offset"], text.len(), "{page}");
+
+        // A tail wider than one page still answers with the last bytes, not the
+        // head of the requested window.
+        let bounded: Value = serde_json::from_str(
+            &manager
+                .output_page(&job.id, JobStream::Stdout, 0, Some(10_000), 8, 4096, false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bounded["next_offset"], text.len(), "{bounded}");
+        assert!(
+            bounded["offset"].as_u64().unwrap() < text.len() as u64,
+            "{bounded}"
+        );
+    }
+
+    #[test]
+    fn status_carries_the_tail_of_each_stream_and_honours_the_cap() {
+        let manager = JobManager::new(Duration::from_secs(60)).unwrap();
+        let job = manager.create_for_test(30).unwrap();
+        let lines: Vec<String> = (1..=25).map(|n| format!("line {n}")).collect();
+        let stdout_text = lines.join("\n") + "\n";
+        let stderr_text = "warn: one\nwarn: two";
+        fs::write(&job.stdout_path, &stdout_text).unwrap();
+        fs::write(&job.stderr_path, stderr_text).unwrap();
+        manager.finish(
+            &job.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: stdout_text.len() as u64,
+                    stored_bytes: stdout_text.len() as u64,
+                    truncated: false,
+                },
+                StreamSummary {
+                    total_bytes: stderr_text.len() as u64,
+                    stored_bytes: stderr_text.len() as u64,
+                    truncated: false,
+                },
+            ),
+        );
+
+        // The default peek is the end of each stream, not its whole content.
+        let status: Value = serde_json::from_str(
+            &manager
+                .status_with_tail(&job.id, DEFAULT_TAIL_LINES)
+                .unwrap(),
+        )
+        .unwrap();
+        let stdout = status["stdout"]["tail"].as_array().unwrap();
+        assert_eq!(stdout.len(), DEFAULT_TAIL_LINES, "{status}");
+        assert_eq!(stdout[0], "line 16", "{status}");
+        assert_eq!(stdout[9], "line 25", "{status}");
+        assert_eq!(
+            status["stderr"]["tail"],
+            serde_json::json!(["warn: one", "warn: two"])
+        );
+        // The byte accounting a caller pages with is unchanged.
+        assert_eq!(status["stdout"]["stored_bytes"], stdout_text.len());
+
+        // Zero asks for status only, and the cap is the advertised maximum.
+        let plain: Value =
+            serde_json::from_str(&manager.status_with_tail(&job.id, 0).unwrap()).unwrap();
+        assert!(plain["stdout"].get("tail").is_none(), "{plain}");
+        let capped: Value =
+            serde_json::from_str(&manager.status_with_tail(&job.id, 500).unwrap()).unwrap();
+        assert_eq!(
+            capped["stdout"]["tail"].as_array().unwrap().len(),
+            MAX_TAIL_LINES
+        );
+    }
+
+    #[test]
+    fn tail_lines_stay_short_and_read_only_the_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stdout");
+        let long = "x".repeat(TAIL_LINE_BYTES * 2);
+        fs::write(&path, format!("first\r\n{long}\nlast\n")).unwrap();
+
+        let tail = read_tail_lines(&path, 10).unwrap();
+        assert_eq!(tail.len(), 3, "{tail:?}");
+        assert_eq!(tail[0], "first", "{tail:?}");
+        // An over-wide line is cut on a boundary and says so.
+        let clipped = tail[1].as_str().unwrap();
+        assert!(clipped.ends_with('…'), "{clipped:?}");
+        assert!(
+            clipped.len() <= TAIL_LINE_BYTES + '…'.len_utf8(),
+            "{clipped:?}"
+        );
+        assert_eq!(tail[2], "last", "{tail:?}");
+
+        // A spool that is gone (fully acknowledged) simply has no tail.
+        assert!(read_tail_lines(&temp.path().join("missing"), 10).is_none());
+    }
+
+    #[test]
     fn output_is_released_only_after_both_streams_are_consumed() {
         let manager = JobManager::new(Duration::from_secs(60)).unwrap();
         let job = manager.create_for_test(30).unwrap();
@@ -3483,12 +3717,12 @@ mod tests {
             ),
         );
         let first = manager
-            .output_page(&job.id, JobStream::Stdout, 0, 100, 4096, false)
+            .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
             .unwrap();
         assert!(first.contains("hello"));
         assert!(job.stdout_path.exists());
         manager
-            .output_page(&job.id, JobStream::Stderr, 0, 100, 4096, false)
+            .output_page(&job.id, JobStream::Stderr, 0, None, 100, 4096, false)
             .unwrap();
         // Reading is pure/replayable. Only explicit acknowledgement advances
         // cleanup watermarks.
@@ -3520,7 +3754,7 @@ mod tests {
         fs::write(&job.stdout_path, b"one").unwrap();
         let first: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -3556,7 +3790,7 @@ mod tests {
         );
         let tail: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 3, 64, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 3, None, 64, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -3597,7 +3831,7 @@ mod tests {
         );
         let first: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, 2, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 0, None, 2, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -3605,7 +3839,7 @@ mod tests {
         assert_eq!(first["next_offset"], 1);
         let second: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 1, 8, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 1, None, 8, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -3632,10 +3866,10 @@ mod tests {
             ),
         );
         let first = manager
-            .output_page(&job.id, JobStream::Stdout, 0, 100, 4096, false)
+            .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
             .unwrap();
         let replay = manager
-            .output_page(&job.id, JobStream::Stdout, 0, 100, 4096, false)
+            .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
             .unwrap();
         assert_eq!(
             first, replay,
@@ -3729,7 +3963,15 @@ mod tests {
         let ceiling = 4096;
         let payload_ceiling = job_output_payload_ceiling(ceiling).unwrap();
         let page = manager
-            .output_page(&job.id, JobStream::Stdout, 0, usize::MAX, ceiling, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                0,
+                None,
+                usize::MAX,
+                ceiling,
+                false,
+            )
             .unwrap();
         let serialized = serialized_tool_result_len(&page).unwrap();
         assert!(
@@ -4005,7 +4247,7 @@ mod tests {
         );
         let released_page: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -4014,7 +4256,7 @@ mod tests {
         assert_eq!(released_page["released"], true);
         assert_eq!(released_page["data"], "");
         let page_error = manager
-            .output_page(&job.id, JobStream::Stdout, 1, 64, 4096, false)
+            .output_page(&job.id, JobStream::Stdout, 1, None, 64, 4096, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -5438,7 +5680,7 @@ mod tests {
 
         let page: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, 100, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -5493,7 +5735,7 @@ mod tests {
         assert_eq!(fs::metadata(&job.stdout_path).unwrap().len(), 4);
         let released_page: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 4, 64, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 4, None, 64, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -5502,7 +5744,7 @@ mod tests {
         assert_eq!(released_page["released"], true);
         assert_eq!(released_page["data"], "");
         let released_error = manager
-            .output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false)
+            .output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false)
             .unwrap_err()
             .to_string();
         assert!(released_error.contains("already acknowledged and released"));
@@ -5520,7 +5762,7 @@ mod tests {
         assert_eq!(replay["stdout"]["acknowledged_bytes"], 8);
         let tail: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 4, 64, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, 4, None, 64, 4096, false)
                 .unwrap(),
         )
         .unwrap();
@@ -5529,7 +5771,7 @@ mod tests {
         assert_eq!(tail["complete"], true);
         assert_eq!(tail["released"], true);
         let page_error = manager
-            .output_page(&job.id, JobStream::Stdout, 8, 64, 4096, false)
+            .output_page(&job.id, JobStream::Stdout, 8, None, 64, 4096, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -5589,7 +5831,7 @@ mod tests {
             Err(JobError::Unknown(_))
         ));
         assert!(matches!(
-            manager.output_page(&job.id, JobStream::Stdout, 0, 64, 4096, false),
+            manager.output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false),
             Err(JobError::Unknown(_))
         ));
         assert!(matches!(

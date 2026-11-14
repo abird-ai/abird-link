@@ -3347,7 +3347,15 @@ mod tests {
         }
         let output = second
             .jobs
-            .output_page(&id, crate::jobs::JobStream::Stdout, 0, 4096, 4096, false)
+            .output_page(
+                &id,
+                crate::jobs::JobStream::Stdout,
+                0,
+                None,
+                4096,
+                4096,
+                false,
+            )
             .unwrap();
         assert!(output.contains("survived"), "{output}");
         drop(second);
@@ -3774,6 +3782,7 @@ mod tests {
                     &compat_id,
                     crate::jobs::JobStream::Stdout,
                     0,
+                    None,
                     4096,
                     4096,
                     false,
@@ -3788,6 +3797,7 @@ mod tests {
                     &native_id,
                     crate::jobs::JobStream::Stdout,
                     0,
+                    None,
                     4096,
                     4096,
                     false,
@@ -3889,7 +3899,15 @@ mod tests {
         let page: Value = serde_json::from_str(
             &machine
                 .jobs
-                .output_page(job_id, crate::jobs::JobStream::Stdout, 0, 8192, 8192, false)
+                .output_page(
+                    job_id,
+                    crate::jobs::JobStream::Stdout,
+                    0,
+                    None,
+                    8192,
+                    8192,
+                    false,
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -3959,6 +3977,7 @@ mod tests {
                     job_id,
                     crate::jobs::JobStream::Stdout,
                     0,
+                    None,
                     16_384,
                     16_384,
                     false,
@@ -4073,6 +4092,7 @@ mod tests {
                     &task_id,
                     crate::jobs::JobStream::Stdout,
                     0,
+                    None,
                     4096,
                     4096,
                     false,
@@ -4264,7 +4284,15 @@ mod tests {
         assert_eq!(status["stdout"]["stored_bytes"], 4, "{status}");
         let partial = machine
             .jobs
-            .output_page(&id, crate::jobs::JobStream::Stdout, 0, 4096, 4096, false)
+            .output_page(
+                &id,
+                crate::jobs::JobStream::Stdout,
+                0,
+                None,
+                4096,
+                4096,
+                false,
+            )
             .unwrap();
         assert!(partial.contains("done"), "{partial}");
         tokio::time::sleep(Duration::from_millis(1300)).await;
