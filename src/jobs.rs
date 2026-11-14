@@ -999,6 +999,43 @@ impl JobFinisher {
     }
 }
 
+/// One page request: where to start, how much to take and how to render it.
+/// Grouped so a call site cannot quietly transposes an offset and a size.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutputPageRequest {
+    pub(crate) offset: u64,
+    pub(crate) tail: Option<usize>,
+    pub(crate) bytes: usize,
+    pub(crate) response_ceiling: usize,
+    pub(crate) base64: bool,
+}
+
+/// Terse constructors for tests, where the terse form keeps the assertion
+/// readable. The runtime path names every field instead.
+#[cfg(test)]
+impl OutputPageRequest {
+    /// A forward page of at most `bytes` bytes from `offset`. The wire budget is
+    /// the profile's short page, not the requested size: those are different
+    /// questions, and a one-byte request must not imply a one-byte envelope.
+    pub(crate) fn at(offset: u64, bytes: usize) -> Self {
+        Self {
+            offset,
+            tail: None,
+            bytes,
+            response_ceiling: crate::limits::DEFAULT_OUTPUT_PAGE_BYTES,
+            base64: false,
+        }
+    }
+
+    /// The last `bytes` bytes of the stream.
+    pub(crate) fn tail(bytes: usize) -> Self {
+        Self {
+            tail: Some(bytes),
+            ..Self::at(0, bytes)
+        }
+    }
+}
+
 impl JobManager {
     #[cfg(test)]
     pub(crate) fn new(retention: Duration) -> Result<Self> {
@@ -1516,10 +1553,17 @@ impl JobManager {
             )
         };
         if tail_lines > 0 {
+            // Both streams carry a tail: a build often reports its verdict on
+            // stderr while progress goes to stdout, and the two spools are
+            // independent, so a stream with nothing to show stays silent
+            // instead of contributing an empty array.
             for (key, path) in ["stdout", "stderr"].into_iter().zip(spools) {
                 let Some(lines) = read_tail_lines(&path, tail_lines) else {
                     continue;
                 };
+                if lines.is_empty() {
+                    continue;
+                }
                 if let Some(stream) = payload.get_mut(key).and_then(Value::as_object_mut) {
                     stream.insert("tail".to_owned(), Value::Array(lines));
                 }
@@ -2028,12 +2072,15 @@ impl JobManager {
         &self,
         id: &str,
         stream: JobStream,
-        offset: u64,
-        tail: Option<usize>,
-        requested_bytes: usize,
-        response_ceiling: usize,
-        base64: bool,
+        request: OutputPageRequest,
     ) -> JobResult<String> {
+        let OutputPageRequest {
+            offset,
+            tail,
+            bytes: requested_bytes,
+            response_ceiling,
+            base64,
+        } = request;
         sweep_expired(&self.inner);
         let payload_ceiling =
             job_output_payload_ceiling(response_ceiling).map_err(JobError::Internal)?;
@@ -3592,7 +3639,7 @@ mod tests {
         // The last four bytes, reported at the absolute offset they came from.
         let page: Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, Some(4), 4096, 4096, false)
+                .output_page(&job.id, JobStream::Stdout, OutputPageRequest::tail(4))
                 .unwrap(),
         )
         .unwrap();
@@ -3604,7 +3651,17 @@ mod tests {
         // head of the requested window.
         let bounded: Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, Some(10_000), 8, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: Some(10_000),
+                        bytes: 8,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -3660,6 +3717,41 @@ mod tests {
         );
         // The byte accounting a caller pages with is unchanged.
         assert_eq!(status["stdout"]["stored_bytes"], stdout_text.len());
+
+        // A stream with no content contributes no field at all.
+        let empty = manager.create_for_test(30).unwrap();
+        fs::write(&empty.stdout_path, "").unwrap();
+        manager.finish(
+            &empty.id,
+            JobCompletion::completed(
+                Some(0),
+                true,
+                StreamSummary {
+                    total_bytes: 0,
+                    stored_bytes: 0,
+                    truncated: false,
+                },
+                StreamSummary {
+                    total_bytes: 0,
+                    stored_bytes: 0,
+                    truncated: false,
+                },
+            ),
+        );
+        let empty_status: Value = serde_json::from_str(
+            &manager
+                .status_with_tail(&empty.id, DEFAULT_TAIL_LINES)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            empty_status["stdout"].get("tail").is_none(),
+            "{empty_status}"
+        );
+        assert!(
+            empty_status["stderr"].get("tail").is_none(),
+            "{empty_status}"
+        );
 
         // Zero asks for status only, and the cap is the advertised maximum.
         let plain: Value =
@@ -3720,12 +3812,32 @@ mod tests {
             ),
         );
         let first = manager
-            .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 100,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap();
         assert!(first.contains("hello"));
         assert!(job.stdout_path.exists());
         manager
-            .output_page(&job.id, JobStream::Stderr, 0, None, 100, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stderr,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 100,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap();
         // Reading is pure/replayable. Only explicit acknowledgement advances
         // cleanup watermarks.
@@ -3757,7 +3869,17 @@ mod tests {
         fs::write(&job.stdout_path, b"one").unwrap();
         let first: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 64,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -3793,7 +3915,17 @@ mod tests {
         );
         let tail: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 3, None, 64, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 3,
+                        tail: None,
+                        bytes: 64,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -3834,7 +3966,17 @@ mod tests {
         );
         let first: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, None, 2, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 2,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -3842,7 +3984,17 @@ mod tests {
         assert_eq!(first["next_offset"], 1);
         let second: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 1, None, 8, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 1,
+                        tail: None,
+                        bytes: 8,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -3869,10 +4021,30 @@ mod tests {
             ),
         );
         let first = manager
-            .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 100,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap();
         let replay = manager
-            .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 100,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap();
         assert_eq!(
             first, replay,
@@ -3969,11 +4141,13 @@ mod tests {
             .output_page(
                 &job.id,
                 JobStream::Stdout,
-                0,
-                None,
-                usize::MAX,
-                ceiling,
-                false,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: usize::MAX,
+                    response_ceiling: ceiling,
+                    base64: false,
+                },
             )
             .unwrap();
         let serialized = serialized_tool_result_len(&page).unwrap();
@@ -4250,7 +4424,17 @@ mod tests {
         );
         let released_page: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 64,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -4259,7 +4443,17 @@ mod tests {
         assert_eq!(released_page["released"], true);
         assert_eq!(released_page["data"], "");
         let page_error = manager
-            .output_page(&job.id, JobStream::Stdout, 1, None, 64, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 1,
+                    tail: None,
+                    bytes: 64,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -5683,7 +5877,17 @@ mod tests {
 
         let page: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 0, None, 100, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 100,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -5738,7 +5942,17 @@ mod tests {
         assert_eq!(fs::metadata(&job.stdout_path).unwrap().len(), 4);
         let released_page: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 4, None, 64, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 4,
+                        tail: None,
+                        bytes: 64,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -5747,7 +5961,17 @@ mod tests {
         assert_eq!(released_page["released"], true);
         assert_eq!(released_page["data"], "");
         let released_error = manager
-            .output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 64,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap_err()
             .to_string();
         assert!(released_error.contains("already acknowledged and released"));
@@ -5765,7 +5989,17 @@ mod tests {
         assert_eq!(replay["stdout"]["acknowledged_bytes"], 8);
         let tail: serde_json::Value = serde_json::from_str(
             &manager
-                .output_page(&job.id, JobStream::Stdout, 4, None, 64, 4096, false)
+                .output_page(
+                    &job.id,
+                    JobStream::Stdout,
+                    OutputPageRequest {
+                        offset: 4,
+                        tail: None,
+                        bytes: 64,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -5774,7 +6008,17 @@ mod tests {
         assert_eq!(tail["complete"], true);
         assert_eq!(tail["released"], true);
         let page_error = manager
-            .output_page(&job.id, JobStream::Stdout, 8, None, 64, 4096, false)
+            .output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 8,
+                    tail: None,
+                    bytes: 64,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -5834,7 +6078,17 @@ mod tests {
             Err(JobError::Unknown(_))
         ));
         assert!(matches!(
-            manager.output_page(&job.id, JobStream::Stdout, 0, None, 64, 4096, false),
+            manager.output_page(
+                &job.id,
+                JobStream::Stdout,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 64,
+                    response_ceiling: 4096,
+                    base64: false
+                }
+            ),
             Err(JobError::Unknown(_))
         ));
         assert!(matches!(

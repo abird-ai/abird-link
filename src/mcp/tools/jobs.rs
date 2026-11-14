@@ -176,9 +176,10 @@ struct JobGetArgs {
     /// 90 is also the ceiling where no response window exists.
     #[serde(default)]
     wait_secs: Option<u64>,
-    /// Trailing lines of each stream to include in this reply. Defaults to
-    /// {job_tail}, at most {job_tail_max}; 0 returns status only. The end of a
-    /// build answers "how is it going" and "why did it fail" without paging.
+    /// Trailing lines of *each* stream (stdout and stderr) to include in this
+    /// reply; a stream with nothing in it is omitted. Defaults to {job_tail}, at
+    /// most {job_tail_max}; 0 returns status only. The end of a build answers
+    /// "how is it going" and "why did it fail" without paging.
     #[serde(default)]
     tail_lines: Option<usize>,
 }
@@ -353,17 +354,14 @@ impl LocalMachine {
                 return tool_error(error);
             }
         }
-        match crate::blocking::run(|| {
-            self.jobs.output_page(
-                &args.job_id,
-                stream,
-                offset,
-                args.tail_bytes,
-                ceiling,
-                response_ceiling,
-                base64,
-            )
-        }) {
+        let request = crate::jobs::OutputPageRequest {
+            offset,
+            tail: args.tail_bytes,
+            bytes: ceiling,
+            response_ceiling,
+            base64,
+        };
+        match crate::blocking::run(|| self.jobs.output_page(&args.job_id, stream, request)) {
             Ok(page) => ok_text(page),
             Err(error) => tool_error(error),
         }

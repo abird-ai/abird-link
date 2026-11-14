@@ -2708,6 +2708,7 @@ impl LocalMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::OutputPageRequest;
     use tokio::sync::RwLock;
 
     use crate::logging::LogConfig;
@@ -3350,11 +3351,13 @@ mod tests {
             .output_page(
                 &id,
                 crate::jobs::JobStream::Stdout,
-                0,
-                None,
-                4096,
-                4096,
-                false,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 4096,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
             )
             .unwrap();
         assert!(output.contains("survived"), "{output}");
@@ -3781,11 +3784,13 @@ mod tests {
                 .output_page(
                     &compat_id,
                     crate::jobs::JobStream::Stdout,
-                    0,
-                    None,
-                    4096,
-                    4096,
-                    false,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 4096,
+                        response_ceiling: 4096,
+                        base64: false
+                    },
                 )
                 .unwrap()
                 .contains("compat")
@@ -3796,11 +3801,13 @@ mod tests {
                 .output_page(
                     &native_id,
                     crate::jobs::JobStream::Stdout,
-                    0,
-                    None,
-                    4096,
-                    4096,
-                    false,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 4096,
+                        response_ceiling: 4096,
+                        base64: false
+                    },
                 )
                 .unwrap()
                 .contains("native")
@@ -3902,11 +3909,13 @@ mod tests {
                 .output_page(
                     job_id,
                     crate::jobs::JobStream::Stdout,
-                    0,
-                    None,
-                    8192,
-                    8192,
-                    false,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 8192,
+                        response_ceiling: 8192,
+                        base64: false,
+                    },
                 )
                 .unwrap(),
         )
@@ -3976,11 +3985,13 @@ mod tests {
                 .output_page(
                     job_id,
                     crate::jobs::JobStream::Stdout,
-                    0,
-                    None,
-                    16_384,
-                    16_384,
-                    false,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 16_384,
+                        response_ceiling: 16_384,
+                        base64: false,
+                    },
                 )
                 .unwrap(),
         )
@@ -4091,11 +4102,13 @@ mod tests {
                 .output_page(
                     &task_id,
                     crate::jobs::JobStream::Stdout,
-                    0,
-                    None,
-                    4096,
-                    4096,
-                    false,
+                    OutputPageRequest {
+                        offset: 0,
+                        tail: None,
+                        bytes: 4096,
+                        response_ceiling: 4096,
+                        base64: false,
+                    },
                 )
                 .unwrap(),
         )
@@ -4287,11 +4300,13 @@ mod tests {
             .output_page(
                 &id,
                 crate::jobs::JobStream::Stdout,
-                0,
-                None,
-                4096,
-                4096,
-                false,
+                OutputPageRequest {
+                    offset: 0,
+                    tail: None,
+                    bytes: 4096,
+                    response_ceiling: 4096,
+                    base64: false,
+                },
             )
             .unwrap();
         assert!(partial.contains("done"), "{partial}");
