@@ -7725,6 +7725,96 @@ name"
     }
 
     #[tokio::test]
+    async fn waiting_job_get_reports_progress_before_completion() {
+        if crate::mcp::resolve_executable("bash").is_none() {
+            return;
+        }
+        use crate::mcp::{AccessSpec, MachineConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = LocalMachine::new(MachineConfig {
+            access: AccessSpec {
+                base_dir: root.clone(),
+                read_roots: vec![root.clone()],
+                write_roots: Vec::new(),
+                deny_read_roots: Vec::new(),
+                deny_write_roots: Vec::new(),
+                unrestricted_fs: false,
+            },
+            cache_mounts: Vec::new(),
+            shell_env: Vec::new(),
+            #[cfg(target_os = "linux")]
+            host_shell: crate::host_services::HostShell::default(),
+            log: LogConfig::default(),
+            serialize: false,
+            allow_shell: true,
+            sandbox_shell: false,
+            allow_network: false,
+            max_shell_timeout_secs: 60,
+            max_output_bytes: 4096,
+            max_read_bytes: 4096,
+            max_write_bytes: 4096,
+
+            task_result_budget: None,
+
+            sync_hold: None,
+            job_retention_secs: crate::limits::DEFAULT_JOB_RETENTION_SECS,
+
+            job_spool_bytes: crate::limits::DEFAULT_JOB_SPOOL_BYTES,
+            protected_paths: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let mcp = EmbeddedMcp::new(machine, CancellationToken::new());
+
+        // A job that outlives several heartbeat ticks.
+        let start = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "job_start", "arguments": {"command": "sleep 2"}}
+        });
+        let (tx, _rx) = mpsc::channel(16);
+        let started = mcp
+            .dispatch_stream(&BTreeMap::new(), &start, tx)
+            .await
+            .unwrap();
+        assert_eq!(started.status, 200);
+        let receipt: Value = serde_json::from_str(
+            started.messages[0]["result"]["content"][0]["text"]
+                .as_str()
+                .expect("job_start receipt text"),
+        )
+        .unwrap();
+        let job_id = receipt["job_id"].as_str().unwrap().to_owned();
+
+        // The wait blocks, so it must report while it blocks: silence here is
+        // indistinguishable from a stalled turn on the client.
+        let call = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "job_get",
+                "arguments": {"job_id": job_id, "wait_secs": 2},
+                "_meta": {"progressToken": "wait"}
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        let task =
+            tokio::spawn(async move { mcp.dispatch_stream(&BTreeMap::new(), &call, tx).await });
+        let first = tokio::time::timeout(Duration::from_millis(900), rx.recv())
+            .await
+            .expect("progress must be emitted before the wait returns")
+            .expect("stream closed without a progress event");
+        assert!(
+            !task.is_finished(),
+            "progress arrived only after the wait completed"
+        );
+        assert_eq!(first["method"], "notifications/progress", "{first}");
+        assert_eq!(first["params"]["progressToken"], "wait");
+        assert!(first["params"].get("message").is_none(), "{first}");
+        assert!(first["params"].get("total").is_none(), "{first}");
+    }
+
+    #[tokio::test]
     async fn client_window_reaches_the_shell_deadline_end_to_end() {
         use crate::mcp::{AccessSpec, MachineConfig};
 

@@ -16,6 +16,99 @@ pub(crate) mod mutation;
 pub(crate) mod patch;
 pub(crate) mod shell;
 
+use std::{
+    future::Future,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
+use rmcp::{
+    model::{ProgressNotificationParam, ProgressToken},
+    service::{Peer, RequestContext, RoleServer},
+};
+use tokio::time::{Instant, sleep_until};
+
+/// Interval between advisory progress ticks for one `tools/call`. A caller
+/// cannot know how much of an arbitrary command or build is done, so a tick is
+/// bare: a monotonic counter, no total, no message.
+#[cfg(not(test))]
+pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Progress is advisory; a stalled transport must never delay the operation it
+/// reports on. Delivery is bounded per tick, with no detached task or queue.
+const PROGRESS_SEND_BUDGET: Duration = Duration::from_millis(100);
+
+async fn deliver_heartbeat_bounded<F: Future<Output = ()>>(deadline: Option<Instant>, delivery: F) {
+    let bound = Instant::now() + PROGRESS_SEND_BUDGET;
+    let send_deadline = deadline.map_or(bound, |deadline| deadline.min(bound));
+    tokio::select! {
+        biased;
+        () = sleep_until(send_deadline) => {}
+        () = delivery => {}
+    }
+}
+
+/// Heartbeat sink for one `tools/call` that carried a progress token. A wait
+/// that emits nothing is indistinguishable from a stalled turn, so anything
+/// that blocks for a transport window reports while it blocks.
+pub(crate) struct ProgressHeartbeat {
+    peer: Peer<RoleServer>,
+    token: ProgressToken,
+    ticks: AtomicU64,
+}
+
+impl ProgressHeartbeat {
+    pub(crate) fn for_request(context: &RequestContext<RoleServer>) -> Option<Self> {
+        let token = context.meta.get_progress_token()?;
+        Some(Self {
+            peer: context.peer.clone(),
+            token,
+            ticks: AtomicU64::new(0),
+        })
+    }
+
+    /// Monotonic progress counter with no total and no message.
+    pub(crate) async fn report(&self, deadline: Option<Instant>) {
+        let progress = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        let param = ProgressNotificationParam::new(self.token.clone(), progress as f64);
+        deliver_heartbeat_bounded(deadline, async {
+            let _ = self.peer.notify_progress(param).await;
+        })
+        .await;
+    }
+}
+
+pub(crate) async fn heartbeat_tick(heartbeat: Option<&ProgressHeartbeat>) {
+    match heartbeat {
+        Some(_) => tokio::time::sleep(PROGRESS_HEARTBEAT_INTERVAL).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits a window-bounded wait while reporting progress. Without a progress
+/// token this is exactly `wait`; with one, the caller keeps receiving ticks for
+/// as long as the wait blocks.
+pub(crate) async fn await_with_heartbeat<F: Future>(
+    heartbeat: Option<ProgressHeartbeat>,
+    deadline: Option<Instant>,
+    wait: F,
+) -> F::Output {
+    let heartbeat = match heartbeat {
+        Some(heartbeat) => heartbeat,
+        None => return wait.await,
+    };
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut wait => return output,
+            () = heartbeat_tick(Some(&heartbeat)) => heartbeat.report(deadline).await,
+        }
+    }
+}
+
 /// Human-readable byte ceiling for a tool description. Powers of two only, so
 /// the text never drifts from the enforced number.
 pub(crate) fn human_bytes(bytes: u64) -> String {
@@ -1291,6 +1384,28 @@ impl Verified {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn heartbeat_delivery_never_crosses_its_deadline() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let delivery_polled = polled.clone();
+        let delivery = async move {
+            delivery_polled.store(true, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        };
+
+        deliver_heartbeat_bounded(Some(Instant::now() - Duration::from_secs(1)), delivery).await;
+        assert!(
+            !polled.load(Ordering::Relaxed),
+            "an expired deadline must win before delivery is polled"
+        );
+    }
+
     /// Placeholders a description may only use if `description_tokens` knows
     /// them: `{lower_snake}` spans, not JSON braces.
     fn unknown_placeholders(text: &str, known: &[&str]) -> Vec<String> {
@@ -1351,7 +1466,6 @@ mod tests {
         assert_eq!(super::human_duration(600), "10 min");
     }
 
-    use super::*;
     use crate::mcp::tools::test_support::test_machine;
 
     #[cfg(unix)]
