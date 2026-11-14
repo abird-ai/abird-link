@@ -2574,6 +2574,83 @@ impl LocalMachine {
     name = "dotlink",
     instructions = "Private local-machine bridge. Filesystem access follows additive allow-read/allow-write/allow-rw grants; deny rules take precedence. Shell is hidden unless enabled. Linux shell execution is Bubblewrap-sandboxed by default with network disabled unless explicitly allowed."
 )]
+impl LocalMachine {
+    /// The tool dispatch itself: everything `call_tool` does once the heartbeat
+    /// sink is attached.
+    async fn dispatch_tool_call(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.to_string();
+        let result_budget = self.request_result_budget(&context);
+        // Building the router to read the schema is not free, so only do it when
+        // the detail line will actually be printed.
+        let detail = match self.config.log.activity_enabled() {
+            true => self.summarize_tool_call_arguments(&name, request.arguments.as_ref()),
+            false => String::new(),
+        };
+        let started = self.config.log.activity_start(&name, detail);
+
+        let shell_result = match self.handle_shell_call(&request, &context).await {
+            Ok(Some(response)) => Some(Ok(fit_call_tool_response_to_budget(
+                &name,
+                response,
+                result_budget,
+            ))),
+            Ok(None) => None,
+            Err(error) => Some(Err(fit_mcp_error_to_budget(error, result_budget))),
+        };
+        if let Some(result) = shell_result {
+            self.config
+                .log
+                .activity_done(&name, started, tool_call_log_outcome(&result));
+            return result;
+        }
+
+        let context = ToolCallContext::new(self, request, context);
+
+        // Linux native filesystem tools use descriptor-rooted operations;
+        // independent MCP requests may execute concurrently by default.
+        // --serialize opts into exclusive execution for predictable ordering.
+        // Other platforms retain their conservative operation gate until
+        // equivalent secure handle-based filesystem access is available.
+        let result = if Self::is_job_control_tool(&name) {
+            self.policy_tool_router().call(context).await
+        } else if self.serialize {
+            let _guard = self.operation_gate.write().await;
+            self.policy_tool_router().call(context).await
+        } else {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                // Native file operations use checked directory handles, and
+                // Bubblewrap gives each shell its own process/filesystem view.
+                self.policy_tool_router().call(context).await
+            }
+            #[cfg(windows)]
+            {
+                // Until Windows gets descriptor-relative tools,
+                // preserve their conservative filesystem topology gate.
+                if Self::is_concurrent_read_tool(&name) {
+                    let _guard = self.operation_gate.read().await;
+                    self.policy_tool_router().call(context).await
+                } else {
+                    let _guard = self.operation_gate.write().await;
+                    self.policy_tool_router().call(context).await
+                }
+            }
+        };
+
+        let result = result
+            .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
+            .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
+        self.config
+            .log
+            .activity_done(&name, started, tool_call_log_outcome(&result));
+        result
+    }
+}
+
 impl rmcp::ServerHandler for LocalMachine {
     async fn list_tools(
         &self,
@@ -2679,72 +2756,20 @@ impl rmcp::ServerHandler for LocalMachine {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let name = request.name.to_string();
-        let result_budget = self.request_result_budget(&context);
-        // Building the router to read the schema is not free, so only do it when
-        // the detail line will actually be printed.
-        let detail = match self.config.log.activity_enabled() {
-            true => self.summarize_tool_call_arguments(&name, request.arguments.as_ref()),
-            false => String::new(),
-        };
-        let started = self.config.log.activity_start(&name, detail);
-
-        let shell_result = match self.handle_shell_call(&request, &context).await {
-            Ok(Some(response)) => Some(Ok(fit_call_tool_response_to_budget(
-                &name,
-                response,
-                result_budget,
-            ))),
-            Ok(None) => None,
-            Err(error) => Some(Err(fit_mcp_error_to_budget(error, result_budget))),
-        };
-        if let Some(result) = shell_result {
-            self.config
-                .log
-                .activity_done(&name, started, tool_call_log_outcome(&result));
-            return result;
-        }
-
-        let context = ToolCallContext::new(self, request, context);
-
-        // Linux native filesystem tools use descriptor-rooted operations;
-        // independent MCP requests may execute concurrently by default.
-        // --serialize opts into exclusive execution for predictable ordering.
-        // Other platforms retain their conservative operation gate until
-        // equivalent secure handle-based filesystem access is available.
-        let result = if Self::is_job_control_tool(&name) {
-            self.policy_tool_router().call(context).await
-        } else if self.serialize {
-            let _guard = self.operation_gate.write().await;
-            self.policy_tool_router().call(context).await
-        } else {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            {
-                // Native file operations use checked directory handles, and
-                // Bubblewrap gives each shell its own process/filesystem view.
-                self.policy_tool_router().call(context).await
-            }
-            #[cfg(windows)]
-            {
-                // Until Windows gets descriptor-relative tools,
-                // preserve their conservative filesystem topology gate.
-                if Self::is_concurrent_read_tool(&name) {
-                    let _guard = self.operation_gate.read().await;
-                    self.policy_tool_router().call(context).await
-                } else {
-                    let _guard = self.operation_gate.write().await;
-                    self.policy_tool_router().call(context).await
-                }
-            }
-        };
-
-        let result = result
-            .map(|response| fit_call_tool_response_to_budget(&name, response, result_budget))
-            .map_err(|error| fit_mcp_error_to_budget(error, result_budget));
-        self.config
-            .log
-            .activity_done(&name, started, tool_call_log_outcome(&result));
-        result
+        // One sink underneath every tool: any call that blocks for a transport
+        // window reports while it blocks, so no wait can be silent and a new
+        // tool cannot forget. `bash` keeps its own sink because that one is
+        // clamped to the child's deadline; two sinks would interleave counters
+        // on one progress token.
+        let heartbeat = (!is_shell_tool(&request.name))
+            .then(|| crate::mcp::tools::ProgressHeartbeat::for_request(&context))
+            .flatten();
+        crate::mcp::tools::await_with_heartbeat(
+            heartbeat,
+            None,
+            self.dispatch_tool_call(request, context),
+        )
+        .await
     }
 }
 

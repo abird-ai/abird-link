@@ -13,9 +13,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use super::{
-    LocalMachine, ProgressHeartbeat, await_with_heartbeat, dot, ok_text, resolve_capped, tool_error,
-};
+use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
 use crate::jobs::JobStream;
 use std::time::Duration;
 use tokio::time::Instant as TokioInstant;
@@ -271,16 +269,7 @@ impl LocalMachine {
         );
         if !wait.is_zero() {
             let deadline = TokioInstant::now() + wait;
-            // A blocked wait emits ticks so a long build does not look like a
-            // stalled turn; the wait itself is unchanged.
-            let heartbeat = ProgressHeartbeat::for_request(&context);
-            if let Err(error) = await_with_heartbeat(
-                heartbeat,
-                Some(deadline),
-                self.jobs.wait_until(&args.job_id, Some(deadline)),
-            )
-            .await
-            {
+            if let Err(error) = self.jobs.wait_until(&args.job_id, Some(deadline)).await {
                 return tool_error(error);
             }
         }
@@ -317,14 +306,10 @@ impl LocalMachine {
         );
         if !wait.is_zero() {
             let deadline = TokioInstant::now() + wait;
-            let heartbeat = ProgressHeartbeat::for_request(&context);
-            if let Err(error) = await_with_heartbeat(
-                heartbeat,
-                Some(deadline),
-                self.jobs
-                    .wait_for_output(&args.job_id, stream, offset, deadline),
-            )
-            .await
+            if let Err(error) = self
+                .jobs
+                .wait_for_output(&args.job_id, stream, offset, deadline)
+                .await
             {
                 return tool_error(error);
             }

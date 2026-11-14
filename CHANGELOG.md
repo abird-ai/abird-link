@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- A blocking `job_get`/`job_output` wait now reports `notifications/progress` while it blocks, exactly as a running shell already did. Silence was the problem: a 90 s wait with no output is indistinguishable from a stalled turn, so a client could show "still thinking" while the bridge was healthy and the job was simply building. The sink, the 10 s tick and the per-tick 100 ms delivery bound are now shared (`mcp::tools::ProgressHeartbeat`, `await_with_heartbeat`) instead of living in the shell module; without a caller-supplied progress token the wait is unchanged.
+- Every tool call now reports `notifications/progress` while it blocks: the heartbeat sink moved from the shell module up to `LocalMachine::call_tool`, so it covers the whole tool surface on every transport instead of the handful of tools that a wait happens to be written in. Silence was the problem: 36 responses in one deployment took 60 s or more and 17 took 85 s or more, all of them dead air, so a client could show "still thinking" while the bridge was healthy and a build was simply quiet. `bash` keeps its own sink because that one is clamped to the child's deadline; two sinks would interleave counters on one progress token. Without a caller-supplied progress token nothing is emitted and every path is unchanged.
 
 ### Changed
 
