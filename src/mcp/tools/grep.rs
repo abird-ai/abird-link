@@ -26,7 +26,10 @@ pub(crate) const MAX_GREP_HITS: usize = 200;
 pub(crate) const MAX_GREP_FILE_BYTES: usize = 1_048_576;
 const MAX_GREP_PATTERN: usize = 1024;
 const MAX_GREP_PER_FILE: usize = 50;
-const MAX_GREP_CONTEXT: usize = 8;
+/// Context lines one hit may expand to per side. The output ceiling still bounds
+/// what fits on the page; a wider request narrows to this and reports the value
+/// it got, so a caller can re-ask against a narrower pattern instead of guessing.
+pub(crate) const MAX_GREP_CONTEXT: usize = 128;
 pub(crate) const MAX_GREP_FILES: usize = 65_536;
 /// Per-request search I/O (not a limit on concurrent HTTP/stdio tool calls).
 pub(crate) const MAX_GREP_SCAN_BYTES: usize = 32 * 1024 * 1024;
@@ -52,17 +55,25 @@ const IGNORE_INCOMPLETE_MARKER: &str =
     "… ignore rules unavailable; results may include or omit matches";
 const PER_FILE_CAP_SUFFIX: &str = " (per-file cap)";
 
-/// The longest marker a `content` page can end with. Bytes are reserved for it
+/// Reports that a context request was narrowed, repeating the count asked for so
+/// a wide request can be re-issued against a narrower pattern.
+fn context_cap_marker(asked: usize) -> String {
+    format!("… context capped at {MAX_GREP_CONTEXT} lines per side (asked {asked})")
+}
+
+/// The longest set of markers a `content` page can end with: one stop marker
+/// plus, when the request was narrowed, the context notice. Bytes are reserved
 /// before a hit is accepted, so a page always ends with whole hit lines.
 fn marker_reserve() -> usize {
-    marker_bytes(usize::MAX)
+    let stop = marker_bytes(usize::MAX)
         .len()
         .max(marker_files(usize::MAX).len())
         .max(marker_hits(usize::MAX).len() + PER_FILE_CAP_SUFFIX.len())
         .max(format!("… no hits at offset {}", usize::MAX).len())
         .max("… discovery scan incomplete; narrow path or glob".len())
-        .max("… search work budget exhausted; narrow path or glob".len())
-        + 1 // the newline that separates the marker from the last hit
+        .max("… search work budget exhausted; narrow path or glob".len());
+    // One newline separates each marker from the line before it.
+    stop + context_cap_marker(usize::MAX).len() + 2
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
@@ -359,6 +370,8 @@ impl LocalMachine {
         let single_file = !tokio::fs::metadata(&root).await?.is_dir();
 
         let glob = GlobFilter::optional(args.glob.as_deref())?;
+        let asked_context = args.before.unwrap_or(0).max(args.after.unwrap_or(0));
+        let context_clamped = asked_context > MAX_GREP_CONTEXT;
         let before = args.before.unwrap_or(0).min(MAX_GREP_CONTEXT);
         let after = args.after.unwrap_or(0).min(MAX_GREP_CONTEXT);
         let limit = args.limit.unwrap_or(MAX_GREP_HITS).clamp(1, MAX_GREP_HITS);
@@ -630,6 +643,12 @@ impl LocalMachine {
                     }
                     content.push_str(&marker);
                 }
+                if context_clamped {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&context_cap_marker(asked_context));
+                }
                 if progress.ignore_incomplete {
                     if !content.is_empty() {
                         content.push('\n');
@@ -870,7 +889,7 @@ impl Paging {
 #[tool_router(router = "grep_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Search UTF-8 text. `path` is a directory (recursive) or a single file; for a file, `glob`/`gitignore`/`skip_hidden` do not apply. `pattern` is regex unless `literal`; `glob` uses the `ls` grammar. `output_mode`: content (matches with context), files, count (per-file; `page_total` is page-scoped). Paging: `offset`/`limit` (limit <={grep_hits}); `gitignore`/`skip_hidden` are opt-in. Budgets per call: {walk_visits} entries visited, {grep_scan} read across <={grep_files} candidates; narrow `path`/`glob` for complete results. Incomplete replies carry text markers or JSON `scan_incomplete`, `incomplete_reason` (first cause) and `incomplete_reasons` (all: directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Replies obey the output byte ceiling and contain whole lines only. Skipped: files over {grep_file}, binary control bytes, invalid UTF-8, symlinks.",
+        description = "Search UTF-8 text. `path` is a directory (recursive) or a single file; for a file, `glob`/`gitignore`/`skip_hidden` do not apply. `pattern` is regex unless `literal`; `glob` uses the `ls` grammar. `output_mode`: content (matches with context), files, count (per-file; `page_total` is page-scoped). Paging: `offset`/`limit` (limit <={grep_hits}); `after`/`before` take up to {grep_context} lines per side and a narrower request is reported; `gitignore`/`skip_hidden` are opt-in. Budgets per call: {walk_visits} entries visited, {grep_scan} read across <={grep_files} candidates; narrow `path`/`glob` for complete results. Incomplete replies carry text markers or JSON `scan_incomplete`, `incomplete_reason` (first cause) and `incomplete_reasons` (all: directory_budget/content_budget/traversal_error/ignore_rules/unreadable_files). Replies obey the output byte ceiling and contain whole lines only. Skipped: files over {grep_file}, binary control bytes, invalid UTF-8, symlinks.",
         annotations(
             title = "Search files",
             read_only_hint = true,
@@ -1334,13 +1353,43 @@ mod tests {
              a.txt:10: l10"
         );
 
-        // Context is capped at 8 lines per side.
+        // A wide request spans the whole small file without narrowing.
         let mut args = grep_args("hit");
         args.before = Some(100);
         args.after = Some(100);
         let content = machine.grep_impl(args).await.unwrap();
         assert!(content.starts_with("a.txt:1: l1\n"), "{content}");
         assert!(content.ends_with("a.txt:10: l10"), "{content}");
+        assert!(!content.contains("context capped"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn grep_context_caps_at_the_advertised_maximum_and_reports_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut lines: Vec<String> = (1..=400).map(|n| format!("l{n}")).collect();
+        lines[199] = "needle".to_owned();
+        std::fs::write(root.join("a.txt"), lines.join("\n") + "\n").unwrap();
+        let machine = test_machine(root);
+
+        let mut args = grep_args("needle");
+        args.before = Some(1_000);
+        args.after = Some(1_000);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert!(
+            content.contains("context capped at 128 lines per side (asked 1000)"),
+            "{content}"
+        );
+        // 128 lines on each side of the hit, plus the hit itself.
+        assert_eq!(content.matches("a.txt:").count(), 257, "{content}");
+
+        // A request inside the cap is answered without a notice.
+        let mut args = grep_args("needle");
+        args.before = Some(2);
+        args.after = Some(2);
+        let content = machine.grep_impl(args).await.unwrap();
+        assert!(!content.contains("context capped"), "{content}");
+        assert_eq!(content.matches("a.txt:").count(), 5, "{content}");
     }
 
     #[tokio::test]

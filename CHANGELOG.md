@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `grep` context is no longer silently narrowed at 8 lines per side. `after`/`before` now allow up to 128 lines, and a request above that ends the page with `… context capped at 128 lines per side (asked N)` so a caller can re-ask against a narrower pattern (fewer hits buy more context) instead of guessing a number it will never receive. The limit is advertised through `{grep_context}`, interpolated from `MAX_GREP_CONTEXT`, so the schema and the clamp cannot drift. The content-marker reserve covers the stop marker plus this notice, so a page still ends with whole hit lines inside the output ceiling.
+
 ## [0.16.5] - 2026-11-13
 
 ### Fixed
