@@ -2086,13 +2086,13 @@ impl LocalMachine {
         args: ShellArgs,
         powershell: bool,
         request_key: Option<String>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> CallToolResult {
         match self.start_shell_job(args, powershell, request_key) {
-            Ok(started) => Ok(match self.jobs.expose_compatibility(&started.id) {
+            Ok(started) => match self.jobs.expose_compatibility(&started.id) {
                 Ok(result) => result,
                 Err(error) => tool_error(error),
-            }),
-            Err(error) => Ok(tool_error(error)),
+            },
+            Err(error) => tool_error(error),
         }
     }
 
@@ -2127,7 +2127,7 @@ impl LocalMachine {
         };
 
         if explicit_background {
-            let receipt = self.background_receipt(args, powershell, request_key)?;
+            let receipt = self.background_receipt(args, powershell, request_key);
             return Ok(Some(CallToolResponse::Complete(receipt)));
         }
 
