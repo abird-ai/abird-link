@@ -85,7 +85,7 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: 
         property.insert("minimum".to_owned(), serde_json::Value::from(0));
         property.insert(
             "maximum".to_owned(),
-            serde_json::Value::from(crate::jobs::MAX_TAIL_LINES),
+            serde_json::Value::from(crate::limits::MAX_JOB_TAIL_LINES),
         );
     }
     if name == "job_output"
@@ -303,8 +303,8 @@ impl LocalMachine {
         }
         let tail_lines = args
             .tail_lines
-            .unwrap_or(crate::jobs::DEFAULT_TAIL_LINES)
-            .min(crate::jobs::MAX_TAIL_LINES);
+            .unwrap_or(crate::limits::DEFAULT_JOB_TAIL_LINES)
+            .min(crate::limits::MAX_JOB_TAIL_LINES);
         // The tail reads the spool, so it runs off the async worker; a status
         // probe with no tail does no I/O beyond the metadata `status` already
         // needs.
@@ -385,7 +385,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Acknowledge `job_output`'s `next_offset` for the same `stream` once received. The only operation that advances cleanup: after both terminal streams are fully acknowledged, compatibility spools are released. Native tasks instead keep the exact-result prefix that `tasks/get` replays, until task retention expires. Unacked output holds the session spool budget until retention ({retention}).",
+        description = "Acknowledge `job_output`'s `next_offset` for the same `stream` once received. The only operation that advances cleanup: after both terminal streams are fully acknowledged, compatibility spools are released. It is a high-water mark, so acknowledging an offset releases everything before it — including output that was skipped by a tail read. Native tasks instead keep the exact-result prefix that `tasks/get` replays, until task retention expires. Unacked output holds the session spool budget until retention ({retention}).",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,
@@ -456,7 +456,7 @@ mod tests {
         let mut get = LocalMachine::all_tools().get("job_get").cloned().unwrap();
         with_job_limits(&mut get, 3600, 8 * 1024 * 1024);
         let tail = &get.input_schema["properties"]["tail_lines"];
-        assert_eq!(tail["maximum"], crate::jobs::MAX_TAIL_LINES as u64);
+        assert_eq!(tail["maximum"], crate::limits::MAX_JOB_TAIL_LINES as u64);
         assert_eq!(tail["minimum"], 0);
 
         let tokens =
@@ -466,12 +466,12 @@ mod tests {
         assert!(
             get_description.contains(&format!(
                 "the last {} lines",
-                crate::jobs::DEFAULT_TAIL_LINES
+                crate::limits::DEFAULT_JOB_TAIL_LINES
             )),
             "{get_description}"
         );
         assert!(
-            get_description.contains(&format!("capped at {}", crate::jobs::MAX_TAIL_LINES)),
+            get_description.contains(&format!("capped at {}", crate::limits::MAX_JOB_TAIL_LINES)),
             "{get_description}"
         );
         let tail_description = get.input_schema["properties"]["tail_lines"]["description"]
@@ -480,8 +480,8 @@ mod tests {
             .to_owned();
         assert!(!tail_description.contains('{'), "{tail_description}");
         assert!(
-            tail_description.contains(&crate::jobs::DEFAULT_TAIL_LINES.to_string())
-                && tail_description.contains(&crate::jobs::MAX_TAIL_LINES.to_string()),
+            tail_description.contains(&crate::limits::DEFAULT_JOB_TAIL_LINES.to_string())
+                && tail_description.contains(&crate::limits::MAX_JOB_TAIL_LINES.to_string()),
             "{tail_description}"
         );
 

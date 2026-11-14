@@ -94,14 +94,6 @@ const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
 /// The one prohibition that belongs wherever a handle is handed back.
 pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run a command that returned a handle";
 
-/// Trailing lines a `job_get` reply carries per stream unless the caller asks
-/// otherwise. The end of a build answers "how is it going" and "why did it fail"
-/// in one round trip, without paging the middle; four lines is usually the
-/// verdict, and a caller that needs a wider window asks for it.
-pub(crate) const DEFAULT_TAIL_LINES: usize = 4;
-/// Hard ceiling on the same argument: enough to see a failure block, bounded so
-/// a status probe cannot quietly become a page read.
-pub(crate) const MAX_TAIL_LINES: usize = 16;
 /// Bytes read backwards from a stream to find those lines.
 const TAIL_WINDOW_BYTES: u64 = 8 * 1024;
 /// Rendered width of one tail line; longer lines are cut with an ellipsis.
@@ -1539,7 +1531,7 @@ impl JobManager {
     /// acknowledged, compacted or cleaned up) simply yields no tail.
     pub(crate) fn status_with_tail(&self, id: &str, tail_lines: usize) -> JobResult<String> {
         sweep_expired(&self.inner);
-        let tail_lines = tail_lines.min(MAX_TAIL_LINES);
+        let tail_lines = tail_lines.min(crate::limits::MAX_JOB_TAIL_LINES);
         let (mut payload, spools) = {
             let state = self.inner.state.lock().expect("job manager lock");
             let entry = state
@@ -3750,13 +3742,17 @@ mod tests {
         // The default peek is the end of each stream, not its whole content.
         let status: Value = serde_json::from_str(
             &manager
-                .status_with_tail(&job.id, DEFAULT_TAIL_LINES)
+                .status_with_tail(&job.id, crate::limits::DEFAULT_JOB_TAIL_LINES)
                 .unwrap(),
         )
         .unwrap();
         let stdout = status["stdout"]["tail"].as_array().unwrap();
-        assert_eq!(stdout.len(), DEFAULT_TAIL_LINES, "{status}");
-        assert_eq!(DEFAULT_TAIL_LINES, 4);
+        assert_eq!(
+            stdout.len(),
+            crate::limits::DEFAULT_JOB_TAIL_LINES,
+            "{status}"
+        );
+        assert_eq!(crate::limits::DEFAULT_JOB_TAIL_LINES, 4);
         assert_eq!(stdout[0], "line 22", "{status}");
         assert_eq!(stdout[3], "line 25", "{status}");
         assert_eq!(
@@ -3788,7 +3784,7 @@ mod tests {
         );
         let empty_status: Value = serde_json::from_str(
             &manager
-                .status_with_tail(&empty.id, DEFAULT_TAIL_LINES)
+                .status_with_tail(&empty.id, crate::limits::DEFAULT_JOB_TAIL_LINES)
                 .unwrap(),
         )
         .unwrap();
@@ -3809,7 +3805,7 @@ mod tests {
             serde_json::from_str(&manager.status_with_tail(&job.id, 500).unwrap()).unwrap();
         assert_eq!(
             capped["stdout"]["tail"].as_array().unwrap().len(),
-            MAX_TAIL_LINES
+            crate::limits::MAX_JOB_TAIL_LINES
         );
     }
 

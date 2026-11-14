@@ -79,6 +79,15 @@ pub(crate) const MAX_JOB_RETENTION_SECS: u64 = 24 * 60 * 60;
 /// This allows useful multi-page build logs without letting a runaway producer
 /// consume the host filesystem indefinitely.
 pub(crate) const MAX_JOB_SPOOL_BYTES_PER_STREAM: u64 = 64 * 1024 * 1024;
+
+/// Trailing lines a `job_get` reply carries per stream unless the caller asks
+/// otherwise. The end of a build answers "how is it going" and "why did it
+/// fail" in one round trip, without paging the middle; four lines is usually the
+/// verdict, and a caller that needs a wider window asks for it.
+pub(crate) const DEFAULT_JOB_TAIL_LINES: usize = 4;
+/// Ceiling on the same argument: enough to see a failure block, bounded so a
+/// status probe cannot quietly become a page read.
+pub(crate) const MAX_JOB_TAIL_LINES: usize = 16;
 /// Aggregate persisted state for one live job session. Per-stream limits stop
 /// one noisy child; this shared ceiling stops many retained jobs from filling
 /// the host disk during the retention window.

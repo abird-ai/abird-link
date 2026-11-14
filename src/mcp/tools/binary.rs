@@ -522,7 +522,7 @@ impl LocalMachine {
 #[tool_router(router = "binary_router", vis = "pub(crate)")]
 impl LocalMachine {
     #[tool(
-        description = "Read a binary file. `format=mcp` returns typed image/audio/blob content for the whole file; `base64` or `hex` returns encoded bytes for the `offset`/`limit` window.",
+        description = "Read a binary file. `format=mcp` returns typed image/audio/blob content for the whole file; `base64` or `hex` returns encoded bytes for the `offset`/`limit` window. UTF-8 text is cheaper through `read`, which returns numbered lines instead of an encoded block.",
         annotations(
             title = "Read binary file",
             read_only_hint = true,
