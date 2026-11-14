@@ -667,6 +667,19 @@ OAuth state lives separately under `$XDG_STATE_HOME/abird/dotlink/` (normally `~
 
 Use `dotlink oauth clients -p <profile>` to inspect approved DCR clients, then `dotlink oauth revoke -p <profile> <client-id>`. `dotlink oauth revoke-all -p <profile>` revokes all persisted refresh grants. Restart dotlink or press `Ctrl+R` if you also want all currently issued short-lived access tokens invalidated immediately.
 
+### ChatGPT seems stuck mid-task. Is that dotlink?
+
+Usually not. dotlink is local and answers every tool call; a stuck conversation is normally the hosted client ending its own turn.
+
+- ChatGPT decides how long one turn may run and can abort it or drop the reply — the UI then looks frozen or stops updating, and dotlink cannot extend that budget.
+- dotlink asks the model to stop at a coherent boundary after about 35 minutes of one turn (measured from the `ts` stamp on shell and job results) and hand back with what is done and what remains. A long turn is exactly what makes a client show "still thinking" while dotlink is answering fine.
+- Blocking calls report `notifications/progress`, and long `bash`/`powershell` runs continue behind a job handle instead of being cut to the transport deadline.
+
+Those measures reduce it; they do not remove it. When it happens:
+
+1. Stop the turn and refresh the ChatGPT page (or reopen the conversation).
+2. Ask it to continue. `job_list` finds a run that was still in flight, and `job_get` / `job_output` return its status, tail or full output — the work was not lost, and it is not re-executed: a repeated tunnel request replays the original response until its retention window expires.
+
 ## NixOS service
 
 NixOS users can enable dotlink as a systemd service directly from this flake. By default it **reuses the selected user's existing profile, saved Runtime key, and OAuth state**—no duplicated setup or generated configuration required:
