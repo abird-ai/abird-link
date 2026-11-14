@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- The turn clock asks for **35 minutes** instead of 40, and states it as a limit rather than a hint: the server instructions tell the model to take the first `ts` of a turn as its anchor, keep one user turn to that horizon, then stop at the next coherent boundary, say what is done and what remains, and hand back instead of starting another step. Both shell descriptions carry the same sentence, so the advice appears wherever the clock is read. A long turn is what makes a hosted client show "still thinking" while the bridge is answering every call.
+
 ## [0.16.7] - 2026-11-14
 
 ### Fixed

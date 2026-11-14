@@ -28,9 +28,10 @@ const _: () = assert!(
 /// the response it is attached to.
 pub(crate) const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(90);
 
-/// Advisory checkpoint horizon for one conversation turn. Guidance only: dotlink
-/// never infers a turn boundary, it stamps `ts` and the caller keeps its own.
-pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 40;
+/// Turn horizon for one user/model turn: the guidance asks a caller to stop and
+/// hand back around here. Advisory only — dotlink never infers a turn boundary,
+/// it stamps `ts` and the caller keeps its own clock.
+pub(crate) const TURN_CHECKPOINT_MINUTES: u64 = 35;
 
 /// OpenAI Secure MCP Tunnel's serialized request/response message ceiling.
 pub(crate) const OPENAI_TUNNEL_SERIALIZED_MESSAGE_BYTES: usize = 10 * 1024 * 1024;

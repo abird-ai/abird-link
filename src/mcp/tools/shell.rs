@@ -114,12 +114,12 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `job_start` returns that handle at once instead of waiting. {follow_up}. Results carry `ts` (epoch seconds); checkpoint around {} min in a turn.",
+            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `job_start` returns that handle at once instead of waiting. {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until the command finishes or timeout_secs expires. For background work use job_start, which returns the same handle: {follow_up}. Results carry `ts` (epoch seconds); checkpoint around {} min in a turn.",
+            "Run a {shell} command; waits until the command finishes or timeout_secs expires. For background work use job_start, which returns the same handle: {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
