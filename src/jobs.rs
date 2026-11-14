@@ -96,10 +96,12 @@ pub(crate) const SHELL_JOB_DO_NOT_REPEAT: &str = "don't re-run a command that re
 
 /// Trailing lines a `job_get` reply carries per stream unless the caller asks
 /// otherwise. The end of a build answers "how is it going" and "why did it fail"
-/// in one round trip, without paging the middle.
-pub(crate) const DEFAULT_TAIL_LINES: usize = 10;
-/// Hard ceiling on the same argument.
-pub(crate) const MAX_TAIL_LINES: usize = 10;
+/// in one round trip, without paging the middle; five lines is usually the
+/// verdict, and a caller that needs a wider window asks for it.
+pub(crate) const DEFAULT_TAIL_LINES: usize = 5;
+/// Hard ceiling on the same argument: enough to see a failure block, bounded so
+/// a status probe cannot quietly become a page read.
+pub(crate) const MAX_TAIL_LINES: usize = 16;
 /// Bytes read backwards from a stream to find those lines.
 const TAIL_WINDOW_BYTES: u64 = 8 * 1024;
 /// Rendered width of one tail line; longer lines are cut with an ellipsis.
@@ -3649,8 +3651,9 @@ mod tests {
         .unwrap();
         let stdout = status["stdout"]["tail"].as_array().unwrap();
         assert_eq!(stdout.len(), DEFAULT_TAIL_LINES, "{status}");
-        assert_eq!(stdout[0], "line 16", "{status}");
-        assert_eq!(stdout[9], "line 25", "{status}");
+        assert_eq!(DEFAULT_TAIL_LINES, 5);
+        assert_eq!(stdout[0], "line 21", "{status}");
+        assert_eq!(stdout[4], "line 25", "{status}");
         assert_eq!(
             status["stderr"]["tail"],
             serde_json::json!(["warn: one", "warn: two"])

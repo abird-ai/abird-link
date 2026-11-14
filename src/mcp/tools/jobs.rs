@@ -54,7 +54,7 @@ pub(crate) fn decode_job_start(
 
 pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: usize) {
     let name = tool.name.as_ref();
-    if !matches!(name, "job_start" | "job_output") {
+    if !matches!(name, "job_start" | "job_get" | "job_output") {
         return;
     }
     let mut schema = (*tool.input_schema).clone();
@@ -77,6 +77,17 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: 
         );
         property.insert("maximum".to_owned(), serde_json::Value::from(max_secs));
     }
+    if name == "job_get"
+        && let Some(property) = properties
+            .get_mut("tail_lines")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        property.insert("minimum".to_owned(), serde_json::Value::from(0));
+        property.insert(
+            "maximum".to_owned(),
+            serde_json::Value::from(crate::jobs::MAX_TAIL_LINES),
+        );
+    }
     if name == "job_output"
         && let Some(property) = properties
             .get_mut("max_output_bytes")
@@ -85,7 +96,8 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: 
         property.insert(
             "description".to_owned(),
             serde_json::Value::String(format!(
-                "Serialized MCP result budget for this page. Defaults to {max_output_bytes}, must be at least {} and is capped at {max_output_bytes}.",
+                "Serialized MCP result budget for this page. Defaults to {} and is capped at {max_output_bytes}; must be at least {}.",
+                crate::limits::DEFAULT_OUTPUT_PAGE_BYTES,
                 crate::mcp::MIN_BYTE_LIMIT,
             )),
         );
@@ -165,8 +177,8 @@ struct JobGetArgs {
     #[serde(default)]
     wait_secs: Option<u64>,
     /// Trailing lines of each stream to include in this reply. Defaults to
-    /// {job_tail} and is capped there; 0 returns status only. The end of a build
-    /// answers "how is it going" and "why did it fail" without paging the spool.
+    /// {job_tail}, at most {job_tail_max}; 0 returns status only. The end of a
+    /// build answers "how is it going" and "why did it fail" without paging.
     #[serde(default)]
     tail_lines: Option<usize>,
 }
@@ -258,7 +270,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. The job id is the native task id when Tasks are supported. `wait_secs`: 90 by default where the transport supplies a response window, clamped to what remains, waiting for completion; 0 answers immediately. `tail_lines` defaults to {job_tail} and is capped there; 0 omits the lines.",
+        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. The job id is the native task id when Tasks are supported. `wait_secs`: 90 by default where the transport supplies a response window, clamped to what remains, waiting for completion; 0 answers immediately. `tail_lines` defaults to {job_tail} and is capped at {job_tail_max}; 0 omits the lines.",
         annotations(
             title = "Get shell job status",
             read_only_hint = true,
@@ -422,6 +434,43 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("8388608")
+        );
+
+        // The tail peek advertises the same default and cap the handler clamps
+        // to, in the tool description and in the argument itself.
+        let mut get = LocalMachine::all_tools().get("job_get").cloned().unwrap();
+        with_job_limits(&mut get, 3600, 8 * 1024 * 1024);
+        let tail = &get.input_schema["properties"]["tail_lines"];
+        assert_eq!(tail["maximum"], crate::jobs::MAX_TAIL_LINES as u64);
+        assert_eq!(tail["minimum"], 0);
+
+        let tokens =
+            crate::mcp::tools::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
+        crate::mcp::tools::substitute_description_tokens(&mut get, &tokens);
+        let get_description = get.description.as_deref().unwrap();
+        assert!(
+            get_description.contains(&format!(
+                "the last {} lines",
+                crate::jobs::DEFAULT_TAIL_LINES
+            )),
+            "{get_description}"
+        );
+        assert!(
+            get_description.contains(&format!(
+                "capped at {}",
+                crate::jobs::MAX_TAIL_LINES
+            )),
+            "{get_description}"
+        );
+        let tail_description = get.input_schema["properties"]["tail_lines"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!tail_description.contains('{'), "{tail_description}");
+        assert!(
+            tail_description.contains(&crate::jobs::DEFAULT_TAIL_LINES.to_string())
+                && tail_description.contains(&crate::jobs::MAX_TAIL_LINES.to_string()),
+            "{tail_description}"
         );
 
         let tokens =

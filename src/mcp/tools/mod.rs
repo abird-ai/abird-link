@@ -147,7 +147,8 @@ pub(crate) fn description_tokens(job_retention_secs: u64) -> Vec<(&'static str, 
         ("{grep_scan}", human_bytes(grep::MAX_GREP_SCAN_BYTES as u64)),
         ("{grep_file}", human_bytes(grep::MAX_GREP_FILE_BYTES as u64)),
         ("{grep_hits}", grep::MAX_GREP_HITS.to_string()),
-        ("{job_tail}", crate::jobs::MAX_TAIL_LINES.to_string()),
+        ("{job_tail}", crate::jobs::DEFAULT_TAIL_LINES.to_string()),
+        ("{job_tail_max}", crate::jobs::MAX_TAIL_LINES.to_string()),
         ("{grep_context}", grep::MAX_GREP_CONTEXT.to_string()),
         (
             "{grep_files}",
@@ -170,17 +171,49 @@ pub(crate) fn substitute_description_tokens(
     tool: &mut rmcp::model::Tool,
     tokens: &[(&'static str, String)],
 ) {
-    let Some(description) = tool.description.as_deref() else {
-        return;
+    let resolve = |text: &str| {
+        let mut text = text.to_owned();
+        for (token, value) in tokens {
+            if text.contains(token) {
+                text = text.replace(token, value);
+            }
+        }
+        text
     };
-    let mut text = description.to_owned();
-    for (token, value) in tokens {
-        if text.contains(token) {
-            text = text.replace(token, value);
+    if let Some(description) = tool.description.as_deref() {
+        let resolved = resolve(description);
+        if resolved != description {
+            tool.description = Some(resolved.into());
         }
     }
-    if text != description {
-        tool.description = Some(text.into());
+    // Argument descriptions carry the same limits, so they resolve through the
+    // same table instead of restating numbers that could drift.
+    let mut schema = (*tool.input_schema).clone();
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let mut changed = false;
+    for property in properties.values_mut() {
+        let Some(object) = property.as_object_mut() else {
+            continue;
+        };
+        let Some(description) = object.get("description").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let resolved = resolve(description);
+        if resolved != description {
+            object.insert(
+                "description".to_owned(),
+                serde_json::Value::String(resolved),
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        tool.input_schema = std::sync::Arc::new(schema);
     }
 }
 
