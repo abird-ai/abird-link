@@ -684,12 +684,6 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
         concurrent_read: false,
     },
     ToolSpec {
-        name: "job_start",
-        capability: Capability::Job,
-        request_replay: true,
-        concurrent_read: false,
-    },
-    ToolSpec {
         name: "job_list",
         capability: Capability::Job,
         request_replay: false,
@@ -2559,11 +2553,7 @@ impl LocalMachine {
         );
         tools::text::with_read_limit(&mut tool, self.config.max_read_bytes);
         tools::binary::with_read_limit(&mut tool, self.config.max_read_bytes);
-        tools::jobs::with_job_limits(
-            &mut tool,
-            self.config.max_shell_timeout_secs,
-            self.config.max_output_bytes,
-        );
+        tools::jobs::with_job_limits(&mut tool, self.config.max_output_bytes);
         tools::substitute_description_tokens(&mut tool, tokens);
         tool
     }
@@ -3429,7 +3419,6 @@ mod tests {
                     "job_get",
                     "job_list",
                     "job_output",
-                    "job_start",
                     "ls",
                     "powershell",
                     "read"
@@ -3447,7 +3436,6 @@ mod tests {
                     "job_get",
                     "job_list",
                     "job_output",
-                    "job_start",
                     "ls",
                     "read"
                 ]
@@ -3773,7 +3761,6 @@ mod tests {
                 "bedit",
                 "bash",
                 "powershell",
-                "job_start",
             ]
         );
         for spec in TOOL_SPECS {

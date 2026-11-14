@@ -13,48 +13,14 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use super::{LocalMachine, dot, ok_text, resolve_output_page, tool_error};
+use super::{LocalMachine, ok_text, resolve_output_page, tool_error};
 use crate::jobs::JobStream;
 use std::time::Duration;
 use tokio::time::Instant as TokioInstant;
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct JobStartArgs {
-    /// Command string to execute in the background.
-    command: String,
-    /// Working directory. Relative paths resolve from dotlink's launch directory.
-    #[serde(default = "dot")]
-    dir: String,
-    /// Optional stdin text passed to the process.
-    #[serde(default)]
-    stdin: Option<String>,
-    /// Execution timeout in seconds. Defaults to the profile shell ceiling and is capped there.
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-}
-
-impl From<JobStartArgs> for super::shell::ShellArgs {
-    fn from(args: JobStartArgs) -> Self {
-        Self {
-            command: args.command,
-            dir: args.dir,
-            stdin: args.stdin,
-            timeout_secs: args.timeout_secs,
-            max_output_bytes: None,
-        }
-    }
-}
-
-pub(crate) fn decode_job_start(
-    arguments: serde_json::Map<String, serde_json::Value>,
-) -> Result<super::shell::ShellArgs, serde_json::Error> {
-    serde_json::from_value::<JobStartArgs>(serde_json::Value::Object(arguments)).map(Into::into)
-}
-
-pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: usize) {
+pub(crate) fn with_job_limits(tool: &mut Tool, max_output_bytes: usize) {
     let name = tool.name.as_ref();
-    if !matches!(name, "job_start" | "job_get" | "job_output") {
+    if !matches!(name, "job_get" | "job_output") {
         return;
     }
     let mut schema = (*tool.input_schema).clone();
@@ -64,19 +30,6 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: 
     else {
         return;
     };
-    if name == "job_start"
-        && let Some(property) = properties
-            .get_mut("timeout_secs")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        property.insert(
-            "description".to_owned(),
-            serde_json::Value::String(format!(
-                "Background execution timeout in seconds. Defaults to {max_secs} and is capped at {max_secs}."
-            )),
-        );
-        property.insert("maximum".to_owned(), serde_json::Value::from(max_secs));
-    }
     if name == "job_get"
         && let Some(property) = properties
             .get_mut("tail_lines")
@@ -119,7 +72,7 @@ pub(crate) fn with_job_limits(tool: &mut Tool, max_secs: u64, max_output_bytes: 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobIdArgs {
-    /// Job/task identifier returned by bash, powershell or job_start.
+    /// Job/task identifier returned by a `background: true` shell call.
     job_id: String,
 }
 
@@ -190,7 +143,7 @@ struct JobGetArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobOutputArgs {
-    /// Job/task identifier returned by bash, powershell or job_start.
+    /// Job/task identifier returned by a `background: true` shell call.
     job_id: String,
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]
@@ -241,22 +194,6 @@ struct JobListArgs {
 
 #[tool_router(router = "jobs_router", vis = "pub(crate)")]
 impl LocalMachine {
-    #[tool(
-        description = "Start a shell command in the background; returns its durable job/task id immediately. Ordinary bash/powershell use the same execution layer but first wait through their response window. Spools retain <={spool} per stream, drained fully, with the retained prefix marked truncated. Follow up: job_get=status, job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop.",
-        annotations(
-            title = "Start background shell job",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn job_start(&self, Parameters(args): Parameters<JobStartArgs>) -> CallToolResult {
-        // The background half lives with the shell it starts, so the transport
-        // dispatch and this handler cannot drift apart.
-        self.background_receipt(args.into(), cfg!(windows), None)
-    }
-
     #[tool(
         description = "List recent durable jobs exposed in this runtime, not scoped to a conversation, so entries may belong to another client of the same bridge. Useful after a lost creation response: stable ids, status/phase, elapsed, session spool usage.",
         annotations(
@@ -424,20 +361,22 @@ mod tests {
 
     #[test]
     fn job_schemas_expose_only_the_relevant_profile_limits() {
-        let mut start = LocalMachine::all_tools().get("job_start").cloned().unwrap();
-        with_job_limits(&mut start, 3600, 8 * 1024 * 1024);
+        // The shell tools own the timeout and inline-output ceilings now (see
+        // `shell_tool_schema_reports_configured_ceilings`); the job readers
+        // advertise only their own page and tail limits.
+        let mut start = LocalMachine::all_tools().get("bash").cloned().unwrap();
+        with_job_limits(&mut start, 8 * 1024 * 1024);
         let start_props = start.input_schema["properties"].as_object().unwrap();
-        assert_eq!(start_props["timeout_secs"]["maximum"], 3600);
-        assert!(
-            !start_props.contains_key("max_output_bytes"),
-            "background output is paged separately and must not advertise a synchronous stream cap"
+        assert_eq!(
+            start_props["background"]["type"], "boolean",
+            "{start_props:?}"
         );
 
         let mut output = LocalMachine::all_tools()
             .get("job_output")
             .cloned()
             .unwrap();
-        with_job_limits(&mut output, 3600, 8 * 1024 * 1024);
+        with_job_limits(&mut output, 8 * 1024 * 1024);
         let output_limit = &output.input_schema["properties"]["max_output_bytes"];
         assert_eq!(output_limit["maximum"], 8 * 1024 * 1024);
         let output_description = output_limit["description"].as_str().unwrap();
@@ -450,7 +389,7 @@ mod tests {
         // The tail peek advertises the same default and cap the handler clamps
         // to, in the tool description and in the argument itself.
         let mut get = LocalMachine::all_tools().get("job_get").cloned().unwrap();
-        with_job_limits(&mut get, 3600, 8 * 1024 * 1024);
+        with_job_limits(&mut get, 8 * 1024 * 1024);
         let tail = &get.input_schema["properties"]["tail_lines"];
         assert_eq!(tail["maximum"], crate::limits::MAX_JOB_TAIL_LINES as u64);
         assert_eq!(tail["minimum"], 0);
@@ -481,15 +420,16 @@ mod tests {
             "{tail_description}"
         );
 
+        // The spool ceiling is advertised where a caller reads output.
         let tokens =
             crate::mcp::tools::description_tokens(crate::limits::DEFAULT_JOB_RETENTION_SECS);
-        crate::mcp::tools::substitute_description_tokens(&mut start, &tokens);
-        let start_description = start.description.as_deref().unwrap();
+        crate::mcp::tools::substitute_description_tokens(&mut output, &tokens);
+        let output_description = output.description.as_deref().unwrap();
         assert!(
-            start_description.contains(&crate::mcp::tools::human_bytes(
+            output_description.contains(&crate::mcp::tools::human_bytes(
                 crate::limits::MAX_JOB_SPOOL_BYTES_PER_STREAM
             )),
-            "{start_description}"
+            "{output_description}"
         );
     }
 }

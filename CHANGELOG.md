@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **`job_start` is gone; `bash`/`powershell` take `background: true`.** It was the same durable execution with the wait suppressed — the dispatch read `explicit_background = name == "job_start"` and its argument type was a field-for-field copy of the shell's. One tool now: `background: false` (default) keeps today's behaviour, `background: true` returns the same handle immediately. One argument schema instead of two, `with_job_limits` no longer patches a shell-shaped tool, and both `name == "job_start"` special cases in the tunnel transport collapse into `is_shell_tool`. Breaking tool-surface change.
+
 - The turn clock asks for **35 minutes** instead of 40, and states it as a limit rather than a hint: the server instructions tell the model to take the first `ts` of a turn as its anchor, keep one user turn to that horizon, then stop at the next coherent boundary, say what is done and what remains, and hand back instead of starting another step. Both shell descriptions carry the same sentence, so the advice appears wherever the clock is read. A long turn is what makes a hosted client show "still thinking" while the bridge is answering every call.
 
 ## [0.16.7] - 2026-11-14

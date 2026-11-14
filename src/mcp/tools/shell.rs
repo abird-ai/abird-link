@@ -83,6 +83,12 @@ pub(crate) struct ShellArgs {
     /// Output byte limit per stream. Defaults to the short-page size, clamped to the profile ceiling (max_output_bytes).
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
+
+    /// Return the durable job handle instead of waiting for the command. The
+    /// execution is the same either way; this only chooses not to hold the
+    /// request, which is what a build that outlives a response window wants.
+    #[serde(default)]
+    pub(crate) background: bool,
 }
 
 /// Salvage window for partial output after a killed child.
@@ -114,12 +120,12 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `job_start` returns that handle at once instead of waiting. {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
+            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting. {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until the command finishes or timeout_secs expires. For background work use job_start, which returns the same handle: {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
+            "Run a {shell} command; waits until the command finishes or timeout_secs expires. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
@@ -2077,10 +2083,10 @@ impl LocalMachine {
     }
 
     /// Start the command and return its handle instead of waiting: the single
-    /// implementation of the explicit-background form, shared by the transport
-    /// dispatch and the `job_start` handler. A refused command is an ordinary
-    /// tool error, exactly as it is for the waiting form, so the wire shape never
-    /// depends on which path handled the call.
+    /// implementation of `background: true`, shared by the transport dispatch and
+    /// the router handlers. A refused command is an ordinary tool error, exactly
+    /// as it is for the waiting form, so the wire shape never depends on which
+    /// path handled the call.
     pub(crate) fn background_receipt(
         &self,
         args: ShellArgs,
@@ -2106,27 +2112,18 @@ impl LocalMachine {
         heartbeat: Option<ProgressHeartbeat>,
     ) -> Result<Option<CallToolResponse>, McpError> {
         let name = request.name.as_ref();
-        let explicit_background = name == "job_start";
-        if !explicit_background && !crate::mcp::is_shell_tool(name) {
+        if !crate::mcp::is_shell_tool(name) {
             return Ok(None);
         }
         if !self.has_tool_for_policy(name) {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
-        let args = if explicit_background {
-            super::jobs::decode_job_start(arguments)
-        } else {
-            serde_json::from_value::<ShellArgs>(Value::Object(arguments))
-        }
-        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        let powershell = if explicit_background {
-            cfg!(windows)
-        } else {
-            name == "powershell"
-        };
+        let args = { serde_json::from_value::<ShellArgs>(Value::Object(arguments)) }
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let powershell = name == "powershell";
 
-        if explicit_background {
+        if args.background {
             let receipt = self.background_receipt(args, powershell, request_key);
             return Ok(Some(CallToolResponse::Complete(receipt)));
         }
@@ -2703,8 +2700,13 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_shell_to_completion(args, false, ProgressHeartbeat::for_request(&context))
-            .await
+        match args.background {
+            true => Ok(self.background_receipt(args, false, None)),
+            false => {
+                self.run_shell_to_completion(args, false, ProgressHeartbeat::for_request(&context))
+                    .await
+            }
+        }
     }
 
     #[tool(
@@ -2722,8 +2724,13 @@ impl LocalMachine {
         Parameters(args): Parameters<ShellArgs>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.run_shell_to_completion(args, true, ProgressHeartbeat::for_request(&context))
-            .await
+        match args.background {
+            true => Ok(self.background_receipt(args, true, None)),
+            false => {
+                self.run_shell_to_completion(args, true, ProgressHeartbeat::for_request(&context))
+                    .await
+            }
+        }
     }
 }
 
@@ -3349,6 +3356,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -3399,6 +3407,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -3435,6 +3444,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(2),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -3461,6 +3471,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -3524,6 +3535,7 @@ mod tests {
                     stdin: Some("x".repeat(160 * 1024)),
                     timeout_secs: Some(3),
                     max_output_bytes: Some(256 * 1024),
+                    background: false,
                 },
                 false,
                 None,
@@ -3554,6 +3566,7 @@ mod tests {
                     stdin: Some("x".repeat(160 * 1024)),
                     timeout_secs: Some(3),
                     max_output_bytes: Some(16 * 1024),
+                    background: false,
                 },
                 false,
                 None,
@@ -3855,6 +3868,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -4041,6 +4055,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(3),
                     max_output_bytes: Some(4),
+                    background: false,
                 },
                 false,
                 None,
@@ -4245,7 +4260,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn explicit_background_never_changes_how_a_failing_call_reports() {
+    async fn background_never_changes_how_a_failing_call_reports() {
         let Some(bash) = resolve_executable("bash") else {
             return;
         };
@@ -4255,11 +4270,12 @@ mod tests {
 
         // An empty command is a tool error whether the caller waits or asks for
         // the handle, and both paths must agree on that.
-        for name in ["bash", "job_start"] {
-            let call = CallToolRequestParams::new(name).with_arguments(
-                serde_json::from_value::<serde_json::Map<String, Value>>(
-                    serde_json::json!({ "command": "   " }),
-                )
+        for background in [false, true] {
+            let call = CallToolRequestParams::new("bash").with_arguments(
+                serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                    "command": "   ",
+                    "background": background
+                }))
                 .unwrap(),
             );
             let response = machine
@@ -4270,8 +4286,51 @@ mod tests {
             let CallToolResponse::Complete(result) = response else {
                 panic!("a rejected command must not become a task");
             };
-            assert_eq!(result.is_error, Some(true), "{name}");
+            assert_eq!(result.is_error, Some(true), "background={background}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_shell_returns_the_handle_without_waiting() {
+        let Some(bash) = resolve_executable("bash") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let machine = direct_shell_machine(root, bash, 16 * 1024);
+        let call = CallToolRequestParams::new("bash").with_arguments(
+            serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
+                "command": "sleep 5",
+                "background": true
+            }))
+            .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let response = machine
+            .handle_shell_call_with(&call, Some(60_000), true, None, None, None)
+            .await
+            .unwrap()
+            .expect("a background shell returns a response");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "background shell waited {:?}",
+            started.elapsed()
+        );
+        let text = match response {
+            CallToolResponse::Complete(result) => result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|text| text.text.clone())
+                .expect("receipt text"),
+            other => panic!("background shell must complete with a handle: {other:?}"),
+        };
+        let receipt: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(receipt["async"], true, "{receipt}");
+        assert!(receipt["job_id"].as_str().is_some(), "{receipt}");
+        let job_id = receipt["job_id"].as_str().unwrap().to_owned();
+        machine.jobs.cancel(&job_id).unwrap();
     }
 
     #[cfg(unix)]
@@ -4296,15 +4355,16 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("unknown field"), "{error:?}");
 
-        let job_start = CallToolRequestParams::new("job_start").with_arguments(
+        let background = CallToolRequestParams::new("bash").with_arguments(
             serde_json::from_value::<serde_json::Map<String, Value>>(serde_json::json!({
                 "command": "true",
-                "max_output_bytes": 4096
+                "background": true,
+                "max_output_limits": 4096
             }))
             .unwrap(),
         );
         let error = machine
-            .handle_shell_call_with(&job_start, Some(1_000), true, None, None, None)
+            .handle_shell_call_with(&background, Some(1_000), true, None, None, None)
             .await
             .unwrap_err();
         assert!(error.message.contains("unknown field"), "{error:?}");
@@ -4328,6 +4388,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: Some(4096),
+                    background: false,
                 },
                 false,
                 None,
@@ -5713,6 +5774,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: Some(4096),
+                    background: false,
                 },
                 false,
                 None,
@@ -5788,6 +5850,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(1),
                     max_output_bytes: Some(4096),
+                    background: false,
                 },
                 false,
                 None,
@@ -5911,6 +5974,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
+                    background: false,
                 },
                 false, None)
             .await
@@ -6098,6 +6162,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(8),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -6189,6 +6254,7 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(8),
                         max_output_bytes: None,
+                                        background: false,
                     },
                     false, None)
                 .await
@@ -6459,6 +6525,7 @@ mod tests {
             ),
             dir: ".".into(), stdin: None,
             timeout_secs: Some(15), max_output_bytes: None,
+                background: false,
         }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -6559,6 +6626,7 @@ mod tests {
             ).into(),
             dir: "/".into(), stdin: None,
             timeout_secs: Some(8), max_output_bytes: None,
+            background: false,
         }, false, None).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -6713,6 +6781,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(12),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -6816,6 +6885,7 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(10),
                         max_output_bytes: None,
+                        background: false,
                     },
                     false,
                     None,
@@ -6907,6 +6977,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(8),
                     max_output_bytes: None,
+                    background: false,
                 },
                 false,
                 None,
@@ -7013,6 +7084,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
+                    background: false,
                 },
                 false, None)
             .await
@@ -7035,6 +7107,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(10),
                     max_output_bytes: Some(16 * 1024),
+                    background: false,
                 },
                 false,
                 None,

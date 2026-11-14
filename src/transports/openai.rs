@@ -3174,7 +3174,7 @@ fn annotate_response_context(
     }
     let name = jsonrpc.pointer("/params/name").and_then(Value::as_str);
     let shell = tools_call && name.is_some_and(crate::mcp::is_shell_tool);
-    let durable_shell = shell || (tools_call && name == Some("job_start"));
+    let durable_shell = shell;
     // The job tools that can wait need the same remaining-window metadata the
     // shell uses, so a bounded wait can never outlive the response.
     let waits_on_job = tools_call && name.is_some_and(crate::mcp::is_waiting_job_tool);
@@ -3335,8 +3335,7 @@ fn replay_protected_tool_call(jsonrpc: &Value) -> bool {
 }
 
 fn durable_shell_tool_call(jsonrpc: &Value) -> bool {
-    tool_call_name(jsonrpc)
-        .is_some_and(|name| crate::mcp::is_shell_tool(name) || name == "job_start")
+    tool_call_name(jsonrpc).is_some_and(crate::mcp::is_shell_tool)
 }
 
 fn verbose_request_label(jsonrpc: &Value) -> String {
@@ -3876,6 +3875,7 @@ mod tests {
             stdin: None,
             timeout_secs: Some(5),
             max_output_bytes: Some(4096),
+            background: false,
         };
         let original = mcp
             .machine
@@ -3896,6 +3896,7 @@ mod tests {
                         stdin: None,
                         timeout_secs: Some(2),
                         max_output_bytes: Some(1024),
+                        background: false,
                     },
                     false,
                     None,
@@ -5478,6 +5479,7 @@ mod tests {
                     stdin: None,
                     timeout_secs: Some(5),
                     max_output_bytes: Some(1024),
+                    background: false,
                 },
                 false,
                 Some(request_key.clone()),
@@ -6921,10 +6923,11 @@ name"
         let background = json!({
             "jsonrpc":"2.0", "id":1, "method":"tools/call",
             "params": {
-                "name":"job_start",
+                "name":"bash",
                 "arguments": {
                     "command": format!("printf held > '{}'; sleep 1", marker.display()),
-                    "timeout_secs": 3
+                    "timeout_secs": 3,
+                    "background": true
                 }
             }
         });
@@ -7059,8 +7062,8 @@ name"
                 &headers,
                 &call(
                     1,
-                    "job_start",
-                    json!({"command":"printf started; sleep 5", "timeout_secs":8}),
+                    "bash",
+                    json!({"command":"printf started; sleep 5", "timeout_secs":8, "background": true}),
                 ),
             )
             .await
@@ -7588,13 +7591,16 @@ name"
 
         // Explicit background jobs carry request identity but no synchronous
         // wait budget because they return immediately by definition.
-        let mut job_start = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"job_start","arguments":{"command":"true"}}});
+        // `background: true` is one tool now, so the annotation cannot tell it
+        // apart from a waiting call — nor does it need to: the budget is advisory
+        // and a background call returns before it is ever consulted.
+        let mut background = shell(json!({"command":"true","background":true}));
         assert_eq!(
-            annotate_response_context(&mut job_start, window, reserve, "job-request", "token"),
-            Ok(None)
+            annotate_response_context(&mut background, window, reserve, "request", "token"),
+            Ok(Some(90))
         );
-        assert_eq!(request_meta(&job_start), Some("job-request".to_owned()));
-        assert_eq!(sync_meta(&job_start), None);
+        assert_eq!(request_meta(&background), Some("request".to_owned()));
+        assert_eq!(sync_meta(&background), Some(90_000));
 
         // Every tools/call gets the serialized result budget, while only
         // durable shell calls get request identity / synchronous-window metadata.
@@ -7770,7 +7776,7 @@ name"
 
         let start = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "job_start", "arguments": {"command": "sleep 30"}}
+            "params": {"name": "bash", "arguments": {"command": "sleep 30", "background": true}}
         });
         let (tx, _rx) = mpsc::channel(16);
         let started = mcp
@@ -7780,7 +7786,7 @@ name"
         let receipt: Value = serde_json::from_str(
             started.messages[0]["result"]["content"][0]["text"]
                 .as_str()
-                .expect("job_start receipt text"),
+                .expect("background shell receipt text"),
         )
         .unwrap();
         let job_id = receipt["job_id"].as_str().unwrap().to_owned();
@@ -7935,7 +7941,7 @@ name"
         // A job that outlives several heartbeat ticks.
         let start = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "job_start", "arguments": {"command": "sleep 2"}}
+            "params": {"name": "bash", "arguments": {"command": "sleep 2", "background": true}}
         });
         let (tx, _rx) = mpsc::channel(16);
         let started = mcp
@@ -7946,7 +7952,7 @@ name"
         let receipt: Value = serde_json::from_str(
             started.messages[0]["result"]["content"][0]["text"]
                 .as_str()
-                .expect("job_start receipt text"),
+                .expect("background shell receipt text"),
         )
         .unwrap();
         let job_id = receipt["job_id"].as_str().unwrap().to_owned();

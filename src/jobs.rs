@@ -2352,8 +2352,7 @@ fn render_tool_result(snapshot: &ToolResultSnapshot) -> Result<CallToolResult> {
             snapshot.timeout_secs
         )
     });
-    let next = timed_out
-        .then_some("job_start starts it in the background, or retry with a larger timeout_secs");
+    let next = timed_out.then_some("retry with background: true, or a larger timeout_secs");
     let text = serde_json::json!({
         "ts": completion.completed_unix,
         "exit_code": completion.exit_code,
