@@ -74,19 +74,17 @@ fn bounded_job_error(message: impl Into<String>) -> String {
     message
 }
 
-/// Canonical follow-up clauses, in order: (tool, clause).
-///
-/// Add or remove a job tool here and every surface follows: the handoff
-/// receipt, the status payload and the shell tool description. Phrasing rule:
-/// `<tool>(<arg>) to <purpose>`, joined with commas, with one leading `call`
-/// supplied by the renderer. The tool key lets a caller reading one payload
-/// skip the call it already made.
 /// How often a bounded job wait re-reads the retained spool length.
 const JOB_WAIT_POLL: Duration = Duration::from_millis(200);
 
-const SHELL_JOB_CLAUSES: &[(&str, &str)] = &[
+/// Canonical follow-up clauses, in order: (tool, clause).
+///
+/// Add or remove a job tool here and every surface follows: the handoff
+/// receipt, the status payload and the shell tool description. The tool key
+/// also lets a payload skip the call its reader has just made.
+const JOB_FOLLOW_UP_CLAUSES: &[(&str, &str)] = &[
     ("job_get", "job_get=status"),
-    ("job_output", "job_output(offset)=output"),
+    ("job_output", "job_output(offset)=remaining output"),
     ("job_ack", "job_ack(highest read)=free spool"),
     ("job_cancel", "job_cancel=stop"),
 ];
@@ -99,17 +97,9 @@ const TAIL_WINDOW_BYTES: u64 = 8 * 1024;
 /// Rendered width of one tail line; longer lines are cut with an ellipsis.
 const TAIL_LINE_BYTES: usize = 512;
 
-/// Reading a job by default means reading its end: a build's failures and a
-/// test run's verdict are at the tail, and the middle is context nobody reads.
-pub(crate) const JOB_TAIL_PEEK_PREFERENCE: &str = "To check on a job, use `job_get`: it returns the last lines of each stream, so one call shows how far a build has got or why it failed. When you need more than that, `job_output` reads either the last `tail_bytes` of a stream or a page from an offset; read the complete output from the acknowledged offset only when the whole log is genuinely needed.";
-
-/// One follow-up sentence, dropping the tool whose result the caller is already
-/// reading: a `job_get` payload must not tell the caller to call `job_get`.
-/// What a caller should do next, given the job's actual stage.
-///
-/// A finished job that still holds output must be acknowledged; one that is
-/// fully released needs no instruction at all, so the field is omitted rather
-/// than kept as dead prose.
+/// What a caller should do next, given the job's actual stage: a running job
+/// still offers the whole chain, a finished one only has output left, and one
+/// that was fully released says nothing at all.
 #[derive(Clone, Copy)]
 pub(crate) struct JobFollowUp {
     finished: bool,
@@ -117,50 +107,54 @@ pub(crate) struct JobFollowUp {
 }
 
 impl JobFollowUp {
+    /// A job that is still running: every follow-up is available.
+    pub(crate) const RUNNING: Self = Self {
+        finished: false,
+        unacked: false,
+    };
+
     fn of(entry: &JobEntry) -> Self {
         Self {
             finished: entry.completion.is_some(),
             unacked: entry.stdout_retained > 0 || entry.stderr_retained > 0,
         }
     }
+
+    /// Whether this stage can still act on one clause.
+    fn wants(self, tool: &str) -> bool {
+        match (self.finished, self.unacked) {
+            (false, _) => true,
+            (true, true) => matches!(tool, "job_output" | "job_ack"),
+            (true, false) => false,
+        }
+    }
 }
 
+/// One follow-up sentence for this stage, dropping the tool whose result the
+/// caller is already reading: a `job_get` payload must not tell the caller to
+/// call `job_get`.
 pub(crate) fn job_follow_up(state: JobFollowUp, already_used: Option<&str>) -> Option<String> {
-    if !state.finished {
-        return Some(shell_job_follow_up(already_used));
-    }
-    if !state.unacked {
+    let clauses: Vec<&str> = JOB_FOLLOW_UP_CLAUSES
+        .iter()
+        .filter(|(tool, _)| state.wants(tool) && Some(*tool) != already_used)
+        .map(|(_, clause)| *clause)
+        .collect();
+    if clauses.is_empty() {
         return None;
     }
-    let mut parts = Vec::new();
-    for (tool, clause) in [
-        ("job_output", "job_output(offset)=remaining output"),
-        (
-            "job_ack",
-            "job_ack(highest read)=free the spool and its session budget",
-        ),
-    ] {
-        if Some(tool) != already_used {
-            parts.push(clause);
-        }
-    }
-    Some(format!("output complete: {}", parts.join(", ")))
+    let lead = if state.finished {
+        "output complete: "
+    } else {
+        "call "
+    };
+    Some(format!("{lead}{}", clauses.join(", ")))
 }
 
+/// The chain a just-handed-back handle advertises: a running job's clauses, so
+/// a receipt and a status payload cannot drift apart.
 pub(crate) fn shell_job_follow_up(already_used: Option<&str>) -> String {
-    let mut text = String::from("call ");
-    let mut first = true;
-    for (tool, clause) in SHELL_JOB_CLAUSES {
-        if Some(*tool) == already_used {
-            continue;
-        }
-        if !first {
-            text.push_str(", ");
-        }
-        first = false;
-        text.push_str(clause);
-    }
-    text
+    job_follow_up(JobFollowUp::RUNNING, already_used)
+        .expect("a running job always has at least one follow-up clause")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -3352,14 +3346,14 @@ mod tests {
         let all = shell_job_follow_up(None);
         assert_eq!(
             all,
-            "call job_get=status, job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop",
+            "call job_get=status, job_output(offset)=remaining output, job_ack(highest read)=free spool, job_cancel=stop",
             "{all}"
         );
         // A payload from one job tool never tells the caller to call it again.
         let from_status = shell_job_follow_up(Some("job_get"));
         assert_eq!(
             from_status,
-            "call job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop",
+            "call job_output(offset)=remaining output, job_ack(highest read)=free spool, job_cancel=stop",
             "{from_status}"
         );
         assert!(!from_status.contains("job_get"), "{from_status}");
@@ -3367,24 +3361,18 @@ mod tests {
 
     #[test]
     fn finished_job_follow_up_asks_for_the_ack_and_drops_cancel() {
-        let running = JobFollowUp {
-            finished: false,
-            unacked: false,
-        };
         assert_eq!(
-            job_follow_up(running, Some("job_get")).unwrap(),
-            "call job_output(offset)=output, job_ack(highest read)=free spool, job_cancel=stop"
+            job_follow_up(JobFollowUp::RUNNING, Some("job_get")).unwrap(),
+            "call job_output(offset)=remaining output, job_ack(highest read)=free spool, job_cancel=stop"
         );
         let held = JobFollowUp {
             finished: true,
             unacked: true,
         };
-        let next = job_follow_up(held, Some("job_get")).unwrap();
-        assert!(
-            next.contains("job_ack(highest read)=free the spool and its session budget"),
-            "{next}"
+        assert_eq!(
+            job_follow_up(held, Some("job_get")).unwrap(),
+            "output complete: job_output(offset)=remaining output, job_ack(highest read)=free spool"
         );
-        assert!(!next.contains("job_cancel"), "{next}");
         let released = JobFollowUp {
             finished: true,
             unacked: false,

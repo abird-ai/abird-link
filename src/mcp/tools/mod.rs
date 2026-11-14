@@ -1507,9 +1507,26 @@ mod tests {
             let raw = tool.description.clone().unwrap_or_default();
             let unknown = unknown_placeholders(&raw, &known);
             assert!(unknown.is_empty(), "{} uses {unknown:?}", tool.name);
-            for token in &known {
-                if raw.contains(token) {
-                    used.insert(*token);
+            // A token may belong to the description or to an argument's
+            // description; both resolve through the same table, so either
+            // place counts as used.
+            let mut texts: Vec<&str> = vec![raw.as_ref()];
+            if let Some(properties) = tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
+                texts.extend(properties.values().filter_map(|property| {
+                    property
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                }));
+            }
+            for text in texts {
+                for token in &known {
+                    if text.contains(token) {
+                        used.insert(*token);
+                    }
                 }
             }
             super::substitute_description_tokens(&mut tool, &tokens);

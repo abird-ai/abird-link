@@ -125,11 +125,9 @@ fn resolve_wait(wait_secs: Option<u64>, budget: Option<Duration>) -> Duration {
 struct JobGetArgs {
     /// Job id from a shell call that returned a handle.
     job_id: String,
-    /// Wait up to this many seconds for the job to finish before returning its
-    /// status. Defaults to 90 where the transport supplies a response window and
-    /// is clamped to what remains of it, so a wait cannot outlive the response.
-    /// 0 returns immediately, which is what an interactive status check wants;
-    /// 90 is also the ceiling where no response window exists.
+    /// Wait up to this many seconds for the job to finish; 0 answers now.
+    /// Defaults to 90 where the transport supplies a response window and is
+    /// always clamped to what remains of it (90 is also the ceiling without one).
     #[serde(default)]
     wait_secs: Option<u64>,
     /// Trailing lines of *each* stream (stdout and stderr) to include in this
@@ -148,26 +146,24 @@ struct JobOutputArgs {
     /// stdout or stderr. Defaults to stdout.
     #[serde(default)]
     stream: OutputStream,
-    /// Raw byte offset in the selected spool stream. Defaults to zero; `job_get` already carries the tail, so page here only for the full output.
+    /// Raw byte offset in the selected spool stream. Defaults to zero.
     #[serde(default)]
     offset: Option<u64>,
     /// Maximum response bytes for this page. Defaults to the short-page size and is capped at the profile ceiling.
     #[serde(default)]
     max_output_bytes: Option<usize>,
-    /// Read the last N bytes of the stream instead of paging from `offset`
-    /// (0 reads one byte). Mutually exclusive with `offset`. Returns at once
-    /// unless `wait_secs` is given, which waits for the job to finish so the tail
-    /// is final. The page is the end of that window; acknowledging it frees the
-    /// whole prefix, including output it did not show.
+    /// Read the last N bytes instead of paging from `offset` (0 reads one byte);
+    /// exclusive with `offset`. With `wait_secs` it waits for the job to finish
+    /// so the tail is final, and the page is the end of that window.
     #[serde(default)]
     tail_bytes: Option<usize>,
     /// text returns UTF-8-lossy text for model readability; base64 preserves arbitrary bytes exactly.
     #[serde(default)]
     encoding: OutputEncoding,
-    /// Wait up to this many seconds for output past `offset` (or for the job to
-    /// finish) before paging. Defaults to 90 where the transport supplies a
-    /// response window and is clamped to what remains of it; 90 is also the
-    /// ceiling where no window exists. 0 pages immediately.
+    /// Wait up to this many seconds for output past `offset` or for the job to
+    /// finish; 0 pages now. Defaults to 90 where the transport supplies a
+    /// response window and is always clamped to what remains of it (90 is also
+    /// the ceiling without one).
     #[serde(default)]
     wait_secs: Option<u64>,
 }
@@ -209,7 +205,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. The job id is the native task id when Tasks are supported. `wait_secs`: 90 by default where the transport supplies a response window, clamped to what remains, waiting for completion; 0 answers immediately. `tail_lines` defaults to {job_tail} and is capped at {job_tail_max}; 0 omits the lines.",
+        description = "Current state of a durable shell job: status, elapsed, exit state, stdout/stderr byte counts, and the last {job_tail} lines of each stream so one call shows how far it got or why it failed. A job exposed as a native task uses this id as its `taskId`.",
         annotations(
             title = "Get shell job status",
             read_only_hint = true,
@@ -252,7 +248,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read content from a job's stdout or stderr: a page from `offset`, or the last `tail_bytes` of the stream. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages default to the short-page size and are bounded by the profile ceiling; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. For a quick look at the end without reading the middle, `job_get` already returns the last lines of each stream. Streams retain <={spool} and report truncation.",
+        description = "Read a job's stdout or stderr: an `offset` page or the last `tail_bytes`, never an acknowledgement, so it stays replayable. Page from `next_offset` until `complete=true`, then `job_ack` the highest offset safely received. Streams retain <={spool} and report truncation.",
         annotations(
             title = "Read shell job output",
             read_only_hint = true,
@@ -318,7 +314,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Acknowledge `job_output`'s `next_offset` for the same `stream` once received. The only operation that advances cleanup: after both terminal streams are fully acknowledged, compatibility spools are released. It is a high-water mark, so acknowledging an offset releases everything before it — including output that was skipped by a tail read. Native tasks instead keep the exact-result prefix that `tasks/get` replays, until task retention expires. Unacked output holds the session spool budget until retention ({retention}).",
+        description = "Acknowledge `job_output`'s `next_offset` for the same `stream` once received: the only operation that advances cleanup, releasing both terminal streams once fully acknowledged. It is a high-water mark, so an acknowledged offset also releases output skipped by a tail read. A native task keeps only the exact prefix `tasks/get` replays. Unacked output holds the session spool budget until retention ({retention}).",
         annotations(
             title = "Acknowledge shell job output",
             read_only_hint = false,
@@ -403,10 +399,6 @@ mod tests {
                 "the last {} lines",
                 crate::limits::DEFAULT_JOB_TAIL_LINES
             )),
-            "{get_description}"
-        );
-        assert!(
-            get_description.contains(&format!("capped at {}", crate::limits::MAX_JOB_TAIL_LINES)),
             "{get_description}"
         );
         let tail_description = get.input_schema["properties"]["tail_lines"]["description"]

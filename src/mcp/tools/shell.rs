@@ -100,7 +100,7 @@ fn shell_timeout_description(max_secs: u64) -> String {
 
 fn shell_output_description(max_bytes: usize) -> String {
     format!(
-        "Ordinary shell-result byte limit per stream. Defaults to the short page ({default}) and is capped at {max_bytes}; ask for more when the output is genuinely needed. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output.",
+        "Per-stream byte limit for the inline result. Defaults to the short page ({default}) and is capped at {max_bytes}; it never limits what the spool retains, so ask for more only when the result itself is needed.",
         default =
             super::human_bytes((crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(max_bytes)) as u64),
         max_bytes = super::human_bytes(max_bytes as u64),
@@ -118,12 +118,12 @@ fn shell_tool_description(shell: &str, sync_hold: Option<Duration>) -> String {
     );
     match sync_hold {
         Some(hold) => format!(
-            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting. {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
+            "Run a {shell} command. If still running after {}s it returns a job handle instead of output and keeps running; `background: true` returns that handle at once instead of waiting; {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             hold.as_secs(),
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
         None => format!(
-            "Run a {shell} command; waits until the command finishes or timeout_secs expires. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Results carry `ts` (epoch seconds): keep one user turn to about {} min, then checkpoint and hand back.",
+            "Run a {shell} command; waits until the command finishes or timeout_secs expires. `background: true` starts the same durable execution and returns its handle immediately: {follow_up}. Results carry `ts` (epoch seconds) for the {}-minute turn clock.",
             crate::limits::TURN_CHECKPOINT_MINUTES
         ),
     }
