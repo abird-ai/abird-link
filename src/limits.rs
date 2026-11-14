@@ -57,9 +57,17 @@ pub(crate) const OPENAI_TUNNEL_BINARY_RESPONSE_RESERVE_BYTES: usize = 64 * 1024;
 /// fit their complete CallToolResult beneath OPENAI_TUNNEL_TOOL_RESULT_BYTES.
 pub(crate) const OPENAI_TUNNEL_TRANSFER_CEILING_BYTES: usize = 8 * 1024 * 1024;
 
-/// New profiles default to modest per-call transfer ceilings; users can raise
-/// them up to OPENAI_TUNNEL_TRANSFER_CEILING_BYTES when larger transfers are useful.
+/// New profiles default every per-call transfer ceiling to this value; users can
+/// raise them up to OPENAI_TUNNEL_TRANSFER_CEILING_BYTES when larger transfers
+/// are useful. This is the *maximum* a call may ask for, not what it gets when
+/// it does not ask.
 pub(crate) const DEFAULT_TRANSFER_BYTES: usize = 1024 * 1024;
+
+/// What a shell result or `job_output` page gets when the call does not ask for a
+/// size. A tool result is context the model must read, so the default favours a
+/// short one: the profile ceiling stays the caller's maximum, the spool keeps
+/// every byte, and `job_output` pages the rest on demand.
+pub(crate) const DEFAULT_OUTPUT_PAGE_BYTES: usize = 256 * 1024;
 
 /// Completed/background job state is retained for this long unless all spool
 /// output has already been consumed. Active jobs keep their own shell deadline.

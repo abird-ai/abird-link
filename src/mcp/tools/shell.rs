@@ -29,7 +29,10 @@ use tokio::{
 };
 use tokio_util::task::AbortOnDropHandle;
 
-use super::{LocalMachine, ProgressHeartbeat, dot, heartbeat_tick, resolve_capped, tool_error};
+use super::{
+    LocalMachine, ProgressHeartbeat, dot, heartbeat_tick, resolve_capped, resolve_output_page,
+    tool_error,
+};
 #[cfg(target_os = "linux")]
 use crate::mcp::{
     AccessPolicy, ShellGuards, guard_identities, validate_host_mount_policy, validate_shell_guards,
@@ -77,7 +80,7 @@ pub(crate) struct ShellArgs {
     #[serde(default)]
     pub(crate) timeout_secs: Option<u64>,
 
-    /// Output byte limit per stream. Defaults to the profile ceiling (max_output_bytes); clamped to it.
+    /// Output byte limit per stream. Defaults to the short-page size, clamped to the profile ceiling (max_output_bytes).
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
 }
@@ -93,7 +96,7 @@ fn shell_timeout_description(max_secs: u64) -> String {
 
 fn shell_output_description(max_bytes: usize) -> String {
     format!(
-        "Ordinary shell-result byte limit per stream. Defaults to {max_bytes} and is capped there. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output."
+        "Ordinary shell-result byte limit per stream. Defaults to the short-page size and is capped at {max_bytes}; ask for a larger size when the output is genuinely needed. Every shell execution is durably spooled; if the response window closes first or the complete ordinary result cannot fit the transport response budget, dotlink returns the same job/task handle and its retained output is paged with job_output."
     )
 }
 
@@ -1546,7 +1549,7 @@ impl ShellRuntime {
     }
 
     fn output_limit(&self, requested: Option<usize>) -> usize {
-        resolve_capped(requested, self.config.max_output_bytes)
+        resolve_output_page(requested, self.config.max_output_bytes)
     }
 
     #[cfg(target_os = "linux")]

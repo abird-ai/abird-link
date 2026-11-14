@@ -369,6 +369,17 @@ fn tool_error(error: impl std::fmt::Display) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error.to_string())])
 }
 
+/// Shell results and `job_output` pages: the caller may ask any size up to the
+/// profile ceiling, and an omitted size gets the short-page default instead of
+/// the ceiling. Output is context the model must read, so the default is small
+/// and the maximum is still available to a caller that wants it.
+pub(crate) fn resolve_output_page(requested: Option<usize>, ceiling: usize) -> usize {
+    let ceiling = ceiling.max(1);
+    requested
+        .unwrap_or(crate::limits::DEFAULT_OUTPUT_PAGE_BYTES.min(ceiling))
+        .clamp(1, ceiling)
+}
+
 /// Client-controlled limit under a policy ceiling: the caller picks any value up
 /// to the configured ceiling, which is also the fallback when omitted.
 pub(crate) fn resolve_capped<T>(requested: Option<T>, ceiling: T) -> T
@@ -1389,6 +1400,24 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn output_pages_default_short_and_still_allow_the_ceiling() {
+        let ceiling = crate::limits::DEFAULT_TRANSFER_BYTES;
+        // Omitted: the short page, not the ceiling.
+        assert_eq!(
+            resolve_output_page(None, ceiling),
+            crate::limits::DEFAULT_OUTPUT_PAGE_BYTES
+        );
+        // Asked for: the whole ceiling is available.
+        assert_eq!(resolve_output_page(Some(ceiling), ceiling), ceiling);
+        // Above the ceiling: clamped, never widened.
+        assert_eq!(resolve_output_page(Some(ceiling * 8), ceiling), ceiling);
+        // A profile ceiling below the short page wins.
+        let small = crate::limits::DEFAULT_OUTPUT_PAGE_BYTES / 4;
+        assert_eq!(resolve_output_page(None, small), small);
+        assert_eq!(resolve_output_page(Some(0), ceiling), 1);
+    }
 
     #[tokio::test]
     async fn heartbeat_delivery_never_crosses_its_deadline() {

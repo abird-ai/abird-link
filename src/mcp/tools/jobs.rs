@@ -13,7 +13,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use super::{LocalMachine, dot, ok_text, resolve_capped, tool_error};
+use super::{LocalMachine, dot, ok_text, resolve_output_page, tool_error};
 use crate::jobs::JobStream;
 use std::time::Duration;
 use tokio::time::Instant as TokioInstant;
@@ -280,7 +280,7 @@ impl LocalMachine {
     }
 
     #[tool(
-        description = "Read one page of a job's stdout or stderr by raw byte offset. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages are bounded by `max_output_bytes`; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. Streams retain <={spool} and report truncation.",
+        description = "Read one page of a job's stdout or stderr by raw byte offset. Never acknowledges or deletes, so it stays replayable; `wait_secs` (default and clamp as in job_get) waits for new bytes past `offset` or completion, 0 pages what is retained now. Pages default to the short-page size and are bounded by the profile ceiling; page from `next_offset` until `complete=true`, then `job_ack` the highest safely received offset. Streams retain <={spool} and report truncation.",
         annotations(
             title = "Read shell job output",
             read_only_hint = true,
@@ -294,7 +294,7 @@ impl LocalMachine {
         Parameters(args): Parameters<JobOutputArgs>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let ceiling = resolve_capped(args.max_output_bytes, self.config.max_output_bytes);
+        let ceiling = resolve_output_page(args.max_output_bytes, self.config.max_output_bytes);
         let response_ceiling = self.request_result_budget(&context).unwrap_or(ceiling);
         let stream = args.stream.into();
         let offset = args.offset.unwrap_or(0);

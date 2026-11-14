@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A shell result or `job_output` page that does not ask for a size now gets **256 KiB** instead of the profile ceiling. The ceiling itself is unchanged: new profiles still default to 1 MiB and may be raised to 8 MiB, so a caller that genuinely needs the whole result can still ask for it — the default only stops an unasked-for megabyte of build log from becoming context the model must read. Nothing is lost to the trim: every execution is durably spooled and `job_output` pages the rest (median page 64 KiB in this deployment), so the cost of a short default is one round trip rather than a blown context. `read`/`write` payloads are untouched and keep the 1 MiB default.
+
 - `grep` context is no longer silently narrowed at 8 lines per side. `after`/`before` now allow up to 128 lines, and a request above that ends the page with `… context capped at 128 lines per side (asked N)` so a caller can re-ask against a narrower pattern (fewer hits buy more context) instead of guessing a number it will never receive. The limit is advertised through `{grep_context}`, interpolated from `MAX_GREP_CONTEXT`, so the schema and the clamp cannot drift. The content-marker reserve covers the stop marker plus this notice, so a page still ends with whole hit lines inside the output ceiling.
 
 ## [0.16.5] - 2026-11-13
